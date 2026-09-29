@@ -19,7 +19,7 @@ button{cursor:pointer}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:cente
 dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);max-width:640px;width:95vw}
 </style></head><body>
 <header><h1>Central Boni · Produção</h1>
-<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/backup.db">Backup</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button></div></header>
+<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/backup.db">Backup</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button></div></header>
 <div class="wrap">
 <div class="kpis" id="kpis"></div>
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
@@ -32,6 +32,8 @@ dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);colo
 <p style="color:var(--mut);font-size:12px">Atualiza sozinho a cada 20 s.</p>
 </div>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
+<dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><button onclick="addPau()">Adicionar</button></div>
+<table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes.</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
 <dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Etiquetas</option></select><button onclick="addCol()">Adicionar</button></div>
 <table id="cols" style="margin-top:10px"></table><p><button onclick="dlgCol.close()">Fechar</button></p></dialog>
 <script>
@@ -62,5 +64,9 @@ async function carregarCol(){const L=await (await fetch("/api/colaboradores")).j
  $("cols").innerHTML="<tr><th>Nome</th><th>Função</th><th>Crachá</th><th>Ativo</th></tr>"+L.map(c=>`<tr><td>${esc(c.nome)}</td><td>${esc(c.funcao)}</td><td>${esc(c.codigo)}</td><td><input type="checkbox" ${c.ativo?"checked":""} onchange='salvarCol(${JSON.stringify(c)},this.checked)'></td></tr>`).join("")}
 async function addCol(){if(!nNome.value.trim())return;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:nNome.value.trim(),funcao:nFunc.value})});nNome.value="";carregarCol()}
 async function salvarCol(c,at){c.ativo=at;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
+async function carregarPau(){const L=await (await fetch("/api/pausas")).json();
+ $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
+async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value})});pPes.value="";carregarPau()}
+async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
 carregar();setInterval(carregar,20000);
 </script></body></html>

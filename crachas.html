@@ -9,6 +9,9 @@
 function card(el,tit,sub,cod,cls){const d=document.createElement("div");d.className="c "+(cls||"");d.innerHTML=`<h3>${tit}</h3><p>${sub}</p><svg></svg>`;el.appendChild(d);
  JsBarcode(d.querySelector("svg"),cod,{format:"CODE128",height:70,width:2.2,fontSize:16})}
 fetch("/api/colaboradores").then(r=>r.json()).then(L=>L.filter(c=>c.ativo).forEach(c=>card(g,c.nome,c.funcao||"",c.codigo)));
+card(cmd,"POSTO: SEPARAÇÃO","bipe para este PC virar Separação","CMD-SEPARACAO","cmd");
+card(cmd,"POSTO: GRAVAÇÃO","bipe para este PC virar Gravação","CMD-GRAVACAO","cmd");
+card(cmd,"POSTO: EXPEDIÇÃO","bipe para este PC virar Expedição","CMD-EXPEDICAO","cmd");
 card(cmd,"FALTA DE MATERIAL","bipe isto e depois a etiqueta","CMD-FALTA","cmd");
 card(cmd,"DESFAZER","desfaz o seu último bipe neste posto","CMD-DESFAZER","cmd");
 </script></body></html>
