@@ -47,7 +47,12 @@ def iniciar_db():
             etapa TEXT, colaborador_id INTEGER, posto TEXT, em TEXT, alerta TEXT, desfeito INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS ix_ev_em ON eventos(em);
         CREATE INDEX IF NOT EXISTS ix_it_criado ON itens(criado_em);
+        CREATE TABLE IF NOT EXISTS pausas(id INTEGER PRIMARY KEY, nome TEXT, hora TEXT, pessoas TEXT);
         """)
+        if not c.execute("SELECT 1 FROM pausas LIMIT 1").fetchone():
+            c.executemany("INSERT INTO pausas(nome,hora,pessoas) VALUES(?,?,?)", [
+                ("Cafe da manha", "09:15", "Rafael, Guilherme"),
+                ("Cafe da manha", "09:30", "Yuri, Juninho")])
 
 
 def norm(cod):
@@ -327,6 +332,11 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
+        if p == "/api/pausas":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
+                return self._envia(403, {"erro": "sem acesso"})
+            with conn() as c:
+                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM pausas ORDER BY hora")])
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
         hoje = datetime.now(BR).strftime("%Y-%m-%d")
@@ -374,6 +384,17 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, importar_lote(d))
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
+        if p == "/api/pausas":
+            with _lock, conn() as c:
+                if d.get("excluir"):
+                    c.execute("DELETE FROM pausas WHERE id=?", (d["id"],))
+                elif re.fullmatch(r"\d{1,2}:\d{2}", d.get("hora", "")):
+                    h, m = d["hora"].split(":")
+                    c.execute("INSERT INTO pausas(nome,hora,pessoas) VALUES(?,?,?)",
+                              (d.get("nome") or "Pausa", f"{int(h):02d}:{m}", d.get("pessoas", "")))
+                else:
+                    return self._envia(400, {"erro": "hora invalida (use 09:15)"})
+            return self._envia(200, {"ok": True})
         if p == "/api/colaboradores":
             with _lock, conn() as c:
                 if d.get("id"):
