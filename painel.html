@@ -29,7 +29,7 @@ dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);colo
 <div class="row"><input id="busca" placeholder="Buscar pedido, nome, SKU…" oninput="tabela()"><select id="fst" onchange="tabela()"><option value="">Todos</option>
 <option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>GRAVADO</option><option>EXPEDIDO</option><option value="FALTA">Falta material</option></select></div></div>
 <table id="itens"></table></div>
-<p style="color:var(--mut);font-size:12px">Atualiza sozinho a cada 20 s.</p>
+<p style="color:var(--mut);font-size:12px">Atualiza sozinho a cada 5 segundos.</p>
 </div>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
 <dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><button onclick="addPau()">Adicionar</button></div>
@@ -68,5 +68,5 @@ async function carregarPau(){const L=await (await fetch("/api/pausas")).json();
  $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
 async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value})});pPes.value="";carregarPau()}
 async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
-carregar();setInterval(carregar,20000);
+carregar();setInterval(()=>{if(!document.hidden)carregar()},5000);document.addEventListener("visibilitychange",()=>{if(!document.hidden)carregar()});
 </script></body></html>
