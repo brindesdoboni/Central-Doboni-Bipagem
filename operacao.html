@@ -1,0 +1,55 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Operação - Central Boni</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial,sans-serif;background:#0d0d10;color:#f4f4f5;min-height:100vh;display:flex;flex-direction:column}
+header{display:flex;justify-content:space-between;align-items:center;padding:16px 28px;background:#18181c}
+h1{margin:0;font-size:28px}#relogio{font-size:34px;font-weight:800;font-variant-numeric:tabular-nums}
+main{flex:1;padding:22px 28px;display:grid;gap:20px;grid-template-rows:auto auto 1fr}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+.k{background:#1c1c21;border-radius:14px;padding:18px 20px}.k b{display:block;font-size:64px;line-height:1;font-variant-numeric:tabular-nums}.k span{font-size:20px;color:#a1a1aa}
+.bar{height:34px;background:#26262c;border-radius:10px;overflow:hidden;display:flex}
+.bar div{height:100%;transition:width .6s}
+.prev{font-size:30px;text-align:center}.prev b{font-size:44px;color:#4ade80}
+table{width:100%;border-collapse:collapse;font-size:24px}th,td{padding:10px 12px;text-align:center;border-bottom:1px solid #2e2e33}th{color:#a1a1aa;font-weight:600}td:first-child,th:first-child{text-align:left}
+#pausa{display:none;padding:12px;background:#3b2f00;color:#ffd84d;font-size:28px;font-weight:800;text-align:center}
+#alarme{display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;font-size:80px;font-weight:900;background:#d7263d;text-align:center}
+#alarme.on{display:flex;animation:p .5s steps(1) infinite}@keyframes p{50%{background:#5a0000}}
+#falta{color:#f87171}
+</style></head><body>
+<header><h1>Operação Brindes do Boni</h1><div id="relogio"></div></header>
+<div id="pausa"></div>
+<main>
+ <div class="kpis" id="kpis"></div>
+ <div><div class="bar" id="barra"></div><p class="prev" id="prev">Calculando previsão…</p></div>
+ <div><table id="canais"></table><p style="font-size:22px" id="falta"></p></div>
+</main>
+<div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alN" style="font-size:56px;margin-top:16px"></div></div>
+<script>
+const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+let chave=L("chave");if(!chave){chave=prompt("Chave do posto:")||"";S("chave",chave)}
+const $=id=>document.getElementById(id),esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const COR={AGUARDANDO:"#71717a",SEPARADO:"#0891b2",EM_GRAVACAO:"#d97706",EXPEDIDO:"#16a34a"};
+const NOM={AGUARDANDO:"Aguardando",SEPARADO:"Separados",EM_GRAVACAO:"Em gravação",EXPEDIDO:"Expedidos"};
+async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-Chave":chave}});
+ if(r.status===403){S("chave","");return location.reload()}const d=await r.json(),c=d.contagem,t=d.total||1;
+ $("kpis").innerHTML=`<div class="k"><b>${d.total}</b><span>Pedidos do dia</span></div>`+Object.keys(NOM).map(k=>`<div class="k" style="border-left:8px solid ${COR[k]}"><b>${c[k]}</b><span>${NOM[k]}</span></div>`).join("");
+ $("barra").innerHTML=Object.keys(NOM).map(k=>`<div style="width:${100*c[k]/t}%;background:${COR[k]}"></div>`).join("");
+ const R=d.ritmo,rit=["SEPARACAO","GRAVACAO","EXPEDICAO"].map(p=>R[p].por_hora?`${{SEPARACAO:"Separação",GRAVACAO:"Gravação",EXPEDICAO:"Expedição"}[p]}: ${R[p].por_hora}/h`:"").filter(Boolean).join(" · ");
+ $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";
+ $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"</tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
+ $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
+}catch(e){}}
+// café
+let P=[],ctx=null,tocou={};
+function som(){try{ctx=ctx||new AudioContext();[[0,660,220],[.35,880,330],[.7,523,1047]].forEach(([d,a,b])=>{for(let i=0;i<30;i+=2){const o=ctx.createOscillator(),g=ctx.createGain();o.type="square";o.connect(g);g.connect(ctx.destination);const t=ctx.currentTime+i+d;o.frequency.setValueAtTime(a,t);o.frequency.exponentialRampToValueAtTime(b,t+.3);g.gain.setValueAtTime(.25,t);g.gain.exponentialRampToValueAtTime(.001,t+.32);o.start(t);o.stop(t+.33)}})}catch(e){}}
+async function pausas(){try{const r=await fetch("/api/pausas",{headers:{"X-Chave":chave}});if(r.ok)P=await r.json()}catch(e){}}
+function tick(){const n=new Date();$("relogio").textContent=n.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+ const seg=n.getHours()*3600+n.getMinutes()*60+n.getSeconds();let px=null;
+ for(const p of P){const[h,m]=p.hora.split(":").map(Number),f=h*3600+m*60-seg,k=n.toDateString()+p.id;
+  if(f<=0&&f>-5&&!tocou[k]){tocou[k]=1;$("alN").textContent=p.pessoas;$("alarme").classList.add("on");som();setTimeout(()=>$("alarme").classList.remove("on"),30000)}
+  if(f>0&&f<=3600&&(!px||f<px.f))px={...p,f}}
+ const e=$("pausa");if(!px){e.style.display="none";return}e.style.display="block";
+ e.textContent=`☕ ${px.nome} — ${px.pessoas} em ${Math.floor(px.f/60)}:${String(px.f%60).padStart(2,"0")}`}
+document.addEventListener("click",()=>{try{ctx=ctx||new AudioContext();ctx.resume()}catch(e){}},{once:true});
+carregar();setInterval(carregar,2000);pausas();setInterval(pausas,300000);setInterval(tick,1000);tick();
+</script></body></html>

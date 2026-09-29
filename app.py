@@ -15,7 +15,7 @@ ALERTA_GRAVACAO_MIN = int(os.environ.get("ALERTA_GRAVACAO_MIN", "30"))
 AQUI = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.Lock()
 
-ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "GRAVADO", "EXPEDIDO"]
+ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "EXPEDIDO"]
 ORDEM = {e: i for i, e in enumerate(ETAPAS)}
 
 
@@ -49,10 +49,15 @@ def iniciar_db():
         CREATE INDEX IF NOT EXISTS ix_it_criado ON itens(criado_em);
         CREATE TABLE IF NOT EXISTS pausas(id INTEGER PRIMARY KEY, nome TEXT, hora TEXT, pessoas TEXT);
         """)
-        if not c.execute("SELECT 1 FROM pausas LIMIT 1").fetchone():
-            c.executemany("INSERT INTO pausas(nome,hora,pessoas) VALUES(?,?,?)", [
-                ("Cafe da manha", "09:15", "Rafael, Guilherme"),
-                ("Cafe da manha", "09:30", "Yuri, Juninho")])
+        c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
+        c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
+        padrao = [("Cafe da manha", "09:15", "Rafael, Guilherme"), ("Cafe da manha", "09:30", "Yuri, Juninho"),
+                  ("Cafe da tarde", "15:30", "Yuri, Juninho"), ("Cafe da tarde", "15:45", "Rafael, Guilherme")]
+        if not c.execute("SELECT 1 FROM meta WHERE chave='pausas_v2'").fetchone():
+            for n, h, pes in padrao:  # so adiciona o que falta; depois disso quem manda e o painel
+                if not c.execute("SELECT 1 FROM pausas WHERE hora=? AND pessoas=?", (h, pes)).fetchone():
+                    c.execute("INSERT INTO pausas(nome,hora,pessoas) VALUES(?,?,?)", (n, h, pes))
+            c.execute("INSERT INTO meta VALUES('pausas_v2','1')")
 
 
 def norm(cod):
@@ -145,23 +150,16 @@ def bipar(posto, codigo, operador, modo):
             pers = [i for i in itens if i["personalizado"]]
             if not pers:
                 return {"tipo": "erro", "msg": "Este pedido NAO tem gravacao."}
-            minha = next((i for i in pers if i["status"] == "EM_GRAVACAO" and ultimo_op(c, i["id"]) == op["id"]), None)
-            if minha:
-                return {"tipo": "ok", "msg": f"Gravacao FINALIZADA ({dur_gravacao(c, minha['id'])})",
-                        "item": ev(minha, "GRAVACAO_FIM")}
             alvo = next((i for i in pers if ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]), None)
             if alvo:
                 alerta = "" if alvo["status"] == "SEPARADO" else "pulou separacao"
                 r = ev(alvo, "GRAVACAO_INICIO", alerta)
                 return {"tipo": "aviso" if alerta else "ok",
-                        "msg": "Gravacao INICIADA" + (" (atencao: nao foi separado)" if alerta else ""), "item": r}
-            outro = next((i for i in pers if i["status"] == "EM_GRAVACAO"), None)
-            if outro:
-                return {"tipo": "aviso", "msg": "Outro colaborador esta gravando este pedido.", "item": dict(outro)}
-            return {"tipo": "aviso", "msg": "Ja gravado.", "item": dict(pers[0])}
+                        "msg": "Gravacao registrada" + (" (atencao: nao foi separado)" if alerta else ""), "item": r}
+            return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
-            falta = [i for i in itens if i["personalizado"] and ORDEM[i["status"]] < ORDEM["GRAVADO"]]
+            falta = [i for i in itens if i["personalizado"] and ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]]
             if falta:
                 return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(falta)} item(ns) ainda nao gravado(s)!",
                         "item": dict(falta[0])}
@@ -200,8 +198,6 @@ def recalcular(c, iid):
             st, falta = "SEPARADO", 0
         elif et == "GRAVACAO_INICIO":
             st, falta = "EM_GRAVACAO", 0
-        elif et == "GRAVACAO_FIM":
-            st = "GRAVADO"
         elif et == "EXPEDIDO":
             st = "EXPEDIDO"
     c.execute("UPDATE itens SET status=?, falta_material=?, atualizado_em=? WHERE id=?", (st, falta, agora(), iid))
@@ -230,7 +226,7 @@ def painel(data):
         evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
              ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
         equipe = {}
-        inicio = {}
+        ultimo_grav = {}
         for e in evs:
             p = equipe.setdefault(e["nome"] or "?", {"separados": 0, "gravados": 0, "expedidos": 0,
                                                      "min_gravacao": [], "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
@@ -238,26 +234,61 @@ def painel(data):
             if e["etapa"] == "SEPARADO": p["separados"] += 1
             if e["etapa"] == "EXPEDIDO": p["expedidos"] += 1
             if e["etapa"] == "FALTA_MATERIAL": p["faltas"] += 1
-            if e["etapa"] == "GRAVACAO_INICIO": inicio[e["item_id"]] = e["em"]
-            if e["etapa"] == "GRAVACAO_FIM":
+            if e["etapa"] == "GRAVACAO_INICIO":
+                # tempo por peca = intervalo entre bipes seguidos do mesmo gravador (ignora pausas > 30 min)
                 p["gravados"] += 1
-                if e["item_id"] in inicio:
-                    p["min_gravacao"].append((datetime.fromisoformat(e["em"]) - datetime.fromisoformat(inicio[e["item_id"]])).total_seconds() / 60)
+                ant = ultimo_grav.get(e["nome"])
+                if ant:
+                    m = (datetime.fromisoformat(e["em"]) - datetime.fromisoformat(ant)).total_seconds() / 60
+                    if 0 < m <= 30:
+                        p["min_gravacao"].append(m)
+                ultimo_grav[e["nome"]] = e["em"]
         for p in equipe.values():
             m = p.pop("min_gravacao")
             p["media_gravacao_min"] = round(sum(m) / len(m), 1) if m else None
         alertas = []
-        limite = (datetime.now(timezone.utc) - timedelta(minutes=ALERTA_GRAVACAO_MIN)).isoformat()
         for i in itens:
             if i["falta_material"]:
                 alertas.append({"tipo": "FALTA DE MATERIAL", "item": i})
-            if i["status"] == "EM_GRAVACAO" and i["atualizado_em"] < limite:
-                alertas.append({"tipo": f"GRAVANDO HA MAIS DE {ALERTA_GRAVACAO_MIN} MIN", "item": i})
         for e in evs:
             if e["alerta"] and e["alerta"] != "falta de material":
                 alertas.append({"tipo": e["alerta"].upper(), "item": next((i for i in itens if i["id"] == e["item_id"]), {"pedido": "?"})})
         return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
                 "equipe": equipe, "alertas": alertas, "itens": itens}
+
+
+def operacao():
+    """Visao geral SEM dados por funcionario (para a TV da operacao)."""
+    hoje = datetime.now(BR).strftime("%Y-%m-%d")
+    d = painel(hoje)
+    itens = d["itens"]
+    agora_ = datetime.now(timezone.utc)
+    ini, _ = dia_utc(hoje)
+    ritmo, restante = {}, {
+        "SEPARACAO": sum(1 for i in itens if i["status"] == "AGUARDANDO"),
+        "GRAVACAO": sum(1 for i in itens if i["personalizado"] and i["status"] in ("AGUARDANDO", "SEPARADO")),
+        "EXPEDICAO": sum(1 for i in itens if i["status"] != "EXPEDIDO"),
+    }
+    etapa_ev = {"SEPARACAO": "SEPARADO", "GRAVACAO": "GRAVACAO_INICIO", "EXPEDICAO": "EXPEDIDO"}
+    previsoes = []
+    with conn() as c:
+        for posto, et in etapa_ev.items():
+            r = c.execute("SELECT COUNT(*), MIN(em) FROM eventos WHERE etapa=? AND desfeito=0 AND em>=?", (et, ini)).fetchone()
+            n, primeiro = r[0], r[1]
+            por_hora = None
+            if n >= 3 and primeiro:
+                horas = max((agora_ - datetime.fromisoformat(primeiro)).total_seconds() / 3600, 0.25)
+                por_hora = round(n / horas, 1)
+                if restante[posto]:
+                    previsoes.append(restante[posto] / por_hora)
+            ritmo[posto] = {"feitos": n, "por_hora": por_hora, "faltam": restante[posto]}
+    prev = None
+    if restante["EXPEDICAO"] == 0 and d["total"]:
+        prev = "concluido"
+    elif previsoes:
+        prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
+    return {"contagem": d["contagem"], "total": d["total"], "por_canal": d["por_canal"], "ritmo": ritmo,
+            "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"])}
 
 
 def historico(iid):
@@ -332,6 +363,15 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
+        if p in ("/operacao", "/tv"):
+            return self._pagina("operacao.html")
+        if p == "/api/operacao":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
+                return self._envia(403, {"erro": "sem acesso"})
+            return self._envia(200, operacao())
+        if p == "/sair":
+            return self._envia(302, "", extra={"Location": "/painel",
+                               "Set-Cookie": "cb_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})
         if p == "/api/pausas":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -342,6 +382,16 @@ class H(BaseHTTPRequestHandler):
         hoje = datetime.now(BR).strftime("%Y-%m-%d")
         if p == "/api/painel":
             return self._envia(200, painel(q.get("data") or hoje))
+        if p == "/api/eventos":
+            with conn() as c:
+                desde = int(q.get("desde") if q.get("desde") not in (None, "") else -1)
+                if desde < 0:
+                    r = c.execute("SELECT COALESCE(MAX(id),0) FROM eventos").fetchone()[0]
+                    return self._envia(200, {"ultimo": r, "eventos": []})
+                ev = [dict(r) for r in c.execute("""SELECT e.id, e.etapa, e.posto, e.em, e.alerta, e.desfeito, k.nome,
+                      i.pedido, i.sku, i.nomes FROM eventos e JOIN itens i ON i.id=e.item_id
+                      LEFT JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.id>? ORDER BY e.id LIMIT 50""", (desde,))]
+                return self._envia(200, {"ultimo": ev[-1]["id"] if ev else desde, "eventos": ev})
         if p == "/api/historico":
             return self._envia(200, historico(int(q.get("id", 0))))
         if p == "/api/colaboradores":
