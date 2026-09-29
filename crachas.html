@@ -1,0 +1,14 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Crachás - Central Boni</title>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<style>body{font-family:Arial,sans-serif;margin:20px}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.c{border:2px solid #000;border-radius:10px;padding:14px;text-align:center;break-inside:avoid}.c h3{margin:0 0 4px;font-size:22px}.c p{margin:0 0 6px;color:#555}
+.cmd{border-style:dashed}@media print{button{display:none}}</style></head><body>
+<button onclick="print()">Imprimir</button><h2>Crachás da equipe</h2><div class="g" id="g"></div>
+<h2 style="margin-top:30px">Códigos especiais (colar em cada posto)</h2><div class="g" id="cmd"></div>
+<script>
+function card(el,tit,sub,cod,cls){const d=document.createElement("div");d.className="c "+(cls||"");d.innerHTML=`<h3>${tit}</h3><p>${sub}</p><svg></svg>`;el.appendChild(d);
+ JsBarcode(d.querySelector("svg"),cod,{format:"CODE128",height:70,width:2.2,fontSize:16})}
+fetch("/api/colaboradores").then(r=>r.json()).then(L=>L.filter(c=>c.ativo).forEach(c=>card(g,c.nome,c.funcao||"",c.codigo)));
+card(cmd,"FALTA DE MATERIAL","bipe isto e depois a etiqueta","CMD-FALTA","cmd");
+card(cmd,"DESFAZER","desfaz o seu último bipe neste posto","CMD-DESFAZER","cmd");
+</script></body></html>

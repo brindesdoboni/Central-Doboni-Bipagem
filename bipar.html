@@ -1,0 +1,56 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bipagem - Central Boni</title>
+<style>
+:root{--ok:#1f9d55;--av:#d99a00;--er:#d7263d;--bg:#111;--fg:#fff}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#222;font-size:20px}
+#posto{font-weight:800;font-size:26px;letter-spacing:1px}#op{font-size:22px}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:background .2s}
+#msg{font-size:56px;font-weight:800;max-width:95vw}#det{font-size:28px;margin-top:18px;opacity:.95;line-height:1.4}
+#modo{margin-top:16px;font-size:24px;padding:8px 18px;border-radius:8px;background:var(--av);color:#000;display:none}
+input{position:absolute;opacity:0;left:-999px}
+.escolha{display:grid;grid-template-columns:1fr 1fr;gap:16px;width:min(700px,95vw)}
+.escolha button{font-size:28px;padding:30px;border:0;border-radius:12px;background:#333;color:#fff;cursor:pointer}
+footer{padding:10px 20px;background:#222;font-size:16px;opacity:.8;display:flex;justify-content:space-between}
+a{color:#aaa}
+</style></head><body>
+<header><div id="posto">-</div><div id="op">Bipe seu CRACHÁ</div></header>
+<main id="tela"><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO: FALTA DE MATERIAL — bipe a etiqueta</div></main>
+<footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe)</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
+<input id="in" autocomplete="off">
+<script>
+const POSTOS={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO"};
+const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}}, S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+let posto=L("posto"), chave=L("chave"), op=null, modo=null, tOp=null;
+const $=id=>document.getElementById(id), inp=$("in");
+function beep(ok){try{const a=new AudioContext(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);
+ o.frequency.value=ok?880:220;g.gain.value=.3;o.start();o.stop(a.currentTime+(ok?.12:.5))}catch(e){}}
+function tela(tipo,msg,det){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
+ $("tela").style.background=cor;$("msg").textContent=msg;$("det").innerHTML=det||"";beep(tipo==="ok"||tipo==="operador");
+ clearTimeout(tela.t);tela.t=setTimeout(()=>{$("tela").style.background="var(--bg)"},tipo==="erro"?4000:1500)}
+function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+function trocarPosto(){S("posto","");location.reload()}
+function escolherPosto(){ $("msg").textContent="Qual é este posto?";
+ $("det").innerHTML='<div class="escolha">'+Object.entries(POSTOS).map(([k,v])=>`<button onclick="S('posto','${k}');location.reload()">${v}</button>`).join("")+"</div>"}
+function pronto(){ $("posto").textContent=POSTOS[posto]; $("msg").textContent="Bipe seu CRACHÁ"; $("det").textContent="";
+ setInterval(()=>{if(document.activeElement!==inp)inp.focus()},500)}
+function sairOp(){op=null;$("op").textContent="Bipe seu CRACHÁ"}
+async function enviar(codigo){
+ const c=codigo.trim().toUpperCase(); if(!c)return;
+ if(c.replace(/[^A-Z]/g,"")==="CMDFALTA"){ if(!op)return tela("erro","Bipe o seu CRACHÁ primeiro.");
+   modo="FALTA";$("modo").style.display="block";return tela("aviso","Falta de material","Agora bipe a etiqueta do pedido")}
+ try{const r=await fetch("/api/bipe",{method:"POST",headers:{"Content-Type":"application/json","X-Chave":chave},
+   body:JSON.stringify({posto,codigo:c,operador:op&&op.codigo,modo})});const d=await r.json();
+  if(r.status===403){S("chave","");chave=null;return tela("erro","Chave do posto inválida","Recarregue a página e digite a chave")}
+  if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome}
+  modo=null;$("modo").style.display="none";
+  const i=d.item;let det="";
+  if(i)det=`Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}<br>${esc(i.sku)} ${esc(i.cor)}`+
+    (i.nomes?`<br>Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"");
+  tela(d.tipo,d.msg,det);
+  clearTimeout(tOp);tOp=setTimeout(sairOp,20*60*1000);
+ }catch(e){tela("erro","Sem conexão","Verifique a internet e bipe de novo")}}
+inp.addEventListener("keydown",e=>{if(e.key==="Enter"){enviar(inp.value);inp.value=""}});
+if(!chave){chave=prompt("Chave do posto (fornecida pelo Lucas):")||"";S("chave",chave)}
+if(!posto||!POSTOS[posto])escolherPosto();else pronto();
+</script></body></html>

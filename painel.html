@@ -1,0 +1,66 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Painel - Central Boni</title>
+<style>
+:root{--bg:#f6f6f7;--card:#fff;--fg:#18181b;--mut:#71717a;--bd:#e4e4e7;--ok:#16a34a;--av:#d97706;--er:#dc2626;--az:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#0f0f11;--card:#1a1a1d;--fg:#f4f4f5;--mut:#a1a1aa;--bd:#2e2e33}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--card)}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}a{color:var(--az)}
+.wrap{padding:16px 20px;display:grid;gap:16px;max-width:1300px;margin:auto}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.k{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px}.k b{display:block;font-size:30px}.k span{color:var(--mut);font-size:13px}
+.box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;overflow:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}th{color:var(--mut);font-weight:600}
+tr.c{cursor:pointer}tr.c:hover{background:#8881}
+.tag{padding:2px 8px;border-radius:99px;font-size:12px;font-weight:700;color:#fff}
+.AGUARDANDO{background:#71717a}.SEPARADO{background:#0891b2}.EM_GRAVACAO{background:var(--av)}.GRAVADO{background:var(--az)}.EXPEDIDO{background:var(--ok)}
+.al{padding:8px 10px;border-left:4px solid var(--er);background:#dc262612;margin-bottom:6px;border-radius:4px}
+input,select,button{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:14px}
+button{cursor:pointer}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);max-width:640px;width:95vw}
+</style></head><body>
+<header><h1>Central Boni · Produção</h1>
+<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/backup.db">Backup</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button></div></header>
+<div class="wrap">
+<div class="kpis" id="kpis"></div>
+<div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
+<div class="box"><h2>Por canal</h2><table id="canais"></table></div>
+<div class="box"><h2>Equipe (dia)</h2><table id="equipe"></table></div>
+<div class="box"><div class="row" style="justify-content:space-between"><h2>Pedidos</h2>
+<div class="row"><input id="busca" placeholder="Buscar pedido, nome, SKU…" oninput="tabela()"><select id="fst" onchange="tabela()"><option value="">Todos</option>
+<option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>GRAVADO</option><option>EXPEDIDO</option><option value="FALTA">Falta material</option></select></div></div>
+<table id="itens"></table></div>
+<p style="color:var(--mut);font-size:12px">Atualiza sozinho a cada 20 s.</p>
+</div>
+<dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
+<dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Etiquetas</option></select><button onclick="addCol()">Adicionar</button></div>
+<table id="cols" style="margin-top:10px"></table><p><button onclick="dlgCol.close()">Fechar</button></p></dialog>
+<script>
+const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hora=s=>s?new Date(s).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}):"-";
+const NOMES={AGUARDANDO:"Aguardando",SEPARADO:"Separado",EM_GRAVACAO:"Em gravação",GRAVADO:"Gravado",EXPEDIDO:"Expedido"};
+let D=null;
+$("data").value=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
+$("data").onchange=carregar;
+async function carregar(){const d=$("data").value;$("exp").href=`/exportar.csv?de=${d}&ate=${d}`;
+ const r=await fetch("/api/painel?data="+d);if(r.status===401)return location.reload();D=await r.json();render()}
+function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_material).length;
+ $("kpis").innerHTML=[["Total",D.total],...Object.keys(NOMES).map(k=>[NOMES[k],c[k]]),["Falta material",falta]]
+  .map(([t,v])=>`<div class="k"><b>${v}</b><span>${t}</span></div>`).join("");
+ $("alertas").innerHTML=D.alertas.length?D.alertas.map(a=>`<div class="al"><b>${esc(a.tipo)}</b> — pedido ${esc(a.item.pedido)} ${esc(a.item.sku||"")} ${a.item.etiqueta?"(etiqueta "+esc(a.item.etiqueta)+")":""}</div>`).join(""):"Nenhum alerta 👍";
+ $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOMES).map(n=>`<th>${n}</th>`).join("")+"</tr>"+
+  Object.entries(D.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOMES).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
+ $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravados</th><th>Média gravação</th><th>Expedidos</th><th>Faltas</th><th>1º bipe</th><th>Último</th></tr>"+
+  Object.entries(D.equipe).map(([n,p])=>`<tr><td><b>${esc(n)}</b></td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.media_gravacao_min??"-"}${p.media_gravacao_min!=null?" min":""}</td><td>${p.expedidos}</td><td>${p.faltas}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}</td></tr>`).join("");
+ tabela()}
+function tabela(){if(!D)return;const b=$("busca").value.toLowerCase(),f=$("fst").value;
+ const L=D.itens.filter(i=>(!f||(f==="FALTA"?i.falta_material:i.status===f))&&(!b||[i.pedido,i.nomes,i.sku,i.rastreio,i.loja].join(" ").toLowerCase().includes(b)));
+ $("itens").innerHTML="<tr><th>Etiq.</th><th>Pedido</th><th>Canal</th><th>SKU</th><th>Nome</th><th>Fonte</th><th>Status</th></tr>"+
+  L.slice(0,500).map(i=>`<tr class="c" onclick="hist(${i.id},'${esc(i.pedido)}')"><td>${esc(i.etiqueta)}</td><td>${esc(i.pedido)}</td><td>${esc(i.canal)}</td><td>${esc(i.sku)} ${esc(i.cor)}</td><td>${esc(i.nomes)}</td><td>${esc(i.fonte)}</td><td><span class="tag ${i.status}">${NOMES[i.status]}</span>${i.falta_material?' <span class="tag" style="background:var(--er)">FALTA</span>':""}</td></tr>`).join("")}
+async function hist(id,ped){const h=await (await fetch("/api/historico?id="+id)).json();$("hTit").textContent="Pedido "+ped;
+ $("hist").innerHTML="<tr><th>Hora</th><th>Etapa</th><th>Quem</th><th>Alerta</th></tr>"+h.map(e=>`<tr style="${e.desfeito?"text-decoration:line-through;opacity:.5":""}"><td>${new Date(e.em).toLocaleString("pt-BR")}</td><td>${esc(e.etapa)}</td><td>${esc(e.nome)}</td><td>${esc(e.alerta)}</td></tr>`).join("");dlgHist.showModal()}
+async function carregarCol(){const L=await (await fetch("/api/colaboradores")).json();
+ $("cols").innerHTML="<tr><th>Nome</th><th>Função</th><th>Crachá</th><th>Ativo</th></tr>"+L.map(c=>`<tr><td>${esc(c.nome)}</td><td>${esc(c.funcao)}</td><td>${esc(c.codigo)}</td><td><input type="checkbox" ${c.ativo?"checked":""} onchange='salvarCol(${JSON.stringify(c)},this.checked)'></td></tr>`).join("")}
+async function addCol(){if(!nNome.value.trim())return;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:nNome.value.trim(),funcao:nFunc.value})});nNome.value="";carregarCol()}
+async function salvarCol(c,at){c.ativo=at;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
+carregar();setInterval(carregar,20000);
+</script></body></html>
