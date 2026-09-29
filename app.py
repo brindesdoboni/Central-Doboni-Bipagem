@@ -303,7 +303,10 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def _pagina(self, nome):
-        with open(os.path.join(AQUI, "web", nome), encoding="utf-8") as f:
+        caminho = os.path.join(AQUI, "web", nome)
+        if not os.path.exists(caminho):
+            caminho = os.path.join(AQUI, nome)  # paginas soltas na raiz do repositorio
+        with open(caminho, encoding="utf-8") as f:
             self._envia(200, f.read(), "text/html; charset=utf-8")
 
     def _admin(self):
