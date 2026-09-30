@@ -35,14 +35,20 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <div class="row"><input id="busca" placeholder="Buscar pedido, nome, SKU…" oninput="tabela()"><select id="fst" onchange="tabela()"><option value="">Todos</option>
 <option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>EXPEDIDO</option><option>DEVOLVIDO</option><option value="FALTA">Falta material</option></select></div></div>
 <div class="row" style="margin:6px 0 10px"><button onclick="selTodos(true)">Selecionar todos (da lista)</button><button onclick="selTodos(false)">Limpar seleção</button>
-<button onclick="excluirSel()" style="border-color:var(--er);color:var(--er)">Excluir selecionados</button><button onclick="dlgAdd.showModal()">+ Incluir etiqueta</button><span class="mut" id="nsel"></span></div>
+<button onclick="excluirSel()" style="border-color:var(--er);color:var(--er)">Excluir selecionados</button><button onclick="abrirAdd()">+ Incluir etiquetas</button><span class="mut" id="nsel"></span></div>
 <table id="itens"></table></div>
 <div id="toasts"></div><p style="color:var(--mut);font-size:12px">Atualiza em tempo real (1 segundo).</p>
 </div>
-<dialog id="dlgAdd"><h2>Incluir etiqueta manualmente</h2>
-<div class="row"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio (código de barras)"><select id="aCan"><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA RAPIDA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
-<div class="row" style="margin-top:8px"><input id="aSku" placeholder="SKU"><input id="aNom" placeholder="Nome(s) — separe com |"><input id="aFon" placeholder="Fonte"><label><input type="checkbox" id="aPer" checked> Tem gravação</label></div>
-<p class="mut">O bipe funciona pelo nº do pedido ou pelo rastreio.</p><p><button onclick="addItem()">Incluir</button> <button onclick="dlgAdd.close()">Fechar</button> <span id="aMsg" class="mut"></span></p></dialog>
+<dialog id="dlgAdd" class="largo"><h2>Incluir etiquetas</h2>
+<p class="mut">Clique no campo abaixo e <b>bipe as etiquetas</b> — cada bipe já inclui na hora e o canal (Shopee/TikTok) é identificado pelo código.</p>
+<div class="row"><input id="bIn" placeholder="Bipe aqui…" style="font-size:18px;flex:1;min-width:260px" autocomplete="off">
+<input id="bSku" placeholder="SKU (opcional)" size="14"><label><input type="checkbox" id="bPer" checked> Tem gravação</label></div>
+<p class="mut">O SKU e o "tem gravação" valem para os próximos bipes até você mudar.</p>
+<div class="dbody"><table id="bLista"></table></div>
+<details style="margin-top:10px"><summary>Incluir digitando (com nome e fonte)</summary>
+<div class="row" style="margin-top:8px"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio"><select id="aCan"><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA RAPIDA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
+<div class="row" style="margin-top:8px"><input id="aSku" placeholder="SKU"><input id="aNom" placeholder="Nome(s) — separe com |"><input id="aFon" placeholder="Fonte"><label><input type="checkbox" id="aPer" checked> Tem gravação</label><button onclick="addItem()">Incluir</button><span id="aMsg" class="mut"></span></div></details>
+<p><button onclick="dlgAdd.close()">Fechar</button></p></dialog>
 <dialog id="dlgProd" class="largo"><h2>Produtividade</h2><div class="row"><input type="date" id="prDe"> até <input type="date" id="prAte"><button onclick="carregarProd()">Ver</button><span class="mut">Tempo por peça = intervalo até o próximo bipe do mesmo gravador (pausas acima de 30 min não contam).</span></div>
 <div class="dbody"><h3>Por colaborador</h3><table id="prPes"></table><h3>Tempo de cada material (aprendido com os bipes)</h3><table id="prMat"></table><h3>Cada colaborador × material</h3><table id="prPM"></table></div><p><button onclick="dlgProd.close()">Fechar</button></p></dialog>
 <dialog id="dlgDev" class="largo"><h2>Devoluções</h2><div class="row"><input type="date" id="dvDe"> até <input type="date" id="dvAte"><button onclick="carregarDev()">Ver</button></div>
@@ -108,6 +114,18 @@ function selTodos(on){if(on)LISTA.forEach(i=>SEL.add(i.id));else SEL.clear();tab
 async function excluirSel(){if(!SEL.size)return alert("Selecione as etiquetas primeiro.");
  if(!confirm(`Excluir ${SEL.size} etiqueta(s) do sistema? Os bipes delas também serão apagados. Não dá para desfazer.`))return;
  const r=await POST("/api/itens/excluir",{ids:[...SEL]});SEL.clear();alert(r.excluidos+" etiqueta(s) excluída(s).");carregar()}
+function canalDe(c){c=c.toUpperCase().replace(/[^A-Z0-9]/g,"");
+ if(/^BR\d{10,15}[A-Z]?$/.test(c))return["SHOPEE","rastreio"];
+ if(/^2\d{5}[0-9A-Z]{8}$/.test(c))return["SHOPEE","pedido"];
+ if(/^5\d{17}$/.test(c))return["TIKTOK","pedido"];
+ if(/^(88|JT)\d{8,15}$/.test(c))return["TIKTOK","rastreio"];
+ return["OUTROS","pedido"]}
+function abrirAdd(){dlgAdd.showModal();setTimeout(()=>bIn.focus(),50)}
+bIn.addEventListener("keydown",async e=>{if(e.key!=="Enter")return;e.preventDefault();const cod=bIn.value.trim();bIn.value="";if(!cod)return;
+ const [canal,tipo]=canalDe(cod);const corpo={pedido:cod,canal,sku:bSku.value.trim().toUpperCase(),personalizado:bPer.checked};if(tipo==="rastreio")corpo.rastreio=cod;
+ const tr=document.createElement("tr");tr.innerHTML=`<td>${esc(cod)}</td><td>${canal}</td><td>${esc(corpo.sku)}</td><td>…</td>`;$("bLista").prepend(tr);
+ try{const r=await POST("/api/itens/adicionar",corpo);tr.lastChild.innerHTML=r.ok?"✅ incluída":(r.erro==="ja cadastrada"?"⚠️ já estava no sistema":"❌ "+esc(r.erro||"erro"));
+  if(r.ok)carregar()}catch(x){tr.lastChild.textContent="❌ sem conexão"}bIn.focus()});
 async function addItem(){if(!aPed.value.trim())return alert("Informe o nº do pedido");
  const r=await POST("/api/itens/adicionar",{pedido:aPed.value.trim(),rastreio:aRas.value.trim(),canal:aCan.value,sku:aSku.value.trim().toUpperCase(),nomes:aNom.value,fonte:aFon.value.trim(),personalizado:aPer.checked});
  $("aMsg").textContent=r.ok?"Incluída ✔":"Erro: "+(r.erro||"");if(r.ok){aPed.value=aRas.value=aSku.value=aNom.value=aFon.value="";carregar()}}

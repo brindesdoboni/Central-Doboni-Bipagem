@@ -628,6 +628,10 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/itens/adicionar":
             if not str(d.get("pedido", "")).strip():
                 return self._envia(400, {"erro": "informe o pedido"})
+            with conn() as c:
+                for cod in {norm(d.get("pedido")), norm(d.get("rastreio"))} - {""}:
+                    if c.execute("SELECT 1 FROM codigos WHERE codigo=?", (cod,)).fetchone():
+                        return self._envia(200, {"ok": False, "erro": "ja cadastrada"})
             it = {k: d.get(k, "") for k in ("pedido", "rastreio", "canal", "loja", "sku", "cor", "fonte", "obs")}
             it["nomes"] = [n.strip() for n in str(d.get("nomes", "")).split("|") if n.strip()]
             it["personalizado"] = bool(d.get("personalizado", True))
