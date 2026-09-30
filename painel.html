@@ -54,7 +54,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
 <dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><button onclick="addPau()">Adicionar</button></div>
 <table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes.</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
-<dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Etiquetas</option></select><button onclick="addCol()">Adicionar</button></div>
+<dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Devolução</option></select><button onclick="addCol()">Adicionar</button></div>
 <table id="cols" style="margin-top:10px"></table><p><button onclick="dlgCol.close()">Fechar</button></p></dialog>
 <script>
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -83,7 +83,9 @@ function tabela(){if(!D)return;const b=$("busca").value.toLowerCase(),f=$("fst")
 async function hist(id,ped){const h=await (await fetch("/api/historico?id="+id)).json();$("hTit").textContent="Pedido "+ped;
  $("hist").innerHTML="<tr><th>Hora</th><th>Etapa</th><th>Quem</th><th>Alerta</th></tr>"+h.map(e=>`<tr style="${e.desfeito?"text-decoration:line-through;opacity:.5":""}"><td>${new Date(e.em).toLocaleString("pt-BR")}</td><td>${esc(e.etapa)}</td><td>${esc(e.nome)}</td><td>${esc(e.alerta)}</td></tr>`).join("");dlgHist.showModal()}
 async function carregarCol(){const L=await (await fetch("/api/colaboradores")).json();
- $("cols").innerHTML="<tr><th>Nome</th><th>Função</th><th>Crachá</th><th>Ativo</th></tr>"+L.map(c=>`<tr><td>${esc(c.nome)}</td><td>${esc(c.funcao)}</td><td>${esc(c.codigo)}</td><td><input type="checkbox" ${c.ativo?"checked":""} onchange='salvarCol(${JSON.stringify(c)},this.checked)'></td></tr>`).join("")}
+ $("cols").innerHTML="<tr><th>Nome</th><th>Função</th><th>Crachá</th><th>Ativo</th><th></th></tr>"+L.map(c=>`<tr><td>${esc(c.nome)}</td><td>${esc(c.funcao)}</td><td>${esc(c.codigo)}</td><td><input type="checkbox" ${c.ativo?"checked":""} onchange='salvarCol(${JSON.stringify(c)},this.checked)'></td><td><button onclick="excluirCol(${c.id},'${esc(c.nome)}')" style="color:var(--er)">Excluir</button></td></tr>`).join("")}
+async function excluirCol(id,nome){if(!confirm(`Excluir ${nome} da equipe? O crachá para de funcionar. O histórico do que ${nome} já fez continua salvo.`))return;
+ await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarCol()}
 async function addCol(){if(!nNome.value.trim())return;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:nNome.value.trim(),funcao:nFunc.value})});nNome.value="";carregarCol()}
 async function salvarCol(c,at){c.ativo=at;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
 async function carregarPau(){const L=await (await fetch("/api/pausas")).json();

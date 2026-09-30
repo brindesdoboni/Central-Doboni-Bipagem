@@ -51,6 +51,9 @@ def iniciar_db():
         CREATE TABLE IF NOT EXISTS custos(sku TEXT PRIMARY KEY, descricao TEXT, custo REAL, atualizado_em TEXT);
         """)
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
+        if "excluido" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
+            c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
+        c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
         c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
         padrao = [("Cafe da manha", "09:15", "Rafael, Guilherme"), ("Cafe da manha", "09:30", "Yuri, Juninho"),
                   ("Cafe da tarde", "15:30", "Yuri, Juninho"), ("Cafe da tarde", "15:45", "Rafael, Guilherme")]
@@ -550,7 +553,7 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, historico(int(q.get("id", 0))))
         if p == "/api/colaboradores":
             with conn() as c:
-                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM colaboradores ORDER BY ativo DESC, nome")])
+                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM colaboradores WHERE COALESCE(excluido,0)=0 ORDER BY ativo DESC, nome")])
         if p == "/exportar.csv":
             return self._envia(200, exportar(q.get("de") or hoje, q.get("ate") or hoje), "text/csv; charset=utf-8",
                                {"Content-Disposition": f"attachment; filename=bipagem_{q.get('de') or hoje}.csv"})
@@ -646,7 +649,10 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/api/colaboradores":
             with _lock, conn() as c:
-                if d.get("id"):
+                if d.get("excluir"):
+                    # sai da lista e o cracha para de funcionar; o historico continua com o nome
+                    c.execute("UPDATE colaboradores SET excluido=1, ativo=0 WHERE id=?", (d["id"],))
+                elif d.get("id"):
                     c.execute("UPDATE colaboradores SET nome=?, funcao=?, ativo=? WHERE id=?",
                               (d["nome"], d.get("funcao", ""), 1 if d.get("ativo", True) else 0, d["id"]))
                 else:
