@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Envia o lote do dia (spec.py da folha de gravacao) para a Central Boni.
 
-Uso:  python3 enviar_lote.py spec.py [saida.pdf] --url https://SEU-APP.up.railway.app --token SEU_TOKEN
+Uso:  python3 enviar_lote.py spec.py [saida.pdf] --json lote_central.json   (gera o lote para enviar pelo Chrome)
+      python3 enviar_lote.py spec.py [saida.pdf] --url https://SEU-APP.up.railway.app --token SEU_TOKEN
       (ou defina CENTRAL_URL e CENTRAL_TOKEN no ambiente)
 
 spec.py: P=[(pedido, canal ER/TT/SP, tipo G/A/C/E/N, [(sku,cor,nome)], fonte, obs)]
@@ -70,6 +71,17 @@ def montar(spec_path, pdf_path=None):
 
 
 def main():
+    if "--json" in sys.argv:
+        # modo automacao: so gera o lote; o envio e feito pelo Chrome com o painel logado
+        i = sys.argv.index("--json")
+        saida = sys.argv[i + 1]
+        resto = [a for j, a in enumerate(sys.argv[1:], 1) if j not in (i, i + 1)]
+        itens = montar(resto[0], resto[1] if len(resto) > 1 else None)
+        with open(saida, "w", encoding="utf-8") as f:
+            json.dump(itens, f, ensure_ascii=False)
+        print(f"{len(itens)} etiqueta(s) prontas em {saida} "
+              f"({sum(1 for x in itens if not x['etiqueta'])} sem numero de etiqueta)")
+        return
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     opt = dict(zip(sys.argv[1::1], sys.argv[2::1]))
     url = opt.get("--url") or os.environ.get("CENTRAL_URL")

@@ -72,6 +72,7 @@ def norm(cod):
 def importar_lote(dados):
     lote = dados.get("lote") or datetime.now(BR).strftime("%Y%m%d-%H%M")
     n_novo = n_atual = 0
+    ocorr = {}
     with _lock, conn() as c:
         for i, it in enumerate(dados.get("itens", [])):
             pedido = str(it.get("pedido") or "").strip()
@@ -89,6 +90,25 @@ def importar_lote(dados):
                           nomes=nomes, fonte=it.get("fonte") or "", tipo=tipo, obs=it.get("obs") or "",
                           personalizado=pers, atualizado_em=agora())
             ant = c.execute("SELECT id FROM itens WHERE chave=?", (chave,)).fetchone()
+            if not ant:
+                # mesma etiqueta vinda de outra fonte (Zebra, automacao, PDF, bipe): junta em vez de duplicar
+                n = ocorr[norm(pedido)] = ocorr.get(norm(pedido), 0) + 1
+                cand = [r[0] for r in c.execute("""SELECT DISTINCT item_id FROM codigos WHERE codigo IN (?,?)
+                        ORDER BY item_id""", (norm(pedido), norm(campos["rastreio"]) or "-"))]
+                if len(cand) >= n:
+                    iid = cand[n - 1]
+                    novos = {k: v for k, v in campos.items() if v not in ("", None) and k not in ("lote", "personalizado")}
+                    if tipo or "personalizado" in it:
+                        novos["personalizado"] = pers
+                    if nomes and not c.execute("SELECT personalizado FROM itens WHERE id=?", (iid,)).fetchone()[0] \
+                            and "personalizado" not in it and not tipo:
+                        novos["personalizado"] = 1
+                    c.execute(f"UPDATE itens SET {', '.join(k + '=?' for k in novos)} WHERE id=?", list(novos.values()) + [iid])
+                    n_atual += 1
+                    for cod in {pedido, campos["rastreio"], *(it.get("codigos") or [])}:
+                        if norm(cod):
+                            c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (norm(cod), iid))
+                    continue
             if ant:
                 iid = ant["id"]
                 sets = ", ".join(f"{k}=?" for k in campos if k != "rastreio" or campos["rastreio"])
@@ -588,7 +608,7 @@ class H(BaseHTTPRequestHandler):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
             return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo")))
         if p == "/api/lotes":
-            if not hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN):
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "token invalido"})
             return self._envia(200, importar_lote(d))
         if not self._admin():

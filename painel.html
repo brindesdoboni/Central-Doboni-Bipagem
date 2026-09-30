@@ -45,6 +45,8 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <input id="bSku" placeholder="SKU (opcional)" size="14"><label><input type="checkbox" id="bPer" checked> Tem gravação</label></div>
 <p class="mut">O SKU e o "tem gravação" valem para os próximos bipes até você mudar.</p>
 <div class="dbody"><table id="bLista"></table></div>
+<div class="box" style="margin-top:10px"><b>Importar PDF de etiquetas</b> <span class="mut">(do UpSeller ou da folha de gravação — cada página vira uma etiqueta; separadores são ignorados)</span>
+<div class="row" style="margin-top:8px"><input type="file" id="pdfIn" accept="application/pdf" multiple onchange="importarPDF(this.files)"><span id="pdfMsg" class="mut"></span></div></div>
 <details style="margin-top:10px"><summary>Incluir digitando (com nome e fonte)</summary>
 <div class="row" style="margin-top:8px"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio"><select id="aCan"><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA RAPIDA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
 <div class="row" style="margin-top:8px"><input id="aSku" placeholder="SKU"><input id="aNom" placeholder="Nome(s) — separe com |"><input id="aFon" placeholder="Fonte"><label><input type="checkbox" id="aPer" checked> Tem gravação</label><button onclick="addItem()">Incluir</button><span id="aMsg" class="mut"></span></div></details>
@@ -120,6 +122,31 @@ function canalDe(c){c=c.toUpperCase().replace(/[^A-Z0-9]/g,"");
  if(/^5\d{17}$/.test(c))return["TIKTOK","pedido"];
  if(/^(88|JT)\d{8,15}$/.test(c))return["TIKTOK","rastreio"];
  return["OUTROS","pedido"]}
+function linhasPagina(tc){const L=[];for(const it of tc.items){if(!it.str||!it.str.trim())continue;const y=Math.round(it.transform[5]);
+  let l=L.find(l=>Math.abs(l.y-y)<=3);if(!l){l={y,p:[]};L.push(l)}l.p.push([it.transform[4],it.str])}
+ return L.sort((a,b)=>b.y-a.y).map(l=>l.p.sort((a,b)=>a[0]-b[0]).map(x=>x[1]).join(" ").replace(/\s+/g," ").trim())}
+function lerEtiqueta(linhas){const t=linhas.join("\n"),T=t.toUpperCase();
+ const ped=(t.match(/\b(2\d{5}[0-9A-Z]{8})\b/)||t.match(/\b(5\d{17})\b/)||[])[1]||"";
+ let ras="";for(const rx of[/\b(BR\d{12,14}[A-Z]?)\b/,/\b([A-Z]{2}\d{9}BR)\b/,/\b(88\d{10,14})\b/]){const m=t.match(rx);if(m&&m[1]!==ped){ras=m[1];break}}
+ if(!ped&&!ras)return null;
+ let canal=/^2\d{5}/.test(ped)||/SHOPEE|\bSPX\b/.test(T)?"SHOPEE":/^5\d{17}$/.test(ped)||/TIKTOK|TIK TOK|J&T/.test(T)?"TIKTOK":"OUTROS";
+ if(/ENTREGA R[AÁ]PIDA/.test(T))canal="ENTREGA RAPIDA";
+ const skus=[...new Set([...t.matchAll(/SKU\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._\-\/]{1,40})/gi)].map(m=>m[1].toUpperCase()))];
+ const fl=linhas.find(l=>/^\s*Fonte\s*[:\-]/i.test(l));const fonte=fl?fl.replace(/^\s*Fonte\s*[:\-]\s*/i,"").trim():"";
+ const etq=(t.match(/ETIQUETA\s*N?[ºo°.]?\s*(\d+)/i)||[])[1];
+ const semPers=/SEM PERSONALIZ/.test(T)&&!etq;
+ return {pedido:ped||ras,rastreio:ras,canal,sku:skus.join(" + "),fonte,etiqueta:etq?Number(etq):null,personalizado:!semPers}}
+async function importarPDF(files){if(!files.length)return;const msg=$("pdfMsg");msg.textContent="Lendo PDF…";
+ try{const pdfjs=await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+  let novos=0,atual=0,ign=0,pags=0;
+  for(const f of files){const doc=await pdfjs.getDocument({data:await f.arrayBuffer()}).promise;const itens=[],vez={};
+   for(let n=1;n<=doc.numPages;n++){pags++;msg.textContent=`Lendo ${f.name}: página ${n}/${doc.numPages}…`;
+    const e=lerEtiqueta(linhasPagina(await (await doc.getPage(n)).getTextContent()));if(!e){ign++;continue}
+    e.seq="pdf"+(vez[e.pedido]=(vez[e.pedido]||0)+1);itens.push(e)}
+   for(let i=0;i<itens.length;i+=200){const r=await POST("/api/lotes",{lote:"PDF "+f.name,itens:itens.slice(i,i+200)});if(!r.ok)throw new Error(r.erro||"erro");novos+=r.novos;atual+=r.atualizados}}
+  msg.innerHTML=`✅ ${pags} página(s): <b>${novos}</b> nova(s), <b>${atual}</b> já existiam (atualizadas), ${ign} ignorada(s) (separadores/sem código).`;carregar()}
+ catch(x){msg.textContent="❌ Não consegui ler o PDF: "+x.message}$("pdfIn").value=""}
 function abrirAdd(){dlgAdd.showModal();setTimeout(()=>bIn.focus(),50)}
 bIn.addEventListener("keydown",async e=>{if(e.key!=="Enter")return;e.preventDefault();const cod=bIn.value.trim();bIn.value="";if(!cod)return;
  const [canal,tipo]=canalDe(cod);const corpo={pedido:cod,canal,sku:bSku.value.trim().toUpperCase(),personalizado:bPer.checked};if(tipo==="rastreio")corpo.rastreio=cod;
