@@ -568,6 +568,8 @@ class H(BaseHTTPRequestHandler):
                                    {"Content-Disposition": f"attachment; filename=central_{hoje}.db"})
         if p == "/crachas":
             return self._pagina("crachas.html")
+        if p == "/setores":
+            return self._pagina("setores.html")
         self._envia(404, {"erro": "nao encontrado"})
 
     def do_POST(self):

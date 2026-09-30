@@ -1,0 +1,22 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Etiquetas de setor - Central Boni</title>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<style>
+@page{size:100mm 150mm;margin:0}
+body{margin:0;font-family:Arial,sans-serif}
+.et{width:100mm;height:150mm;box-sizing:border-box;padding:8mm;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;page-break-after:always;border:1px dashed #ccc}
+.et small{font-size:14pt;letter-spacing:2px}.et h1{font-size:34pt;margin:4mm 0 2mm}.et p{font-size:12pt;margin:0 0 8mm}
+.et svg{width:84mm;height:auto}
+#topo{padding:10px;font:16px Arial}@media print{#topo{display:none}.et{border:0}}
+</style></head><body>
+<div id="topo"><button onclick="print()" style="font-size:16px;padding:8px 14px">Imprimir</button> Uma etiqueta 10x15 por setor. Na janela de impressão escolha a Zebra (ou "Salvar como PDF") e tamanho 100 x 150 mm.</div>
+<div id="lista"></div>
+<script>
+const S=[["SETOR","SEPARAÇÃO","Bipe para este PC virar Separação","CMD-SEPARACAO"],
+ ["SETOR","GRAVAÇÃO","Bipe para este PC virar Gravação","CMD-GRAVACAO"],
+ ["SETOR","EXPEDIÇÃO","Bipe para este PC virar Expedição","CMD-EXPEDICAO"],
+ ["SETOR","DEVOLUÇÃO","Bipe para este PC virar Devolução","CMD-DEVOLUCAO"],
+ ["AÇÃO","FALTA DE MATERIAL","Bipe isto e depois a etiqueta do pedido","CMD-FALTA"],
+ ["AÇÃO","DESFAZER","Desfaz o seu último bipe neste posto","CMD-DESFAZER"]];
+for(const [t,n,d,c] of S){const e=document.createElement("div");e.className="et";e.innerHTML=`<small>${t}</small><h1>${n}</h1><p>${d}</p><svg></svg>`;
+ lista.appendChild(e);JsBarcode(e.querySelector("svg"),c,{format:"CODE128",height:110,width:3,fontSize:18,margin:0})}
+</script></body></html>
