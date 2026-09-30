@@ -15,7 +15,7 @@ ALERTA_GRAVACAO_MIN = int(os.environ.get("ALERTA_GRAVACAO_MIN", "30"))
 AQUI = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.Lock()
 
-ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "EXPEDIDO"]
+ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "EXPEDIDO", "DEVOLVIDO"]
 ORDEM = {e: i for i, e in enumerate(ETAPAS)}
 
 
@@ -48,6 +48,7 @@ def iniciar_db():
         CREATE INDEX IF NOT EXISTS ix_ev_em ON eventos(em);
         CREATE INDEX IF NOT EXISTS ix_it_criado ON itens(criado_em);
         CREATE TABLE IF NOT EXISTS pausas(id INTEGER PRIMARY KEY, nome TEXT, hora TEXT, pessoas TEXT);
+        CREATE TABLE IF NOT EXISTS custos(sku TEXT PRIMARY KEY, descricao TEXT, custo REAL, atualizado_em TEXT);
         """)
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
         c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
@@ -126,6 +127,12 @@ def bipar(posto, codigo, operador, modo):
             return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}"}
         itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
                           "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
+        if not itens and posto == "DEVOLUCAO":
+            iid = c.execute("""INSERT INTO itens(chave,lote,pedido,sku,personalizado,status,criado_em,atualizado_em)
+                               VALUES(?,?,?,?,0,'AGUARDANDO',?,?)""",
+                            (f"DEV|{cod}|{agora()}", "DEVOLUCAO", codigo.strip(), "", agora(), agora())).lastrowid
+            c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
+            itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
         if not itens:
             return {"tipo": "erro", "msg": f"Codigo {codigo} nao encontrado em nenhum lote."}
 
@@ -170,6 +177,18 @@ def bipar(posto, codigo, operador, modo):
             for i in pend:
                 r = ev(i, "EXPEDIDO")
             return {"tipo": "ok", "msg": f"Expedido ({len(pend)} item(ns))", "item": r}
+        if posto == "DEVOLUCAO":
+            pend = [i for i in itens if i["status"] != "DEVOLVIDO"]
+            if not pend:
+                return {"tipo": "aviso", "msg": "Devolucao ja registrada.", "item": dict(itens[0])}
+            r, total = None, 0.0
+            for i in pend:
+                r = ev(i, "DEVOLVIDO")
+                total += custo_de(c, i["sku"]) or 0
+            sem_sku = any(not i["sku"] for i in pend)
+            msg = f"Devolucao registrada ({len(pend)} item(ns))"
+            msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
+            return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "item": r}
         return {"tipo": "erro", "msg": "Posto invalido."}
 
 
@@ -200,6 +219,8 @@ def recalcular(c, iid):
             st, falta = "EM_GRAVACAO", 0
         elif et == "EXPEDIDO":
             st = "EXPEDIDO"
+        elif et == "DEVOLVIDO":
+            st = "DEVOLVIDO"
     c.execute("UPDATE itens SET status=?, falta_material=?, atualizado_em=? WHERE id=?", (st, falta, agora(), iid))
 
 
@@ -215,7 +236,7 @@ def painel(data):
         # itens do dia = criados no dia OU com movimento no dia OU ainda nao expedidos
         itens = [dict(r) for r in c.execute("""SELECT * FROM itens WHERE (criado_em>=? AND criado_em<?)
             OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0)
-            OR (status!='EXPEDIDO' AND criado_em<?) ORDER BY canal, etiqueta, id""", (ini, fim, ini, fim, fim))]
+            OR (status NOT IN ('EXPEDIDO','DEVOLVIDO') AND criado_em<?) ORDER BY canal, etiqueta, id""", (ini, fim, ini, fim, fim))]
         cont = {e: 0 for e in ETAPAS}
         for i in itens:
             cont[i["status"]] += 1
@@ -261,13 +282,18 @@ def operacao():
     """Visao geral SEM dados por funcionario (para a TV da operacao)."""
     hoje = datetime.now(BR).strftime("%Y-%m-%d")
     d = painel(hoje)
-    itens = d["itens"]
+    itens = [i for i in d["itens"] if i["status"] != "DEVOLVIDO"]
+    cont = {e: 0 for e in ETAPAS if e != "DEVOLVIDO"}
+    por_canal = {}
+    for i in itens:
+        cont[i["status"]] += 1
+        por_canal.setdefault(i["canal"] or "-", {e: 0 for e in cont})[i["status"]] += 1
     agora_ = datetime.now(timezone.utc)
     ini, _ = dia_utc(hoje)
     ritmo, restante = {}, {
         "SEPARACAO": sum(1 for i in itens if i["status"] == "AGUARDANDO"),
         "GRAVACAO": sum(1 for i in itens if i["personalizado"] and i["status"] in ("AGUARDANDO", "SEPARADO")),
-        "EXPEDICAO": sum(1 for i in itens if i["status"] != "EXPEDIDO"),
+        "EXPEDICAO": sum(1 for i in itens if i["status"] not in ("EXPEDIDO", "DEVOLVIDO")),
     }
     etapa_ev = {"SEPARACAO": "SEPARADO", "GRAVACAO": "GRAVACAO_INICIO", "EXPEDICAO": "EXPEDIDO"}
     previsoes = []
@@ -282,13 +308,134 @@ def operacao():
                 if restante[posto]:
                     previsoes.append(restante[posto] / por_hora)
             ritmo[posto] = {"feitos": n, "por_hora": por_hora, "faltam": restante[posto]}
+        # gravacao: soma do tempo aprendido de cada material que falta / gravadores ativos hoje
+        tempos = tempos_por_material(c, 30)
+        geral = tempos.get("__GERAL__")
+        if geral and restante["GRAVACAO"]:
+            falta_min = sum(tempos.get((i["sku"] or "").upper(), geral) for i in itens
+                            if i["personalizado"] and i["status"] in ("AGUARDANDO", "SEPARADO"))
+            ativos = c.execute("""SELECT COUNT(DISTINCT colaborador_id) FROM eventos WHERE etapa='GRAVACAO_INICIO'
+                                  AND desfeito=0 AND em>=?""", ((agora_ - timedelta(hours=1)).isoformat(),)).fetchone()[0]
+            previsoes.append(falta_min / max(ativos, 1) / 60)
     prev = None
-    if restante["EXPEDICAO"] == 0 and d["total"]:
+    if restante["EXPEDICAO"] == 0 and itens:
         prev = "concluido"
     elif previsoes:
         prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
-    return {"contagem": d["contagem"], "total": d["total"], "por_canal": d["por_canal"], "ritmo": ritmo,
+    return {"contagem": cont, "total": len(itens), "por_canal": por_canal, "ritmo": ritmo,
             "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"])}
+
+
+def _num(v):
+    t = str(v or "").strip().replace("R$", "").replace(" ", "")
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    return float(t)
+
+
+def custo_de(c, sku):
+    """Custo do SKU (soma se for 'A + B'). Aceita codigo exato ou prefixo cadastrado (ex.: 06016B -> 06016B-PRETA)."""
+    if not sku:
+        return None
+    tabela = {r[0]: r[1] for r in c.execute("SELECT UPPER(sku), custo FROM custos")}
+    total, achou = 0.0, False
+    for parte in [x.strip().upper() for x in sku.split("+") if x.strip()]:
+        if parte in tabela:
+            total += tabela[parte]; achou = True; continue
+        chaves = [k for k in tabela if parte.startswith(k)]
+        if chaves:
+            total += tabela[max(chaves, key=len)]; achou = True
+    return round(total, 2) if achou else None
+
+
+def _gravacoes(c, ini, fim=None):
+    """Lista (colaborador, sku, minutos) - tempo de cada peca = ate o proximo bipe do mesmo gravador (<= 30 min)."""
+    q = """SELECT e.colaborador_id, k.nome, e.em, UPPER(COALESCE(i.sku,'')) sku FROM eventos e JOIN itens i ON i.id=e.item_id
+           LEFT JOIN colaboradores k ON k.id=e.colaborador_id
+           WHERE e.etapa='GRAVACAO_INICIO' AND e.desfeito=0 AND e.em>=?""" + (" AND e.em<?" if fim else "") + \
+        " ORDER BY e.colaborador_id, e.em"
+    rows = c.execute(q, (ini, fim) if fim else (ini,)).fetchall()
+    out = []
+    for a, b in zip(rows, rows[1:]):
+        if a[0] != b[0]:
+            continue
+        m = (datetime.fromisoformat(b[2]) - datetime.fromisoformat(a[2])).total_seconds() / 60
+        if 0 < m <= 30:
+            out.append((a[1] or "?", a[3] or "(sem SKU)", m))
+    return out
+
+
+def tempos_por_material(c, dias):
+    ini = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    g = _gravacoes(c, ini)
+    por = {}
+    for _, sku, m in g:
+        por.setdefault(sku, []).append(m)
+    res = {k: sum(v) / len(v) for k, v in por.items() if len(v) >= 2}
+    if g:
+        res["__GERAL__"] = sum(m for _, _, m in g) / len(g)
+    return res
+
+
+def produtividade(de, ate):
+    ini, _ = dia_utc(de)
+    _, fim = dia_utc(ate)
+    with conn() as c:
+        g = _gravacoes(c, ini, fim)
+        mat, pes_mat = {}, {}
+        for nome, sku, m in g:
+            mat.setdefault(sku, []).append(m)
+            pes_mat.setdefault((nome, sku), []).append(m)
+        media = lambda v: round(sum(v) / len(v), 1)
+        materiais = sorted(({"sku": k, "pecas": len(v), "media_min": media(v), "min": round(min(v), 1),
+                             "max": round(max(v), 1)} for k, v in mat.items()), key=lambda x: -x["pecas"])
+        pessoa_material = sorted(({"nome": n, "sku": s, "pecas": len(v), "media_min": media(v)}
+                                  for (n, s), v in pes_mat.items()), key=lambda x: (x["nome"], -x["pecas"]))
+        pessoas = {}
+        for r in c.execute("""SELECT k.nome, e.etapa, COUNT(*), MIN(e.em), MAX(e.em) FROM eventos e
+                LEFT JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.desfeito=0 AND e.em>=? AND e.em<?
+                GROUP BY k.nome, e.etapa""", (ini, fim)):
+            p = pessoas.setdefault(r[0] or "?", {"nome": r[0] or "?", "separados": 0, "gravados": 0, "expedidos": 0,
+                                                 "devolucoes": 0, "faltas": 0})
+            chave = {"SEPARADO": "separados", "GRAVACAO_INICIO": "gravados", "EXPEDIDO": "expedidos",
+                     "DEVOLVIDO": "devolucoes", "FALTA_MATERIAL": "faltas"}.get(r[1])
+            if chave:
+                p[chave] += r[2]
+        dias_ativos = {r[0] or "?": r[1] for r in c.execute("""SELECT k.nome, COUNT(DISTINCT substr(e.em,1,10))
+                FROM eventos e LEFT JOIN colaboradores k ON k.id=e.colaborador_id
+                WHERE e.desfeito=0 AND e.em>=? AND e.em<? GROUP BY k.nome""", (ini, fim))}
+        por_pessoa_grav = {}
+        for nome, _, m in g:
+            por_pessoa_grav.setdefault(nome, []).append(m)
+        for n, p in pessoas.items():
+            v = por_pessoa_grav.get(n)
+            p["media_gravacao_min"] = media(v) if v else None
+            p["dias"] = dias_ativos.get(n, 0)
+            p["gravados_por_dia"] = round(p["gravados"] / p["dias"], 1) if p["dias"] else 0
+        return {"de": de, "ate": ate, "materiais": materiais, "pessoa_material": pessoa_material,
+                "pessoas": sorted(pessoas.values(), key=lambda x: x["nome"])}
+
+
+def devolucoes(de, ate):
+    ini, _ = dia_utc(de)
+    _, fim = dia_utc(ate)
+    with conn() as c:
+        linhas = [dict(r) for r in c.execute("""SELECT i.id, i.pedido, i.rastreio, i.canal, i.loja, i.sku, i.nomes,
+                e.em, k.nome quem FROM eventos e JOIN itens i ON i.id=e.item_id
+                LEFT JOIN colaboradores k ON k.id=e.colaborador_id
+                WHERE e.etapa='DEVOLVIDO' AND e.desfeito=0 AND e.em>=? AND e.em<? ORDER BY e.em DESC""", (ini, fim))]
+        por = {}
+        for l in linhas:
+            l["custo"] = custo_de(c, l["sku"])
+            partes = [x.strip().upper() for x in (l["sku"] or "").split("+") if x.strip()] or ["(SEM SKU)"]
+            for k in partes:  # pedido com 2 produtos conta em cada produto
+                cu = custo_de(c, k) if k != "(SEM SKU)" else None
+                a = por.setdefault(k, {"sku": k, "qtd": 0, "custo_unit": cu, "total": 0.0})
+                a["qtd"] += 1
+                a["total"] = round(a["total"] + (cu or 0), 2)
+        return {"linhas": linhas, "por_produto": sorted(por.values(), key=lambda x: -x["total"]),
+                "total": round(sum(a["total"] for a in por.values()), 2),
+                "sem_custo": sum(1 for l in linhas if l["custo"] is None)}
 
 
 def historico(iid):
@@ -392,6 +539,13 @@ class H(BaseHTTPRequestHandler):
                       i.pedido, i.sku, i.nomes FROM eventos e JOIN itens i ON i.id=e.item_id
                       LEFT JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.id>? ORDER BY e.id LIMIT 50""", (desde,))]
                 return self._envia(200, {"ultimo": ev[-1]["id"] if ev else desde, "eventos": ev})
+        if p == "/api/produtividade":
+            return self._envia(200, produtividade(q.get("de") or hoje, q.get("ate") or hoje))
+        if p == "/api/devolucoes":
+            return self._envia(200, devolucoes(q.get("de") or hoje, q.get("ate") or hoje))
+        if p == "/api/custos":
+            with conn() as c:
+                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM custos ORDER BY sku")])
         if p == "/api/historico":
             return self._envia(200, historico(int(q.get("id", 0))))
         if p == "/api/colaboradores":
@@ -434,6 +588,51 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, importar_lote(d))
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
+        if p == "/api/custos":
+            with _lock, conn() as c:
+                if d.get("excluir"):
+                    c.execute("DELETE FROM custos WHERE sku=?", (d["sku"],))
+                    return self._envia(200, {"ok": True})
+                linhas = []
+                if d.get("texto"):  # colado da planilha/XBZ: "SKU;custo" ou "SKU<tab>descricao<tab>custo"
+                    for ln in d["texto"].splitlines():
+                        cols = [x.strip() for x in re.split(r"\t|;", ln) if x.strip()]
+                        if len(cols) < 2:
+                            continue
+                        try:
+                            linhas.append((cols[0], " ".join(cols[1:-1]), _num(cols[-1])))
+                        except ValueError:
+                            continue  # cabecalho ou linha sem preco
+                else:
+                    try:
+                        linhas.append((d["sku"], d.get("descricao", ""), _num(d["custo"])))
+                    except (KeyError, ValueError):
+                        return self._envia(400, {"erro": "custo invalido"})
+                for sku, desc, custo in linhas:
+                    if sku.strip():
+                        c.execute("""INSERT INTO custos VALUES(?,?,?,?) ON CONFLICT(sku) DO UPDATE SET
+                                     descricao=COALESCE(NULLIF(excluded.descricao,''),custos.descricao),
+                                     custo=excluded.custo, atualizado_em=excluded.atualizado_em""",
+                                  (sku.strip().upper(), desc, custo, agora()))
+            return self._envia(200, {"ok": True, "importados": len(linhas)})
+        if p == "/api/itens/excluir":
+            ids = [int(x) for x in d.get("ids", [])]
+            with _lock, conn() as c:
+                c.executemany("DELETE FROM itens WHERE id=?", [(i,) for i in ids])
+            return self._envia(200, {"ok": True, "excluidos": len(ids)})
+        if p == "/api/itens/adicionar":
+            if not str(d.get("pedido", "")).strip():
+                return self._envia(400, {"erro": "informe o pedido"})
+            it = {k: d.get(k, "") for k in ("pedido", "rastreio", "canal", "loja", "sku", "cor", "fonte", "obs")}
+            it["nomes"] = [n.strip() for n in str(d.get("nomes", "")).split("|") if n.strip()]
+            it["personalizado"] = bool(d.get("personalizado", True))
+            it["seq"] = "M" + agora()
+            return self._envia(200, importar_lote({"lote": "MANUAL", "itens": [it]}))
+        if p == "/api/itens/editar":
+            with _lock, conn() as c:
+                c.execute("UPDATE itens SET sku=?, atualizado_em=? WHERE id=?",
+                          (str(d.get("sku", "")).strip().upper(), agora(), int(d["id"])))
+            return self._envia(200, {"ok": True})
         if p == "/api/pausas":
             with _lock, conn() as c:
                 if d.get("excluir"):

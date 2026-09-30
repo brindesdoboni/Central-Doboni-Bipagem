@@ -12,18 +12,20 @@ h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}a{color:var(--az)}
 table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}th{color:var(--mut);font-weight:600}
 tr.c{cursor:pointer}tr.c:hover{background:#8881}
 .tag{padding:2px 8px;border-radius:99px;font-size:12px;font-weight:700;color:#fff}
-.AGUARDANDO{background:#71717a}.SEPARADO{background:#0891b2}.EM_GRAVACAO{background:var(--av)}.GRAVADO{background:var(--az)}.EXPEDIDO{background:var(--ok)}
+.AGUARDANDO{background:#71717a}.SEPARADO{background:#0891b2}.EM_GRAVACAO{background:var(--av)}.GRAVADO{background:var(--az)}.EXPEDIDO{background:var(--ok)}.DEVOLVIDO{background:#7c3aed}
 .al{padding:8px 10px;border-left:4px solid var(--er);background:#dc262612;margin-bottom:6px;border-radius:4px}
 input,select,button{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:14px}
 button{cursor:pointer}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);max-width:640px;width:95vw}
+dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{width:100%;min-height:140px;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font:13px monospace}
+.mut{color:var(--mut);font-size:13px}
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;max-width:min(380px,90vw)}
 .toast{background:var(--card);border:1px solid var(--bd);border-left:5px solid var(--az);border-radius:8px;padding:10px 12px;box-shadow:0 4px 14px #0003;font-size:14px;animation:ent .25s ease}
 .toast.SEPARADO{border-left-color:#0891b2}.toast.GRAVACAO_INICIO{border-left-color:var(--av)}.toast.EXPEDIDO{border-left-color:var(--ok)}.toast.FALTA_MATERIAL{border-left-color:var(--er)}
 @keyframes ent{from{opacity:0;transform:translateY(10px)}}
 </style></head><body>
 <header><h1>Central Boni · Produção</h1>
-<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button></div></header>
+<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
 <div class="wrap">
 <div class="kpis" id="kpis"></div>
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
@@ -31,10 +33,24 @@ dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);colo
 <div class="box"><h2>Equipe (dia)</h2><table id="equipe"></table></div>
 <div class="box"><div class="row" style="justify-content:space-between"><h2>Pedidos</h2>
 <div class="row"><input id="busca" placeholder="Buscar pedido, nome, SKU…" oninput="tabela()"><select id="fst" onchange="tabela()"><option value="">Todos</option>
-<option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>EXPEDIDO</option><option value="FALTA">Falta material</option></select></div></div>
+<option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>EXPEDIDO</option><option>DEVOLVIDO</option><option value="FALTA">Falta material</option></select></div></div>
+<div class="row" style="margin:6px 0 10px"><button onclick="selTodos(true)">Selecionar todos (da lista)</button><button onclick="selTodos(false)">Limpar seleção</button>
+<button onclick="excluirSel()" style="border-color:var(--er);color:var(--er)">Excluir selecionados</button><button onclick="dlgAdd.showModal()">+ Incluir etiqueta</button><span class="mut" id="nsel"></span></div>
 <table id="itens"></table></div>
 <div id="toasts"></div><p style="color:var(--mut);font-size:12px">Atualiza em tempo real (1 segundo).</p>
 </div>
+<dialog id="dlgAdd"><h2>Incluir etiqueta manualmente</h2>
+<div class="row"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio (código de barras)"><select id="aCan"><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA RAPIDA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
+<div class="row" style="margin-top:8px"><input id="aSku" placeholder="SKU"><input id="aNom" placeholder="Nome(s) — separe com |"><input id="aFon" placeholder="Fonte"><label><input type="checkbox" id="aPer" checked> Tem gravação</label></div>
+<p class="mut">O bipe funciona pelo nº do pedido ou pelo rastreio.</p><p><button onclick="addItem()">Incluir</button> <button onclick="dlgAdd.close()">Fechar</button> <span id="aMsg" class="mut"></span></p></dialog>
+<dialog id="dlgProd" class="largo"><h2>Produtividade</h2><div class="row"><input type="date" id="prDe"> até <input type="date" id="prAte"><button onclick="carregarProd()">Ver</button><span class="mut">Tempo por peça = intervalo até o próximo bipe do mesmo gravador (pausas acima de 30 min não contam).</span></div>
+<div class="dbody"><h3>Por colaborador</h3><table id="prPes"></table><h3>Tempo de cada material (aprendido com os bipes)</h3><table id="prMat"></table><h3>Cada colaborador × material</h3><table id="prPM"></table></div><p><button onclick="dlgProd.close()">Fechar</button></p></dialog>
+<dialog id="dlgDev" class="largo"><h2>Devoluções</h2><div class="row"><input type="date" id="dvDe"> até <input type="date" id="dvAte"><button onclick="carregarDev()">Ver</button></div>
+<div class="dbody"><div id="dvRes" style="margin:10px 0;font-size:16px"></div><h3>Por produto</h3><table id="dvProd"></table><h3>Pedidos devolvidos</h3><table id="dvLin"></table></div><p><button onclick="dlgDev.close()">Fechar</button></p></dialog>
+<dialog id="dlgCus" class="largo"><h2>Custos dos produtos (XBZ)</h2>
+<p class="mut">Cole aqui a lista copiada da planilha ou da XBZ — uma linha por produto: <b>SKU;custo</b> ou colunas <b>SKU [tab] descrição [tab] preço</b>. Pode colar tudo de uma vez; o que já existe é atualizado. Um código cadastrado também vale para as variações (ex.: 06016B vale para 06016B-PRETA).</p>
+<textarea id="cTxt" placeholder="06016B;12,90&#10;09824;8,50"></textarea><div class="row" style="margin:8px 0"><button onclick="importCus()">Importar lista</button> ou um só: <input id="cSku" placeholder="SKU" size="12"><input id="cVal" placeholder="Custo (ex.: 12,90)" size="10"><button onclick="addCus()">Salvar</button><span id="cMsg" class="mut"></span></div>
+<div class="dbody"><table id="cus"></table></div><p><button onclick="dlgCus.close()">Fechar</button></p></dialog>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
 <dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><button onclick="addPau()">Adicionar</button></div>
 <table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes.</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
@@ -43,7 +59,8 @@ dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);colo
 <script>
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const hora=s=>s?new Date(s).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}):"-";
-const NOMES={AGUARDANDO:"Aguardando",SEPARADO:"Separado",EM_GRAVACAO:"Em gravação",EXPEDIDO:"Expedido"};
+const NOMES={AGUARDANDO:"Aguardando",SEPARADO:"Separado",EM_GRAVACAO:"Em gravação",EXPEDIDO:"Expedido",DEVOLVIDO:"Devolvido"};
+const SEL=new Set();
 let D=null;
 $("data").value=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
 $("data").onchange=carregar;
@@ -60,8 +77,9 @@ function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_mater
  tabela()}
 function tabela(){if(!D)return;const b=$("busca").value.toLowerCase(),f=$("fst").value;
  const L=D.itens.filter(i=>(!f||(f==="FALTA"?i.falta_material:i.status===f))&&(!b||[i.pedido,i.nomes,i.sku,i.rastreio,i.loja].join(" ").toLowerCase().includes(b)));
- $("itens").innerHTML="<tr><th>Etiq.</th><th>Pedido</th><th>Canal</th><th>SKU</th><th>Nome</th><th>Fonte</th><th>Status</th></tr>"+
-  L.slice(0,500).map(i=>`<tr class="c" onclick="hist(${i.id},'${esc(i.pedido)}')"><td>${esc(i.etiqueta)}</td><td>${esc(i.pedido)}</td><td>${esc(i.canal)}</td><td>${esc(i.sku)} ${esc(i.cor)}</td><td>${esc(i.nomes)}</td><td>${esc(i.fonte)}</td><td><span class="tag ${i.status}">${NOMES[i.status]}</span>${i.falta_material?' <span class="tag" style="background:var(--er)">FALTA</span>':""}</td></tr>`).join("")}
+ LISTA=L;$("nsel").textContent=SEL.size?SEL.size+" selecionada(s)":"";
+ $("itens").innerHTML="<tr><th></th><th>Etiq.</th><th>Pedido</th><th>Canal</th><th>SKU</th><th>Nome</th><th>Fonte</th><th>Status</th></tr>"+
+  L.slice(0,500).map(i=>`<tr class="c" onclick="hist(${i.id},'${esc(i.pedido)}')"><td onclick="event.stopPropagation()"><input type="checkbox" ${SEL.has(i.id)?"checked":""} onchange="marca(${i.id},this.checked)"></td><td>${esc(i.etiqueta)}</td><td>${esc(i.pedido)}</td><td>${esc(i.canal)}</td><td>${esc(i.sku)} ${esc(i.cor)}</td><td>${esc(i.nomes)}</td><td>${esc(i.fonte)}</td><td><span class="tag ${i.status}">${NOMES[i.status]}</span>${i.falta_material?' <span class="tag" style="background:var(--er)">FALTA</span>':""}</td></tr>`).join("")}
 async function hist(id,ped){const h=await (await fetch("/api/historico?id="+id)).json();$("hTit").textContent="Pedido "+ped;
  $("hist").innerHTML="<tr><th>Hora</th><th>Etapa</th><th>Quem</th><th>Alerta</th></tr>"+h.map(e=>`<tr style="${e.desfeito?"text-decoration:line-through;opacity:.5":""}"><td>${new Date(e.em).toLocaleString("pt-BR")}</td><td>${esc(e.etapa)}</td><td>${esc(e.nome)}</td><td>${esc(e.alerta)}</td></tr>`).join("");dlgHist.showModal()}
 async function carregarCol(){const L=await (await fetch("/api/colaboradores")).json();
@@ -72,7 +90,7 @@ async function carregarPau(){const L=await (await fetch("/api/pausas")).json();
  $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
 async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value})});pPes.value="";carregarPau()}
 async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
-const ETQ={SEPARADO:"separou",GRAVACAO_INICIO:"mandou para gravação",EXPEDIDO:"expediu",FALTA_MATERIAL:"marcou FALTA DE MATERIAL em"};
+const ETQ={SEPARADO:"separou",GRAVACAO_INICIO:"mandou para gravação",EXPEDIDO:"expediu",FALTA_MATERIAL:"marcou FALTA DE MATERIAL em",DEVOLVIDO:"registrou DEVOLUÇÃO do"};
 let ultimoEv=-1,ocupado=false;
 function toast(e){const t=document.createElement("div");t.className="toast "+e.etapa;
  t.innerHTML=`<b>${esc(e.nome||"?")}</b> ${ETQ[e.etapa]||esc(e.etapa)} o pedido ${esc(e.pedido)}<br><span style="color:var(--mut)">${esc(e.sku||"")} ${e.nomes?"· "+esc(e.nomes):""} · ${hora(e.em)}</span>`;
@@ -81,6 +99,38 @@ async function vigiar(){if(ocupado||document.hidden)return;ocupado=true;
  try{const r=await (await fetch("/api/eventos?desde="+ultimoEv)).json();
   if(ultimoEv>=0&&r.eventos.length){r.eventos.filter(e=>!e.desfeito).forEach(toast);carregar()}
   ultimoEv=r.ultimo}catch(e){}ocupado=false}
+let LISTA=[];const brl=v=>v==null?"—":"R$ "+Number(v).toFixed(2).replace(".",",");
+const POST=(u,b)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());
+function marca(id,on){on?SEL.add(id):SEL.delete(id);$("nsel").textContent=SEL.size?SEL.size+" selecionada(s)":""}
+function selTodos(on){if(on)LISTA.forEach(i=>SEL.add(i.id));else SEL.clear();tabela()}
+async function excluirSel(){if(!SEL.size)return alert("Selecione as etiquetas primeiro.");
+ if(!confirm(`Excluir ${SEL.size} etiqueta(s) do sistema? Os bipes delas também serão apagados. Não dá para desfazer.`))return;
+ const r=await POST("/api/itens/excluir",{ids:[...SEL]});SEL.clear();alert(r.excluidos+" etiqueta(s) excluída(s).");carregar()}
+async function addItem(){if(!aPed.value.trim())return alert("Informe o nº do pedido");
+ const r=await POST("/api/itens/adicionar",{pedido:aPed.value.trim(),rastreio:aRas.value.trim(),canal:aCan.value,sku:aSku.value.trim().toUpperCase(),nomes:aNom.value,fonte:aFon.value.trim(),personalizado:aPer.checked});
+ $("aMsg").textContent=r.ok?"Incluída ✔":"Erro: "+(r.erro||"");if(r.ok){aPed.value=aRas.value=aSku.value=aNom.value=aFon.value="";carregar()}}
+const hojeISO=()=>$("data").value, diasAtras=n=>new Date(Date.now()-3*3600e3-n*864e5).toISOString().slice(0,10);
+function abrirProd(){if(!prDe.value){prDe.value=diasAtras(29);prAte.value=hojeISO()}dlgProd.showModal();carregarProd()}
+async function carregarProd(){const d=await (await fetch(`/api/produtividade?de=${prDe.value}&ate=${prAte.value}`)).json();
+ const mn=v=>v==null?"—":v+" min";
+ $("prPes").innerHTML="<tr><th>Colaborador</th><th>Dias</th><th>Separados</th><th>Gravados</th><th>Gravados/dia</th><th>Tempo médio por peça</th><th>Expedidos</th><th>Devoluções</th><th>Faltas</th></tr>"+
+  d.pessoas.map(p=>`<tr><td><b>${esc(p.nome)}</b></td><td>${p.dias}</td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.gravados_por_dia}</td><td>${mn(p.media_gravacao_min)}</td><td>${p.expedidos}</td><td>${p.devolucoes}</td><td>${p.faltas}</td></tr>`).join("");
+ $("prMat").innerHTML=d.materiais.length?"<tr><th>Material (SKU)</th><th>Peças medidas</th><th>Tempo médio</th><th>Mais rápida</th><th>Mais lenta</th></tr>"+
+  d.materiais.map(m=>`<tr><td><b>${esc(m.sku)}</b></td><td>${m.pecas}</td><td><b>${m.media_min} min</b></td><td>${m.min} min</td><td>${m.max} min</td></tr>`).join(""):"<tr><td class='mut'>Ainda sem gravações suficientes no período.</td></tr>";
+ $("prPM").innerHTML=d.pessoa_material.length?"<tr><th>Colaborador</th><th>Material</th><th>Peças</th><th>Tempo médio</th></tr>"+
+  d.pessoa_material.map(m=>`<tr><td>${esc(m.nome)}</td><td>${esc(m.sku)}</td><td>${m.pecas}</td><td>${m.media_min} min</td></tr>`).join(""):""}
+function abrirDev(){if(!dvDe.value){dvDe.value=diasAtras(29);dvAte.value=hojeISO()}dlgDev.showModal();carregarDev()}
+async function carregarDev(){const d=await (await fetch(`/api/devolucoes?de=${dvDe.value}&ate=${dvAte.value}`)).json();
+ $("dvRes").innerHTML=`<b>${d.linhas.length}</b> devolução(ões) · custo total <b>${brl(d.total)}</b>`+(d.sem_custo?` · <span style="color:var(--er)">${d.sem_custo} sem custo cadastrado ou sem SKU</span>`:"");
+ $("dvProd").innerHTML="<tr><th>Produto (SKU)</th><th>Qtd</th><th>Custo unit.</th><th>Total</th></tr>"+d.por_produto.map(p=>`<tr><td><b>${esc(p.sku)}</b></td><td>${p.qtd}</td><td>${brl(p.custo_unit)}</td><td><b>${brl(p.total)}</b></td></tr>`).join("");
+ $("dvLin").innerHTML="<tr><th>Data</th><th>Pedido</th><th>Canal</th><th>SKU</th><th>Custo</th><th>Quem bipou</th></tr>"+d.linhas.map(l=>`<tr><td>${new Date(l.em).toLocaleString("pt-BR")}</td><td>${esc(l.pedido)}</td><td>${esc(l.canal)}</td>
+  <td><input value="${esc(l.sku)}" size="16" placeholder="informe o SKU" onchange="editSku(${l.id},this.value)"></td><td>${brl(l.custo)}</td><td>${esc(l.quem)}</td></tr>`).join("")}
+async function editSku(id,v){await POST("/api/itens/editar",{id,sku:v});carregarDev()}
+async function carregarCus(){const L=await (await fetch("/api/custos")).json();
+ $("cus").innerHTML="<tr><th>SKU</th><th>Descrição</th><th>Custo</th><th>Atualizado</th><th></th></tr>"+L.map(c=>`<tr><td><b>${esc(c.sku)}</b></td><td>${esc(c.descricao)}</td><td>${brl(c.custo)}</td><td>${c.atualizado_em?new Date(c.atualizado_em).toLocaleDateString("pt-BR"):""}</td><td><button onclick="delCus('${esc(c.sku)}')">Excluir</button></td></tr>`).join("")}
+async function importCus(){if(!cTxt.value.trim())return;const r=await POST("/api/custos",{texto:cTxt.value});$("cMsg").textContent=r.importados+" produto(s) importado(s)";cTxt.value="";carregarCus()}
+async function addCus(){if(!cSku.value.trim()||!cVal.value.trim())return;const r=await POST("/api/custos",{sku:cSku.value,custo:cVal.value});$("cMsg").textContent=r.ok?"Salvo ✔":"Custo inválido";cSku.value=cVal.value="";carregarCus()}
+async function delCus(sku){if(confirm("Excluir o custo de "+sku+"?")){await POST("/api/custos",{sku,excluir:true});carregarCus()}}
 carregar();vigiar();setInterval(vigiar,1000);setInterval(()=>{if(!document.hidden)carregar()},30000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)carregar()});
 </script></body></html>
