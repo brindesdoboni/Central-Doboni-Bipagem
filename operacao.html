@@ -43,7 +43,7 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  const R=d.ritmo,rit=["SEPARACAO","GRAVACAO","EXPEDICAO"].map(p=>R[p].por_hora?`${{SEPARACAO:"Separação",GRAVACAO:"Gravação",EXPEDICAO:"Expedição"}[p]}: ${R[p].por_hora}/h`:"").filter(Boolean).join(" · ");
  $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+`<td class="${v.FALTA?"nt":""}">${v.FALTA||0}</td></tr>`).join("");
-const CP={"ENTREGA DIRETA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
+const CP={"SHOPEE ENTREGA RÁPIDA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
  $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><b>${p.total&&!p.faltam?"✓":p.faltam}</b><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
 }catch(e){}}

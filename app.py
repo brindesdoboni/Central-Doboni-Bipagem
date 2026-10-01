@@ -79,14 +79,14 @@ def _envio_obs(obs):
     return m[-1].strip() if m else ""
 
 
-GRUPOS = ["ENTREGA DIRETA", "SHOPEE EXPRESS", "TIKTOK", "OUTROS"]
+GRUPOS = ["SHOPEE ENTREGA RÁPIDA", "TIKTOK", "SHOPEE EXPRESS", "OUTROS"]
 
 
 def grupo_envio(i):
     """Plataforma/forma de envio para a contagem do dia (lojas juntas)."""
     t = " ".join([i.get("canal") or "", i.get("envio") or "", _envio_obs(i.get("obs"))]).upper()
     if "DIRETA" in t or "RAPIDA" in t or "RÁPIDA" in t:
-        return "ENTREGA DIRETA"
+        return "SHOPEE ENTREGA RÁPIDA"
     if "TIKTOK" in t or "TIK TOK" in t:
         return "TIKTOK"
     if "SHOPEE" in t or "SPX" in t or "XPRESS" in t:
@@ -125,7 +125,7 @@ def por_plataforma(itens):
         r = res[p["grupo"]]
         r["total"] += 1
         r["faltam" if p["pendente"] else "enviados"] += 1
-    return [dict(grupo=g, **res[g]) for g in GRUPOS if res[g]["total"] or g != "OUTROS"]
+    return [dict(grupo=g, **res[g]) for g in GRUPOS if True]
 
 
 def importar_lote(dados):
