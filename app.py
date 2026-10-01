@@ -55,6 +55,8 @@ def iniciar_db():
             c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
         if "envio" not in [r[1] for r in c.execute("PRAGMA table_info(itens)")]:
             c.execute("ALTER TABLE itens ADD COLUMN envio TEXT DEFAULT ''")
+        if "duracao" not in [r[1] for r in c.execute("PRAGMA table_info(pausas)")]:
+            c.execute("ALTER TABLE pausas ADD COLUMN duracao INTEGER DEFAULT 15")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
         c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
         padrao = [("Cafe da manha", "09:15", "Rafael, Guilherme"), ("Cafe da manha", "09:30", "Yuri, Juninho"),
@@ -77,7 +79,7 @@ def _envio_obs(obs):
     return m[-1].strip() if m else ""
 
 
-GRUPOS = ["ENTREGA DIRETA", "SHOPEE EXPRESS", "SHOPEE", "TIKTOK", "OUTROS"]
+GRUPOS = ["ENTREGA DIRETA", "SHOPEE EXPRESS", "TIKTOK", "OUTROS"]
 
 
 def grupo_envio(i):
@@ -87,11 +89,22 @@ def grupo_envio(i):
         return "ENTREGA DIRETA"
     if "TIKTOK" in t or "TIK TOK" in t:
         return "TIKTOK"
-    if "SHOPEE" in t or "SPX" in t:
-        if "XPRESS" in t or "SPX" in t or re.match(r"BR\d", (i.get("rastreio") or "").upper()):
-            return "SHOPEE EXPRESS"
-        return "SHOPEE"
+    if "SHOPEE" in t or "SPX" in t or "XPRESS" in t:
+        return "SHOPEE EXPRESS"  # Shopee que nao e entrega direta = Express
     return "OUTROS"
+
+
+def por_grupo_status(itens, etapas):
+    """Tabela 'Canal' agrupada como os quadros + coluna FALTA (bipado em 'nao tem' e ainda nao saiu)."""
+    res = {}
+    for i in itens:
+        if i["status"] not in etapas:
+            continue
+        d = res.setdefault(grupo_envio(i), {**{e: 0 for e in etapas}, "FALTA": 0})
+        d[i["status"]] += 1
+        if i["falta_material"] and i["status"] not in ("EXPEDIDO", "DEVOLVIDO"):
+            d["FALTA"] += 1
+    return {g: res[g] for g in GRUPOS if g in res}
 
 
 def por_plataforma(itens):
@@ -112,7 +125,7 @@ def por_plataforma(itens):
         r = res[p["grupo"]]
         r["total"] += 1
         r["faltam" if p["pendente"] else "enviados"] += 1
-    return [dict(grupo=g, **res[g]) for g in GRUPOS if res[g]["total"] or g not in ("SHOPEE", "OUTROS")]
+    return [dict(grupo=g, **res[g]) for g in GRUPOS if res[g]["total"] or g != "OUTROS"]
 
 
 def importar_lote(dados):
@@ -311,10 +324,7 @@ def painel(data):
         cont = {e: 0 for e in ETAPAS}
         for i in itens:
             cont[i["status"]] += 1
-        por_canal = {}
-        for i in itens:
-            d = por_canal.setdefault(i["canal"] or "-", {e: 0 for e in ETAPAS})
-            d[i["status"]] += 1
+        por_canal = por_grupo_status(itens, ETAPAS)
         evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
              ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
         equipe = {}
@@ -355,10 +365,9 @@ def operacao():
     d = painel(hoje)
     itens = [i for i in d["itens"] if i["status"] != "DEVOLVIDO"]
     cont = {e: 0 for e in ETAPAS if e != "DEVOLVIDO"}
-    por_canal = {}
     for i in itens:
         cont[i["status"]] += 1
-        por_canal.setdefault(i["canal"] or "-", {e: 0 for e in cont})[i["status"]] += 1
+    por_canal = por_grupo_status(itens, list(cont))
     agora_ = datetime.now(timezone.utc)
     ini, _ = dia_utc(hoje)
     ritmo, restante = {}, {
@@ -713,12 +722,15 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/api/pausas":
             with _lock, conn() as c:
+                dur = max(1, min(240, int(d.get("duracao") or 15)))
                 if d.get("excluir"):
                     c.execute("DELETE FROM pausas WHERE id=?", (d["id"],))
+                elif d.get("id"):
+                    c.execute("UPDATE pausas SET duracao=? WHERE id=?", (dur, d["id"]))
                 elif re.fullmatch(r"\d{1,2}:\d{2}", d.get("hora", "")):
                     h, m = d["hora"].split(":")
-                    c.execute("INSERT INTO pausas(nome,hora,pessoas) VALUES(?,?,?)",
-                              (d.get("nome") or "Pausa", f"{int(h):02d}:{m}", d.get("pessoas", "")))
+                    c.execute("INSERT INTO pausas(nome,hora,pessoas,duracao) VALUES(?,?,?,?)",
+                              (d.get("nome") or "Pausa", f"{int(h):02d}:{m}", d.get("pessoas", ""), dur))
                 else:
                     return self._envia(400, {"erro": "hora invalida (use 09:15)"})
             return self._envia(200, {"ok": True})

@@ -14,13 +14,14 @@ input{position:absolute;opacity:0;left:-999px}
 footer{padding:10px 20px;background:#222;font-size:16px;opacity:.8;display:flex;justify-content:space-between}
 a{color:#aaa}
 #pausa{display:none;padding:10px 20px;background:#3b2f00;color:#ffd84d;font-size:24px;font-weight:700;text-align:center}
+#emPausa{display:none;padding:12px 20px;background:#b45309;color:#fff;font-size:28px;font-weight:900;text-align:center}
 #alarme{display:none;position:fixed;inset:0;z-index:9;align-items:center;justify-content:center;flex-direction:column;text-align:center;font-size:64px;font-weight:900;color:#fff;background:#d7263d}
 #alarme.on{display:flex;animation:pisca .5s steps(1) infinite}@keyframes pisca{50%{background:#5a0000}}
 </style></head><body>
 <header><div id="posto">-</div><div id="op">Bipe seu CRACHÁ</div></header>
 <div id="pausa"></div><div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alNomes" style="font-size:48px;margin-top:16px"></div></div>
 <main id="tela"><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO: FALTA DE MATERIAL — bipe a etiqueta</div></main>
-<footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe) · bipe o código do posto para trocar</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
+<div id="emPausa"></div><footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe) · bipe o código do posto para trocar</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
 <input id="in" autocomplete="off">
 <script>
 const POSTOS={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",DEVOLUCAO:"DEVOLUÇÃO"};
@@ -67,10 +68,12 @@ function boing(t0){const a=audio();if(!a)return;[[0,660,220],[.35,880,330],[.7,5
 function alarme(p){$("alNomes").textContent=p.pessoas;$("alarme").classList.add("on");for(let i=0;i<30;i+=2)boing(i);
  setTimeout(()=>$("alarme").classList.remove("on"),30000)}
 async function carregarPausas(){try{const r=await fetch("/api/pausas",{headers:{"X-Chave":chave}});if(r.ok)PAUSAS=await r.json()}catch(e){}}
-function tickPausas(){const n=new Date(),hoje=n.toDateString(),seg=n.getHours()*3600+n.getMinutes()*60+n.getSeconds();let prox=null;
+function tickPausas(){const n=new Date(),hoje=n.toDateString(),seg=n.getHours()*3600+n.getMinutes()*60+n.getSeconds();let prox=null,em=[];
  for(const p of PAUSAS){const [h,m]=p.hora.split(":").map(Number),alvo=h*3600+m*60,falta=alvo-seg,k=hoje+p.id;
   if(falta<=0&&falta>-5&&!tocadas[k]){tocadas[k]=1;alarme(p)}
+  const resta=falta+(p.duracao||15)*60;if(falta<=0&&resta>0)em.push(`☕ ${p.pessoas} em pausa — volta em ${Math.floor(resta/60)}:${String(resta%60).padStart(2,"0")}`);
   if(falta>0&&falta<=3600&&(!prox||falta<prox.falta))prox={...p,falta}}
+ const ep=$("emPausa");ep.style.display=em.length?"block":"none";ep.innerHTML=em.map(esc).join("<br>");
  const el=$("pausa");if(!prox){el.style.display="none";return}
  const mm=Math.floor(prox.falta/60),ss=String(prox.falta%60).padStart(2,"0");
  el.style.display="block";el.textContent=`☕ ${prox.nome} — ${prox.pessoas} em ${mm}:${ss}`}

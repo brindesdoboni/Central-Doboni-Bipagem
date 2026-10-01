@@ -61,8 +61,8 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <textarea id="cTxt" placeholder="06016B;12,90&#10;09824;8,50"></textarea><div class="row" style="margin:8px 0"><button onclick="importCus()">Importar lista</button> ou um só: <input id="cSku" placeholder="SKU" size="12"><input id="cVal" placeholder="Custo (ex.: 12,90)" size="10"><button onclick="addCus()">Salvar</button><span id="cMsg" class="mut"></span></div>
 <div class="dbody"><table id="cus"></table></div><p><button onclick="dlgCus.close()">Fechar</button></p></dialog>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
-<dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><button onclick="addPau()">Adicionar</button></div>
-<table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes.</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
+<dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><label>Duração <input id="pDur" type="number" min="1" max="240" value="15" style="width:70px"> min</label><button onclick="addPau()">Adicionar</button></div>
+<table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes. Durante a pausa, fica embaixo na tela a contagem regressiva até a volta (pela duração).</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
 <dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Devolução</option></select><button onclick="addCol()">Adicionar</button></div>
 <table id="cols" style="margin-top:10px"></table><p><button onclick="dlgCol.close()">Fechar</button></p></dialog>
 <script>
@@ -83,8 +83,8 @@ function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_mater
  $("plats").innerHTML="<tr><th>Plataforma / envio</th><th>Subiram</th><th>Saíram (expedidos)</th><th>Faltam enviar</th></tr>"+
   PL.map(p=>`<tr><td><b>${esc(p.grupo)}</b></td><td>${p.total}</td><td>${p.enviados}</td><td><b>${p.faltam}</b></td></tr>`).join("")+
   `<tr><td><b>TOTAL</b></td><td><b>${sm("total")}</b></td><td><b>${sm("enviados")}</b></td><td><b>${sm("faltam")}</b></td></tr>`;
- $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOMES).map(n=>`<th>${n}</th>`).join("")+"</tr>"+
-  Object.entries(D.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOMES).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
+ $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOMES).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+
+  Object.entries(D.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOMES).map(s=>`<td>${v[s]}</td>`).join("")+`<td><b style="color:${v.FALTA?"#d7263d":"inherit"}">${v.FALTA||0}</b></td></tr>`).join("");
  $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Média por peça</th><th>Expedidos</th><th>Faltas</th><th>1º bipe</th><th>Último</th></tr>"+
   Object.entries(D.equipe).map(([n,p])=>`<tr><td><b>${esc(n)}</b></td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.media_gravacao_min??"-"}${p.media_gravacao_min!=null?" min":""}</td><td>${p.expedidos}</td><td>${p.faltas}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}</td></tr>`).join("");
  tabela()}
@@ -102,8 +102,9 @@ async function excluirCol(id,nome){if(!confirm(`Excluir ${nome} da equipe? O cra
 async function addCol(){if(!nNome.value.trim())return;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:nNome.value.trim(),funcao:nFunc.value})});nNome.value="";carregarCol()}
 async function salvarCol(c,at){c.ativo=at;await fetch("/api/colaboradores",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})}
 async function carregarPau(){const L=await (await fetch("/api/pausas")).json();
- $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
-async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value})});pPes.value="";carregarPau()}
+ $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th>Duração (min)</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><input type="number" min="1" max="240" value="${p.duracao||15}" style="width:70px" onchange="durPau(${p.id},this.value)"></td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
+async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value,duracao:+pDur.value||15})});pPes.value="";carregarPau()}
+async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,duracao:+v||15})});carregarPau()}
 async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
 const ETQ={SEPARADO:"separou",GRAVACAO_INICIO:"mandou para gravação",EXPEDIDO:"expediu",FALTA_MATERIAL:"marcou FALTA DE MATERIAL em",DEVOLVIDO:"registrou DEVOLUÇÃO do"};
 let ultimoEv=-1,ocupado=false;

@@ -17,6 +17,8 @@ table{width:100%;border-collapse:collapse;font-size:24px}th,td{padding:10px 12px
 #alarme{display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;font-size:80px;font-weight:900;background:#d7263d;text-align:center}
 #alarme.on{display:flex;animation:p .5s steps(1) infinite}@keyframes p{50%{background:#5a0000}}
 #falta{color:#f87171}
+#emPausa{display:none;position:fixed;left:0;right:0;bottom:0;z-index:5;padding:14px 28px;background:#b45309;color:#fff;font-size:34px;font-weight:900;text-align:center}
+td.nt{color:#f87171;font-weight:800}
 </style></head><body>
 <header><h1>Operação Brindes do Boni</h1><div id="relogio"></div></header>
 <div id="pausa"></div>
@@ -26,6 +28,7 @@ table{width:100%;border-collapse:collapse;font-size:24px}th,td{padding:10px 12px
  <div><div class="bar" id="barra"></div><p class="prev" id="prev">Calculando previsão…</p></div>
  <div><table id="canais"></table><p style="font-size:22px" id="falta"></p></div>
 </main>
+<div id="emPausa"></div>
 <div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alN" style="font-size:56px;margin-top:16px"></div></div>
 <script>
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
@@ -39,7 +42,7 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  $("barra").innerHTML=Object.keys(NOM).map(k=>`<div style="width:${100*c[k]/t}%;background:${COR[k]}"></div>`).join("");
  const R=d.ritmo,rit=["SEPARACAO","GRAVACAO","EXPEDICAO"].map(p=>R[p].por_hora?`${{SEPARACAO:"Separação",GRAVACAO:"Gravação",EXPEDICAO:"Expedição"}[p]}: ${R[p].por_hora}/h`:"").filter(Boolean).join(" · ");
  $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";
- $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"</tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
+ $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+`<td class="${v.FALTA?"nt":""}">${v.FALTA||0}</td></tr>`).join("");
 const CP={"ENTREGA DIRETA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
  $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><b>${p.total&&!p.faltam?"✓":p.faltam}</b><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
@@ -49,10 +52,12 @@ let P=[],ctx=null,tocou={};
 function som(){try{ctx=ctx||new AudioContext();[[0,660,220],[.35,880,330],[.7,523,1047]].forEach(([d,a,b])=>{for(let i=0;i<30;i+=2){const o=ctx.createOscillator(),g=ctx.createGain();o.type="square";o.connect(g);g.connect(ctx.destination);const t=ctx.currentTime+i+d;o.frequency.setValueAtTime(a,t);o.frequency.exponentialRampToValueAtTime(b,t+.3);g.gain.setValueAtTime(.25,t);g.gain.exponentialRampToValueAtTime(.001,t+.32);o.start(t);o.stop(t+.33)}})}catch(e){}}
 async function pausas(){try{const r=await fetch("/api/pausas",{headers:{"X-Chave":chave}});if(r.ok)P=await r.json()}catch(e){}}
 function tick(){const n=new Date();$("relogio").textContent=n.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
- const seg=n.getHours()*3600+n.getMinutes()*60+n.getSeconds();let px=null;
+ const seg=n.getHours()*3600+n.getMinutes()*60+n.getSeconds();let px=null,em=[];
  for(const p of P){const[h,m]=p.hora.split(":").map(Number),f=h*3600+m*60-seg,k=n.toDateString()+p.id;
   if(f<=0&&f>-5&&!tocou[k]){tocou[k]=1;$("alN").textContent=p.pessoas;$("alarme").classList.add("on");som();setTimeout(()=>$("alarme").classList.remove("on"),30000)}
+  const resta=f+(p.duracao||15)*60;if(f<=0&&resta>0)em.push(`☕ ${p.pessoas} em pausa — volta em ${Math.floor(resta/60)}:${String(resta%60).padStart(2,"0")}`);
   if(f>0&&f<=3600&&(!px||f<px.f))px={...p,f}}
+ const ep=$("emPausa");ep.style.display=em.length?"block":"none";ep.innerHTML=em.map(esc).join("<br>");
  const e=$("pausa");if(!px){e.style.display="none";return}e.style.display="block";
  e.textContent=`☕ ${px.nome} — ${px.pessoas} em ${Math.floor(px.f/60)}:${String(px.f%60).padStart(2,"0")}`}
 document.addEventListener("click",()=>{try{ctx=ctx||new AudioContext();ctx.resume()}catch(e){}},{once:true});
