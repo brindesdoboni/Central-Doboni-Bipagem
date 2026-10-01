@@ -49,6 +49,8 @@ def iniciar_db():
         CREATE INDEX IF NOT EXISTS ix_it_criado ON itens(criado_em);
         CREATE TABLE IF NOT EXISTS pausas(id INTEGER PRIMARY KEY, nome TEXT, hora TEXT, pessoas TEXT);
         CREATE TABLE IF NOT EXISTS custos(sku TEXT PRIMARY KEY, descricao TEXT, custo REAL, atualizado_em TEXT);
+        CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY, em TEXT, remetente TEXT, assunto TEXT,
+            arquivos TEXT, etiquetas INTEGER, novos INTEGER, atualizados INTEGER, erro TEXT);
         """)
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
         if "excluido" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
@@ -608,6 +610,10 @@ class H(BaseHTTPRequestHandler):
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
         hoje = datetime.now(BR).strftime("%Y-%m-%d")
+        if p == "/api/emails":
+            with conn() as c:
+                ult = [dict(r) for r in c.execute("SELECT * FROM emails ORDER BY id DESC LIMIT 30")]
+            return self._envia(200, {"status": _email_status, "recebidos": ult})
         if p == "/api/painel":
             return self._envia(200, painel(q.get("data") or hoje))
         if p == "/api/eventos":
@@ -750,8 +756,129 @@ class H(BaseHTTPRequestHandler):
         self._envia(404, {"erro": "nao encontrado"})
 
 
+# ------------------------------------------------------------------ etiquetas por e-mail
+# Mande (ou encaminhe) o PDF de etiquetas do UpSeller para o e-mail da Central: ela le e inclui sozinha.
+EMAIL_USUARIO = os.environ.get("EMAIL_USUARIO", "").strip()
+EMAIL_SENHA = os.environ.get("EMAIL_SENHA", "").replace(" ", "")
+EMAIL_IMAP = os.environ.get("EMAIL_IMAP", "imap.gmail.com")
+EMAIL_REMETENTES = [x.strip().lower() for x in os.environ.get("EMAIL_REMETENTES", "").split(",") if x.strip()]
+EMAIL_INTERVALO = int(os.environ.get("EMAIL_INTERVALO", "60"))
+
+
+def ler_etiqueta_txt(t):
+    """Mesma leitura do painel ('Importar PDF'): uma pagina de etiqueta -> item da Central."""
+    T = t.upper()
+    m = re.search(r"\b(2\d{5}[0-9A-Z]{8})\b", t) or re.search(r"\b(5\d{17})\b", t)
+    ped = m.group(1) if m else ""
+    ras = ""
+    for rx in (r"\b(BR\d{12,14}[A-Z]?)\b", r"\b([A-Z]{2}\d{9}BR)\b", r"\b(88\d{10,14})\b"):
+        m = re.search(rx, t)
+        if m and m.group(1) != ped:
+            ras = m.group(1)
+            break
+    if not ped and not ras:
+        return None
+    if re.match(r"2\d{5}", ped) or re.search(r"SHOPEE|\bSPX\b", T):
+        canal = "SHOPEE"
+    elif re.fullmatch(r"5\d{17}", ped) or re.search(r"TIKTOK|TIK TOK|J&T", T):
+        canal = "TIKTOK"
+    else:
+        canal = "OUTROS"
+    envio = ""
+    if re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
+        envio = canal = "ENTREGA DIRETA"
+    elif canal == "SHOPEE" and re.search(r"XPRESS|\bSPX\b", T):
+        envio = "SHOPEE XPRESS"
+    skus = list(dict.fromkeys(x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._\-/]{1,40})", t, re.I)))
+    fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
+    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
+    return {"pedido": ped or ras, "rastreio": ras, "canal": canal, "envio": envio, "sku": " + ".join(skus),
+            "fonte": re.sub(r"^\s*Fonte\s*[:\-]\s*", "", fl, flags=re.I).strip(),
+            "etiqueta": int(etq.group(1)) if etq else None,
+            "personalizado": not ("SEM PERSONALIZ" in T and not etq),
+            "codigos": [x for x in (ped, ras) if x]}
+
+
+def itens_do_pdf(dados):
+    from pypdf import PdfReader
+    itens, ign = [], 0
+    for pg in PdfReader(io.BytesIO(dados)).pages:
+        it = ler_etiqueta_txt(pg.extract_text() or "")
+        if it:
+            itens.append(it)
+        else:
+            ign += 1
+    return itens, ign
+
+
+def checar_email():
+    import imaplib, email
+    from email.header import decode_header, make_header
+    from email.utils import parseaddr
+    im = imaplib.IMAP4_SSL(EMAIL_IMAP)
+    try:
+        im.login(EMAIL_USUARIO, EMAIL_SENHA)
+        im.select("INBOX")
+        _, ids = im.search(None, "UNSEEN")
+        for mid in ids[0].split():
+            _, dd = im.fetch(mid, "(BODY.PEEK[])")
+            msg = email.message_from_bytes(dd[0][1])
+            rem = parseaddr(msg.get("From", ""))[1].lower()
+            assunto = str(make_header(decode_header(msg.get("Subject", ""))))[:200]
+            reg = dict(em=agora(), remetente=rem, assunto=assunto, arquivos="", etiquetas=0, novos=0, atualizados=0, erro="")
+            if EMAIL_REMETENTES and rem not in EMAIL_REMETENTES:
+                reg["erro"] = "remetente nao autorizado (ignorado)"
+            else:
+                nomes = []
+                for parte in msg.walk():
+                    nome = parte.get_filename()
+                    nome = str(make_header(decode_header(nome))) if nome else ""
+                    if parte.get_content_type() != "application/pdf" and not nome.lower().endswith(".pdf"):
+                        continue
+                    nomes.append(nome or "anexo.pdf")
+                    try:
+                        itens, _ = itens_do_pdf(parte.get_payload(decode=True) or b"")
+                        reg["etiquetas"] += len(itens)
+                        if itens:
+                            r = importar_lote({"lote": "EMAIL " + datetime.now(BR).strftime("%d/%m %H:%M"), "itens": itens})
+                            reg["novos"] += r["novos"]
+                            reg["atualizados"] += r["atualizados"]
+                    except Exception as e:
+                        reg["erro"] = f"{nome}: {e}"[:300]
+                reg["arquivos"] = ", ".join(nomes)
+                if not nomes:
+                    reg["erro"] = "e-mail sem PDF anexado"
+                elif not reg["etiquetas"] and not reg["erro"]:
+                    reg["erro"] = "nenhuma etiqueta reconhecida no PDF"
+            with _lock, conn() as c:
+                c.execute(f"INSERT INTO emails({','.join(reg)}) VALUES({','.join('?' * len(reg))})", list(reg.values()))
+            im.store(mid, "+FLAGS", "\\Seen")
+    finally:
+        try:
+            im.logout()
+        except Exception:
+            pass
+
+
+def _email_loop():
+    import time
+    while True:
+        try:
+            checar_email()
+            _email_status.update(ok=True, erro="", ultima=agora())
+        except Exception as e:
+            _email_status.update(ok=False, erro=str(e)[:300], ultima=agora())
+            print("E-mail:", e, flush=True)
+        time.sleep(max(EMAIL_INTERVALO, 20))
+
+
+_email_status = {"ativo": bool(EMAIL_USUARIO and EMAIL_SENHA), "conta": EMAIL_USUARIO, "ok": None, "erro": "", "ultima": ""}
+
+
 if __name__ == "__main__":
     iniciar_db()
+    if _email_status["ativo"]:
+        threading.Thread(target=_email_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))
     print(f"Central Boni rodando na porta {porta} (banco: {DB})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", porta), H).serve_forever()

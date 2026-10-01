@@ -1,1 +1,1 @@
-# sem dependencias externas
+pypdf>=4.0
