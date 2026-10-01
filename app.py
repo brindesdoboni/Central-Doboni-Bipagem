@@ -50,13 +50,15 @@ def iniciar_db():
         CREATE TABLE IF NOT EXISTS pausas(id INTEGER PRIMARY KEY, nome TEXT, hora TEXT, pessoas TEXT);
         CREATE TABLE IF NOT EXISTS custos(sku TEXT PRIMARY KEY, descricao TEXT, custo REAL, atualizado_em TEXT);
         CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY, em TEXT, remetente TEXT, assunto TEXT,
-            arquivos TEXT, etiquetas INTEGER, novos INTEGER, atualizados INTEGER, erro TEXT);
+            arquivos TEXT, etiquetas INTEGER, novos INTEGER, atualizados INTEGER, erro TEXT, uid TEXT);
         """)
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
         if "excluido" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
             c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
         if "envio" not in [r[1] for r in c.execute("PRAGMA table_info(itens)")]:
             c.execute("ALTER TABLE itens ADD COLUMN envio TEXT DEFAULT ''")
+        if "uid" not in [r[1] for r in c.execute("PRAGMA table_info(emails)")]:
+            c.execute("ALTER TABLE emails ADD COLUMN uid TEXT")
         if "duracao" not in [r[1] for r in c.execute("PRAGMA table_info(pausas)")]:
             c.execute("ALTER TABLE pausas ADD COLUMN duracao INTEGER DEFAULT 15")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
@@ -819,13 +821,22 @@ def checar_email():
     try:
         im.login(EMAIL_USUARIO, EMAIL_SENHA)
         im.select("INBOX")
-        _, ids = im.search(None, "UNSEEN")
+        # todos os e-mails dos ultimos 2 dias que ainda nao foram processados (mesmo se ja abertos no Gmail)
+        desde = (datetime.now(BR) - timedelta(days=1)).strftime("%d-%b-%Y")
+        _, ids = im.uid("SEARCH", None, f'(SINCE "{desde}")')
+        with conn() as c:
+            feitos = {r[0] for r in c.execute("SELECT uid FROM emails WHERE uid IS NOT NULL")}
         for mid in ids[0].split():
-            _, dd = im.fetch(mid, "(BODY.PEEK[])")
+            uid = mid.decode()
+            if uid in feitos:
+                continue
+            _, dd = im.uid("FETCH", mid, "(BODY.PEEK[])")
+            if not dd or not isinstance(dd[0], tuple):
+                continue
             msg = email.message_from_bytes(dd[0][1])
             rem = parseaddr(msg.get("From", ""))[1].lower()
             assunto = str(make_header(decode_header(msg.get("Subject", ""))))[:200]
-            reg = dict(em=agora(), remetente=rem, assunto=assunto, arquivos="", etiquetas=0, novos=0, atualizados=0, erro="")
+            reg = dict(uid=uid, em=agora(), remetente=rem, assunto=assunto, arquivos="", etiquetas=0, novos=0, atualizados=0, erro="")
             if EMAIL_REMETENTES and rem not in EMAIL_REMETENTES:
                 reg["erro"] = "remetente nao autorizado (ignorado)"
             else:
@@ -852,7 +863,7 @@ def checar_email():
                     reg["erro"] = "nenhuma etiqueta reconhecida no PDF"
             with _lock, conn() as c:
                 c.execute(f"INSERT INTO emails({','.join(reg)}) VALUES({','.join('?' * len(reg))})", list(reg.values()))
-            im.store(mid, "+FLAGS", "\\Seen")
+            im.uid("STORE", mid, "+FLAGS", "\\Seen")
     finally:
         try:
             im.logout()
