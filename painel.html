@@ -29,6 +29,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <div class="wrap">
 <div class="kpis" id="kpis"></div>
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
+<div class="box"><h2>Por plataforma (pedidos)</h2><table id="plats"></table></div>
 <div class="box"><h2>Por canal</h2><table id="canais"></table></div>
 <div class="box"><h2>Equipe (dia)</h2><table id="equipe"></table></div>
 <div class="box"><div class="row" style="justify-content:space-between"><h2>Pedidos</h2>
@@ -48,7 +49,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <div class="box" style="margin-top:10px"><b>Importar PDF de etiquetas</b> <span class="mut">(do UpSeller ou da folha de gravação — cada página vira uma etiqueta; separadores são ignorados)</span>
 <div class="row" style="margin-top:8px"><input type="file" id="pdfIn" accept="application/pdf" multiple onchange="importarPDF(this.files)"><span id="pdfMsg" class="mut"></span></div></div>
 <details style="margin-top:10px"><summary>Incluir digitando (com nome e fonte)</summary>
-<div class="row" style="margin-top:8px"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio"><select id="aCan"><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA RAPIDA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
+<div class="row" style="margin-top:8px"><input id="aPed" placeholder="Nº do pedido *"><input id="aRas" placeholder="Rastreio"><select id="aCan"><option>SHOPEE EXPRESS</option><option>SHOPEE</option><option>TIKTOK</option><option>ENTREGA DIRETA</option><option>MERCADO LIVRE</option><option>OUTROS</option></select></div>
 <div class="row" style="margin-top:8px"><input id="aSku" placeholder="SKU"><input id="aNom" placeholder="Nome(s) — separe com |"><input id="aFon" placeholder="Fonte"><label><input type="checkbox" id="aPer" checked> Tem gravação</label><button onclick="addItem()">Incluir</button><span id="aMsg" class="mut"></span></div></details>
 <p><button onclick="dlgAdd.close()">Fechar</button></p></dialog>
 <dialog id="dlgProd" class="largo"><h2>Produtividade</h2><div class="row"><input type="date" id="prDe"> até <input type="date" id="prAte"><button onclick="carregarProd()">Ver</button><span class="mut">Tempo por peça = intervalo até o próximo bipe do mesmo gravador (pausas acima de 30 min não contam).</span></div>
@@ -78,6 +79,10 @@ function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_mater
  $("kpis").innerHTML=[["Total",D.total],...Object.keys(NOMES).map(k=>[NOMES[k],c[k]]),["Falta material",falta]]
   .map(([t,v])=>`<div class="k"><b>${v}</b><span>${t}</span></div>`).join("");
  $("alertas").innerHTML=D.alertas.length?D.alertas.map(a=>`<div class="al"><b>${esc(a.tipo)}</b> — pedido ${esc(a.item.pedido)} ${esc(a.item.sku||"")} ${a.item.etiqueta?"(etiqueta "+esc(a.item.etiqueta)+")":""}</div>`).join(""):"Nenhum alerta 👍";
+ const PL=D.plataformas||[],sm=k=>PL.reduce((a,p)=>a+p[k],0);
+ $("plats").innerHTML="<tr><th>Plataforma / envio</th><th>Subiram</th><th>Saíram (expedidos)</th><th>Faltam enviar</th></tr>"+
+  PL.map(p=>`<tr><td><b>${esc(p.grupo)}</b></td><td>${p.total}</td><td>${p.enviados}</td><td><b>${p.faltam}</b></td></tr>`).join("")+
+  `<tr><td><b>TOTAL</b></td><td><b>${sm("total")}</b></td><td><b>${sm("enviados")}</b></td><td><b>${sm("faltam")}</b></td></tr>`;
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOMES).map(n=>`<th>${n}</th>`).join("")+"</tr>"+
   Object.entries(D.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOMES).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
  $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Média por peça</th><th>Expedidos</th><th>Faltas</th><th>1º bipe</th><th>Último</th></tr>"+
@@ -130,12 +135,13 @@ function lerEtiqueta(linhas){const t=linhas.join("\n"),T=t.toUpperCase();
  let ras="";for(const rx of[/\b(BR\d{12,14}[A-Z]?)\b/,/\b([A-Z]{2}\d{9}BR)\b/,/\b(88\d{10,14})\b/]){const m=t.match(rx);if(m&&m[1]!==ped){ras=m[1];break}}
  if(!ped&&!ras)return null;
  let canal=/^2\d{5}/.test(ped)||/SHOPEE|\bSPX\b/.test(T)?"SHOPEE":/^5\d{17}$/.test(ped)||/TIKTOK|TIK TOK|J&T/.test(T)?"TIKTOK":"OUTROS";
- if(/ENTREGA R[AÁ]PIDA/.test(T))canal="ENTREGA RAPIDA";
+ const envio=/ENTREGA (DIRETA|R[AÁ]PIDA)/.test(T)?"ENTREGA DIRETA":canal==="SHOPEE"&&/XPRESS|\bSPX\b/.test(T)?"SHOPEE XPRESS":"";
+ if(envio==="ENTREGA DIRETA")canal="ENTREGA DIRETA";
  const skus=[...new Set([...t.matchAll(/SKU\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._\-\/]{1,40})/gi)].map(m=>m[1].toUpperCase()))];
  const fl=linhas.find(l=>/^\s*Fonte\s*[:\-]/i.test(l));const fonte=fl?fl.replace(/^\s*Fonte\s*[:\-]\s*/i,"").trim():"";
  const etq=(t.match(/ETIQUETA\s*N?[ºo°.]?\s*(\d+)/i)||[])[1];
  const semPers=/SEM PERSONALIZ/.test(T)&&!etq;
- return {pedido:ped||ras,rastreio:ras,canal,sku:skus.join(" + "),fonte,etiqueta:etq?Number(etq):null,personalizado:!semPers}}
+ return {pedido:ped||ras,rastreio:ras,canal,envio,sku:skus.join(" + "),fonte,etiqueta:etq?Number(etq):null,personalizado:!semPers}}
 async function importarPDF(files){if(!files.length)return;const msg=$("pdfMsg");msg.textContent="Lendo PDF…";
  try{const pdfjs=await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";

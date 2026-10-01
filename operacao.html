@@ -4,7 +4,9 @@
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial,sans-serif;background:#0d0d10;color:#f4f4f5;min-height:100vh;display:flex;flex-direction:column}
 header{display:flex;justify-content:space-between;align-items:center;padding:16px 28px;background:#18181c}
 h1{margin:0;font-size:28px}#relogio{font-size:34px;font-weight:800;font-variant-numeric:tabular-nums}
-main{flex:1;padding:22px 28px;display:grid;gap:20px;grid-template-rows:auto auto 1fr}
+main{flex:1;padding:22px 28px;display:grid;gap:20px;grid-template-rows:auto auto auto 1fr}
+.plats{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.pl{background:#1c1c21;border-radius:14px;padding:16px 20px;border-top:10px solid #555}.pl h3{margin:0 0 6px;font-size:24px;letter-spacing:.5px}.pl b{font-size:84px;line-height:1;font-variant-numeric:tabular-nums}.pl span{display:block;font-size:20px;color:#a1a1aa;margin-top:6px}.pl.ok b{color:#4ade80}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
 .k{background:#1c1c21;border-radius:14px;padding:18px 20px}.k b{display:block;font-size:64px;line-height:1;font-variant-numeric:tabular-nums}.k span{font-size:20px;color:#a1a1aa}
 .bar{height:34px;background:#26262c;border-radius:10px;overflow:hidden;display:flex}
@@ -19,6 +21,7 @@ table{width:100%;border-collapse:collapse;font-size:24px}th,td{padding:10px 12px
 <header><h1>Operação Brindes do Boni</h1><div id="relogio"></div></header>
 <div id="pausa"></div>
 <main>
+ <div class="plats" id="plats"></div>
  <div class="kpis" id="kpis"></div>
  <div><div class="bar" id="barra"></div><p class="prev" id="prev">Calculando previsão…</p></div>
  <div><table id="canais"></table><p style="font-size:22px" id="falta"></p></div>
@@ -37,6 +40,8 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  const R=d.ritmo,rit=["SEPARACAO","GRAVACAO","EXPEDICAO"].map(p=>R[p].por_hora?`${{SEPARACAO:"Separação",GRAVACAO:"Gravação",EXPEDICAO:"Expedição"}[p]}: ${R[p].por_hora}/h`:"").filter(Boolean).join(" · ");
  $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"</tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+"</tr>").join("");
+const CP={"ENTREGA DIRETA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
+ $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><b>${p.total&&!p.faltam?"✓":p.faltam}</b><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
 }catch(e){}}
 // café

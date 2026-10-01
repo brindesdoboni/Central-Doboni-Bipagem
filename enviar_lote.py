@@ -40,10 +40,16 @@ def montar(spec_path, pdf_path=None):
             ped = str(reg[0]); pc = compacto(ped)
             for t, tc in paginas:
                 if pc and pc in tc:
-                    d = info.setdefault(ped, {"etiquetas": [], "rastreio": ""})
+                    d = info.setdefault(ped, {"etiquetas": [], "rastreio": "", "envio": ""})
                     m = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
                     if m and int(m.group(1)) not in d["etiquetas"]:
                         d["etiquetas"].append(int(m.group(1)))
+                    T = t.upper()
+                    if not d["envio"]:
+                        if re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
+                            d["envio"] = "ENTREGA DIRETA"
+                        elif re.search(r"XPRESS|\bSPX\b", T):
+                            d["envio"] = "SHOPEE XPRESS"
                     for rx in RX_RASTREIO:
                         r = re.search(rx, t)
                         if r and not d["rastreio"]:
@@ -66,6 +72,7 @@ def montar(spec_path, pdf_path=None):
             "fonte": fonte or "", "obs": obs or "",
             "etiqueta": etqs[n - 1] if len(etqs) >= n else (etqs[0] if etqs else None),
             "rastreio": d.get("rastreio", ""),
+            "envio": "ENTREGA DIRETA" if canal == "ER" else d.get("envio", ""),
         })
     return itens
 

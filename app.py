@@ -53,6 +53,8 @@ def iniciar_db():
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
         if "excluido" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
             c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
+        if "envio" not in [r[1] for r in c.execute("PRAGMA table_info(itens)")]:
+            c.execute("ALTER TABLE itens ADD COLUMN envio TEXT DEFAULT ''")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
         c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
         padrao = [("Cafe da manha", "09:15", "Rafael, Guilherme"), ("Cafe da manha", "09:30", "Yuri, Juninho"),
@@ -69,6 +71,50 @@ def norm(cod):
 
 
 # ------------------------------------------------------------------ lotes (API)
+def _envio_obs(obs):
+    """A ferramenta da Zebra manda a forma de envio no fim da obs: '... [SHOPEE XPRESS]'."""
+    m = re.findall(r"\[([^\]]+)\]", obs or "")
+    return m[-1].strip() if m else ""
+
+
+GRUPOS = ["ENTREGA DIRETA", "SHOPEE EXPRESS", "SHOPEE", "TIKTOK", "OUTROS"]
+
+
+def grupo_envio(i):
+    """Plataforma/forma de envio para a contagem do dia (lojas juntas)."""
+    t = " ".join([i.get("canal") or "", i.get("envio") or "", _envio_obs(i.get("obs"))]).upper()
+    if "DIRETA" in t or "RAPIDA" in t or "RÁPIDA" in t:
+        return "ENTREGA DIRETA"
+    if "TIKTOK" in t or "TIK TOK" in t:
+        return "TIKTOK"
+    if "SHOPEE" in t or "SPX" in t:
+        if "XPRESS" in t or "SPX" in t or re.match(r"BR\d", (i.get("rastreio") or "").upper()):
+            return "SHOPEE EXPRESS"
+        return "SHOPEE"
+    return "OUTROS"
+
+
+def por_plataforma(itens):
+    """Pedidos por plataforma: quantos subiram, quantos ja sairam (expedidos) e quantos faltam."""
+    pedidos = {}
+    for i in itens:
+        if i["status"] == "DEVOLVIDO" or i.get("lote") == "DEVOLUCAO":
+            continue
+        k = norm(i["pedido"]) or f"id{i['id']}"
+        g = grupo_envio(i)
+        p = pedidos.setdefault(k, {"grupo": g, "pendente": False})
+        if g != "OUTROS":
+            p["grupo"] = g
+        if i["status"] != "EXPEDIDO":
+            p["pendente"] = True
+    res = {g: {"total": 0, "enviados": 0, "faltam": 0} for g in GRUPOS}
+    for p in pedidos.values():
+        r = res[p["grupo"]]
+        r["total"] += 1
+        r["faltam" if p["pendente"] else "enviados"] += 1
+    return [dict(grupo=g, **res[g]) for g in GRUPOS if res[g]["total"] or g not in ("SHOPEE", "OUTROS")]
+
+
 def importar_lote(dados):
     lote = dados.get("lote") or datetime.now(BR).strftime("%Y%m%d-%H%M")
     n_novo = n_atual = 0
@@ -86,6 +132,7 @@ def importar_lote(dados):
             chave = "|".join([pedido, str(it.get("sku") or ""), nomes, str(it.get("seq") or "")])
             campos = dict(lote=lote, etiqueta=it.get("etiqueta"), pedido=pedido,
                           rastreio=it.get("rastreio") or "", canal=it.get("canal") or "",
+                          envio=(it.get("envio") or _envio_obs(it.get("obs"))).upper(),
                           loja=it.get("loja") or "", sku=it.get("sku") or "", cor=it.get("cor") or "",
                           nomes=nomes, fonte=it.get("fonte") or "", tipo=tipo, obs=it.get("obs") or "",
                           personalizado=pers, atualizado_em=agora())
@@ -111,8 +158,9 @@ def importar_lote(dados):
                     continue
             if ant:
                 iid = ant["id"]
-                sets = ", ".join(f"{k}=?" for k in campos if k != "rastreio" or campos["rastreio"])
-                vals = [v for k, v in campos.items() if k != "rastreio" or campos["rastreio"]]
+                manter = [k for k in campos if k not in ("rastreio", "envio") or campos[k]]
+                sets = ", ".join(f"{k}=?" for k in manter)
+                vals = [campos[k] for k in manter]
                 c.execute(f"UPDATE itens SET {sets} WHERE id=?", vals + [iid])
                 n_atual += 1
             else:
@@ -298,7 +346,7 @@ def painel(data):
             if e["alerta"] and e["alerta"] != "falta de material":
                 alertas.append({"tipo": e["alerta"].upper(), "item": next((i for i in itens if i["id"] == e["item_id"]), {"pedido": "?"})})
         return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
-                "equipe": equipe, "alertas": alertas, "itens": itens}
+                "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens}
 
 
 def operacao():
@@ -346,6 +394,7 @@ def operacao():
     elif previsoes:
         prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
     return {"contagem": cont, "total": len(itens), "por_canal": por_canal, "ritmo": ritmo,
+            "plataformas": d["plataformas"],
             "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"])}
 
 
@@ -652,7 +701,7 @@ class H(BaseHTTPRequestHandler):
                 for cod in {norm(d.get("pedido")), norm(d.get("rastreio"))} - {""}:
                     if c.execute("SELECT 1 FROM codigos WHERE codigo=?", (cod,)).fetchone():
                         return self._envia(200, {"ok": False, "erro": "ja cadastrada"})
-            it = {k: d.get(k, "") for k in ("pedido", "rastreio", "canal", "loja", "sku", "cor", "fonte", "obs")}
+            it = {k: d.get(k, "") for k in ("pedido", "rastreio", "canal", "envio", "loja", "sku", "cor", "fonte", "obs")}
             it["nomes"] = [n.strip() for n in str(d.get("nomes", "")).split("|") if n.strip()]
             it["personalizado"] = bool(d.get("personalizado", True))
             it["seq"] = "M" + agora()
