@@ -161,7 +161,8 @@ def importar_lote(dados):
                         ORDER BY item_id""", (norm(pedido), norm(campos["rastreio"]) or "-"))]
                 if len(cand) >= n:
                     iid = cand[n - 1]
-                    novos = {k: v for k, v in campos.items() if v not in ("", None) and k not in ("lote", "personalizado")}
+                    novos = {k: v for k, v in campos.items() if v not in ("", None) and k not in ("lote", "personalizado")
+                             and not (k == "canal" and v == "OUTROS")}
                     if tipo or "personalizado" in it:
                         novos["personalizado"] = pers
                     if nomes and not c.execute("SELECT personalizado FROM itens WHERE id=?", (iid,)).fetchone()[0] \
@@ -679,6 +680,14 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, importar_lote(d))
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
+        if p == "/api/importar-pdf":
+            import base64
+            try:
+                itens, ign = itens_do_pdf(base64.b64decode(d.get("dados") or ""))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": f"nao consegui ler o PDF ({e})"})
+            r = importar_lote({"lote": "PDF " + str(d.get("nome") or "")[:60], "itens": itens}) if itens else {"novos": 0, "atualizados": 0}
+            return self._envia(200, {"ok": True, "etiquetas": len(itens), "ignoradas": ign, "novos": r["novos"], "atualizados": r["atualizados"]})
         if p == "/api/custos":
             with _lock, conn() as c:
                 if d.get("excluir"):
@@ -768,37 +777,62 @@ EMAIL_INTERVALO = int(os.environ.get("EMAIL_INTERVALO", "60"))
 
 
 def ler_etiqueta_txt(t):
-    """Mesma leitura do painel ('Importar PDF'): uma pagina de etiqueta -> item da Central."""
-    T = t.upper()
-    m = re.search(r"\b(2\d{5}[0-9A-Z]{8})\b", t) or re.search(r"\b(5\d{17})\b", t)
-    ped = m.group(1) if m else ""
-    ras = ""
-    for rx in (r"\b(BR\d{12,14}[A-Z]?)\b", r"\b([A-Z]{2}\d{9}BR)\b", r"\b(88\d{10,14})\b"):
-        m = re.search(rx, t)
-        if m and m.group(1) != ped:
-            ras = m.group(1)
-            break
-    if not ped and not ras:
+    """Le uma pagina de etiqueta do UpSeller (Shopee com DANFE, TikTok, etiqueta da folha de gravacao)."""
+    T = (t or "").upper()
+    # nº do pedido Shopee (14 caracteres, ex.: 2609286KQNSNAY); o PDF as vezes quebra com espaco no meio
+    junto = re.sub(r"(?<=[0-9A-Z]) (?=[0-9A-Z])", "", T)
+    sn = next((m for m in re.findall(r"(?<![0-9A-Z])(2\d{5}[0-9A-Z]{8})", T) + re.findall(r"(?<![0-9A-Z])(2\d{5}[0-9A-Z]{8})", junto)
+               if re.search(r"[A-Z]", m)), "")
+    m = re.search(r"PEDIDO:\s*(\d{12,20})", T) or re.search(r"(?<!\d)(5\d{17})(?!\d)", T)
+    tid = m.group(1) if m else ""
+    m = re.search(r"BR\d{12,14}[0-9A-Z]?", T)
+    ras = m.group(0) if m else ""
+    m = re.search(r"UPPUS\d+", T)
+    ups = m.group(0) if m else ""
+    ped = sn or tid or ras or ups
+    if not ped:
         return None
-    if re.match(r"2\d{5}", ped) or re.search(r"SHOPEE|\bSPX\b", T):
+    if sn or ras or "DANFE" in T or "SHOPEE" in T or "SPX" in T:
         canal = "SHOPEE"
-    elif re.fullmatch(r"5\d{17}", ped) or re.search(r"TIKTOK|TIK TOK|J&T", T):
+    elif tid or "TIKTOK" in T or "TIK TOK" in T:
         canal = "TIKTOK"
     else:
         canal = "OUTROS"
     envio = ""
     if re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
-        envio = canal = "ENTREGA DIRETA"
-    elif canal == "SHOPEE" and re.search(r"XPRESS|\bSPX\b", T):
+        envio = "ENTREGA DIRETA"
+    elif canal == "SHOPEE":
         envio = "SHOPEE XPRESS"
-    skus = list(dict.fromkeys(x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._\-/]{1,40})", t, re.I)))
+    # itens do pedido (rodape do UpSeller): "1. 18726I-Personalizado (Rosa Claro, Personalizado com Nome) / ..."
+    rod = re.split(r"#UPPUS\d+[^\n]*\n", t, maxsplit=1)
+    skus, cores, pers = [], [], []
+    if len(rod) == 2:
+        for it in re.split(r"(?m)^\s*\d+\.\s*", rod[1])[1:]:
+            mm = re.match(r"\s*([A-Za-z0-9]+)", it)
+            if mm:
+                skus.append(mm.group(1).upper())
+            par = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
+            if par:
+                cores.append(par[-1].split(",")[0].strip())
+            I = it.upper()
+            pers.append("PERSONALIZ" in I and "SEM PERSONALIZ" not in I)
+    if not skus:
+        skus = [x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z][A-Za-z0-9._\-/]{1,40})", t, re.I)]
+    cli = re.search(r"Customer:\s*(.+)", t)
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
     etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
-    return {"pedido": ped or ras, "rastreio": ras, "canal": canal, "envio": envio, "sku": " + ".join(skus),
+    if etq:
+        personalizado = True  # etiqueta numerada da folha de gravacao = vai para a gravacao
+    elif pers:
+        personalizado = any(pers)
+    else:
+        personalizado = not ("SEM PERSONALIZ" in T and not etq)
+    return {"pedido": ped, "rastreio": ras, "canal": canal, "envio": envio,
+            "sku": " + ".join(dict.fromkeys(skus)), "cor": " + ".join(dict.fromkeys(cores)),
             "fonte": re.sub(r"^\s*Fonte\s*[:\-]\s*", "", fl, flags=re.I).strip(),
-            "etiqueta": int(etq.group(1)) if etq else None,
-            "personalizado": not ("SEM PERSONALIZ" in T and not etq),
-            "codigos": [x for x in (ped, ras) if x]}
+            "obs": ("Cliente: " + cli.group(1).strip()) if cli else "",
+            "etiqueta": int(etq.group(1)) if etq else None, "personalizado": personalizado,
+            "codigos": [x for x in dict.fromkeys((sn, tid, ras, ups)) if x]}
 
 
 def itens_do_pdf(dados):
@@ -806,10 +840,17 @@ def itens_do_pdf(dados):
     itens, ign = [], 0
     for pg in PdfReader(io.BytesIO(dados)).pages:
         it = ler_etiqueta_txt(pg.extract_text() or "")
-        if it:
-            itens.append(it)
-        else:
+        if not it:
             ign += 1
+            continue
+        ant = itens[-1] if itens else None
+        if ant and it["codigos"] == [it["pedido"]] and it["pedido"].startswith("UPPUS") and it["pedido"] in ant["codigos"]:
+            # continuacao da lista de itens do mesmo pedido (pedido com muitos produtos ocupa 2 paginas)
+            for k in ("sku", "cor"):
+                ant[k] = " + ".join(dict.fromkeys([x for x in (ant[k] + " + " + it[k]).split(" + ") if x]))
+            ant["personalizado"] = ant["personalizado"] or it["personalizado"]
+            continue
+        itens.append(it)
     return itens, ign
 
 
