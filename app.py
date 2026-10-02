@@ -72,6 +72,7 @@ def iniciar_db():
             atualizado TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
         c.execute("CREATE TABLE IF NOT EXISTS prateleiras(sku TEXT PRIMARY KEY, prateleira TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             tipo TEXT, detalhe TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
@@ -786,6 +787,10 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, contagem_estoque(str(d.get("texto") or "").splitlines()))
         if p == "/api/prateleiras":
             return self._envia(200, salvar_prateleiras(d.get("texto", "")))
+        if p == "/api/estoque/status":
+            return self._envia(200, marcar_sku(d.get("sku", ""), d.get("cor", ""), d.get("status", "")))
+        if p == "/api/estoque/desfazer":
+            return self._envia(200, desfazer_contagem(d.get("ref")))
         if p == "/api/estoque/movimento":
             return self._envia(200, movimento_manual(str(d.get("texto") or "").splitlines()))
         if p == "/api/estoque/distribuir":
@@ -1431,7 +1436,7 @@ def checar_falta(c, iid):
 
 def contagem_estoque(linhas, tipo_obs=None):
     """'SKU;COR;QTD' por linha (cor pode ficar vazia). Define o saldo exato daquele produto/cor agora."""
-    feitos, erros = 0, []
+    feitos, erros, refs = 0, [], []
     with _lock, conn() as c:
         for ln in linhas:
             cols = [x.strip() for x in re.split(r"\t|;", ln)]
@@ -1443,11 +1448,40 @@ def contagem_estoque(linhas, tipo_obs=None):
             except Exception:
                 erros.append(ln.strip()); continue
             atual = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cor)).fetchone()[0]
+            ref = f"CONT|{sku}|{cor}|{agora()}|{secrets.token_hex(3)}"
             c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
-                      (agora(), sku, cor, qtd - atual, "CONTAGEM", f"CONT|{sku}|{cor}|{agora()}|{secrets.token_hex(3)}",
-                       tipo_obs or f"contagem: {qtd:g}"))
+                      (agora(), sku, cor, qtd - atual, "CONTAGEM", ref, tipo_obs or f"contagem: {qtd:g}"))
             feitos += 1
-    return {"ok": True, "feitos": feitos, "erros": erros}
+            refs.append({"ref": ref, "sku": sku, "cor": cor, "qtd": qtd, "antes": atual})
+    return {"ok": True, "feitos": feitos, "erros": erros, "refs": refs}
+
+
+def marcar_sku(sku, cor, status):
+    """status: ARQUIVADO (sem estoque aqui e no fornecedor), EXCLUIDO (nao trabalha mais) ou "" (reativar).
+    Nao apaga historico: so esconde da contagem, da lista e da sugestao de compra. Devolve o status anterior (para o Voltar)."""
+    cor = "" if (cor or "").upper() in ("", "PADRAO", "(COR A DEFINIR)") else estoque_chave(sku, cor)[1]
+    sku = estoque_chave(sku)[0]
+    status = (status or "").upper()
+    if not sku or status not in ("", "ARQUIVADO", "EXCLUIDO"):
+        return {"ok": False, "erro": "dados invalidos"}
+    with _lock, conn() as c:
+        ant = c.execute("SELECT status FROM sku_status WHERE sku=? AND cor=?", (sku, cor)).fetchone()
+        if status:
+            c.execute("INSERT OR REPLACE INTO sku_status VALUES(?,?,?,?)", (sku, cor, status, agora()))
+        else:
+            c.execute("DELETE FROM sku_status WHERE sku=? AND cor=?", (sku, cor))
+    return {"ok": True, "sku": sku, "cor": cor or "PADRAO", "status": status, "anterior": ant[0] if ant else ""}
+
+
+def desfazer_contagem(ref):
+    """Volta uma contagem confirmada: apaga aquele lancamento, o saldo volta a ser o de antes (somando o que mexeu depois)."""
+    with _lock, conn() as c:
+        r = c.execute("SELECT sku, cor FROM estoque_mov WHERE ref=? AND tipo='CONTAGEM'", (ref or "",)).fetchone()
+        if not r:
+            return {"ok": False, "erro": "ja desfeita ou nao encontrada"}
+        c.execute("DELETE FROM estoque_mov WHERE ref=? AND tipo='CONTAGEM'", (ref,))
+        saldo = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (r[0], r[1])).fetchone()[0]
+    return {"ok": True, "sku": r[0], "cor": r[1], "saldo": saldo}
 
 
 def movimento_manual(linhas):
@@ -1677,9 +1711,15 @@ def estoque():
                                   "conhecido": 0, "e15": 0})
         com_cor = {k[0] for k in linhas if k[1]}
         prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
-        out = []
+        st = {(r[0], r[1]): (r[2], r[3]) for r in c.execute("SELECT sku, cor, status, em FROM sku_status")}
+        out, ocultos = [], []
         for (sku, cor), r in linhas.items():
             sem_cor = cor == "" and sku in com_cor  # produto com cores: entrada sem cor ainda precisa ser distribuida
+            stt = st.get((sku, cor))
+            # EXCLUIDO some de tudo; ARQUIVADO (sem estoque aqui nem no fornecedor) volta sozinho se entrar material
+            if stt and (stt[0] == "EXCLUIDO" or (r["saldo"] or 0) <= 0):
+                ocultos.append({"sku": sku, "cor": cor or "PADRAO", "status": stt[0], "em": stt[1], "fisico": r["saldo"] or 0})
+                continue
             media = (r["s15"] or 0) / 15
             fisico = r["saldo"] or 0
             saldo = fisico - pend.get((sku, cor), 0)  # disponivel
@@ -1704,7 +1744,8 @@ def estoque():
     out.sort(key=lambda d: (d["sem_cor"], not d["conhecido"], -(d["comprar"] or 0), d["saldo"], d["sku"]))
     with conn() as c:
         alertas_xbz = [dict(r) for r in c.execute("SELECT * FROM xbz_alertas ORDER BY id DESC LIMIT 40")]
-    return {"itens": out, "dias_compra": ESTOQUE_DIAS_COMPRA, "xbz": _xbz_status, "alertas_xbz": alertas_xbz,
+    return {"itens": out, "ocultos": sorted(ocultos, key=lambda d: (d["sku"], d["cor"])),
+            "dias_compra": ESTOQUE_DIAS_COMPRA, "xbz": _xbz_status, "alertas_xbz": alertas_xbz,
             "total_compra": round(sum(d["valor_compra"] for d in out), 2)}
 
 
