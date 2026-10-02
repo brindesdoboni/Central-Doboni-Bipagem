@@ -57,6 +57,13 @@ def iniciar_db():
             c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
         if "envio" not in [r[1] for r in c.execute("PRAGMA table_info(itens)")]:
             c.execute("ALTER TABLE itens ADD COLUMN envio TEXT DEFAULT ''")
+        cols_it = [r[1] for r in c.execute("PRAGMA table_info(itens)")]
+        if "qtd" not in cols_it:
+            c.execute("ALTER TABLE itens ADD COLUMN qtd INTEGER DEFAULT 1")
+        if "pecas" not in cols_it:
+            c.execute("ALTER TABLE itens ADD COLUMN pecas TEXT DEFAULT ''")
+        c.execute("""CREATE TABLE IF NOT EXISTS compras(id INTEGER PRIMARY KEY, chave TEXT UNIQUE, nf TEXT, data TEXT,
+            conta TEXT, cprod TEXT, descricao TEXT, qtd REAL, unit REAL, total REAL, importado_em TEXT)""")
         if "uid" not in [r[1] for r in c.execute("PRAGMA table_info(emails)")]:
             c.execute("ALTER TABLE emails ADD COLUMN uid TEXT")
         if "duracao" not in [r[1] for r in c.execute("PRAGMA table_info(pausas)")]:
@@ -132,6 +139,20 @@ def por_plataforma(itens):
     return [dict(grupo=g, **res[g]) for g in GRUPOS if True]
 
 
+def _qtd_pecas(it):
+    """Quantidade de unidades e lista de produtos [{sku,cor,qtd}] da etiqueta (para o controle de materiais)."""
+    pec = it.get("pecas") or []
+    if isinstance(pec, str):
+        try:
+            pec = json.loads(pec)
+        except Exception:
+            pec = []
+    pec = [p for p in pec if isinstance(p, dict) and p.get("sku")]
+    if not pec:
+        return {}
+    return {"pecas": json.dumps(pec, ensure_ascii=False), "qtd": sum(int(p.get("qtd") or 1) for p in pec)}
+
+
 def importar_lote(dados):
     lote = dados.get("lote") or datetime.now(BR).strftime("%Y%m%d-%H%M")
     n_novo = n_atual = 0
@@ -152,7 +173,7 @@ def importar_lote(dados):
                           envio=(it.get("envio") or _envio_obs(it.get("obs"))).upper(),
                           loja=it.get("loja") or "", sku=it.get("sku") or "", cor=it.get("cor") or "",
                           nomes=nomes, fonte=it.get("fonte") or "", tipo=tipo, obs=it.get("obs") or "",
-                          personalizado=pers, atualizado_em=agora())
+                          personalizado=pers, atualizado_em=agora(), **_qtd_pecas(it))
             ant = c.execute("SELECT id FROM itens WHERE chave=?", (chave,)).fetchone()
             if not ant:
                 # mesma etiqueta vinda de outra fonte (Zebra, automacao, PDF, bipe): junta em vez de duplicar
@@ -234,6 +255,8 @@ def bipar(posto, codigo, operador, modo):
 
         if modo == "FALTA":
             it = itens[0]
+            if it["falta_material"]:
+                return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}", "item": dict(it)}
             return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}",
                     "item": ev(it, "FALTA_MATERIAL", "falta de material")}
 
@@ -618,6 +641,10 @@ class H(BaseHTTPRequestHandler):
             with conn() as c:
                 ult = [dict(r) for r in c.execute("SELECT * FROM emails ORDER BY id DESC LIMIT 30")]
             return self._envia(200, {"status": _email_status, "recebidos": ult})
+        if p == "/api/materiais":
+            return self._envia(200, materiais(q.get("de") or hoje, q.get("ate") or hoje))
+        if p == "/api/compras":
+            return self._envia(200, compras(q.get("de") or hoje[:8] + "01", q.get("ate") or hoje))
         if p == "/api/painel":
             return self._envia(200, painel(q.get("data") or hoje))
         if p == "/api/eventos":
@@ -680,7 +707,7 @@ class H(BaseHTTPRequestHandler):
                 return self._envia(403, {"ok": False, "erro": "token invalido"})
             import base64
             try:
-                itens, ign = itens_do_pdf(base64.b64decode(d.get("dados") or ""))
+                itens, ign = itens_do_pdf(base64.b64decode(d.get("dados") or ""), str(d.get("nome") or ""))
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": f"nao consegui ler o PDF ({e})"})
             r = importar_lote({"lote": "PDF " + str(d.get("nome") or "")[:60], "itens": itens}) if itens else {"novos": 0, "atualizados": 0}
@@ -691,6 +718,15 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, importar_lote(d))
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
+        if p == "/api/compras/importar":
+            import base64
+            res = []
+            for a in d.get("arquivos") or []:
+                try:
+                    res.append({"nome": a.get("nome"), **importar_nfe(base64.b64decode(a.get("dados") or ""))})
+                except Exception as e:
+                    res.append({"nome": a.get("nome"), "ok": False, "erro": str(e)[:200]})
+            return self._envia(200, {"ok": True, "resultados": res})
         if p == "/api/custos":
             with _lock, conn() as c:
                 if d.get("excluir"):
@@ -770,6 +806,133 @@ class H(BaseHTTPRequestHandler):
         self._envia(404, {"erro": "nao encontrado"})
 
 
+# ------------------------------------------------------------------ compras XBZ (NF-e) e materiais
+def ler_nfe(xml):
+    """NF-e (XML) -> nf, data, conta (destinatario) e itens. Aceita nfeProc ou NFe."""
+    import xml.etree.ElementTree as ET
+    raiz = ET.fromstring(xml)
+    def acha(no, nome):
+        return next((e for e in no.iter() if e.tag.split("}")[-1] == nome), None)
+    def txt(no, nome):
+        e = acha(no, nome) if no is not None else None
+        return (e.text or "").strip() if e is not None else ""
+    inf = acha(raiz, "infNFe")
+    if inf is None:
+        return None
+    chave = (inf.get("Id") or "").replace("NFe", "")
+    ide, emit, dest = acha(inf, "ide"), acha(inf, "emit"), acha(inf, "dest")
+    data = (txt(ide, "dhEmi") or txt(ide, "dEmi"))[:10]
+    itens = []
+    for det in [e for e in inf.iter() if e.tag.split("}")[-1] == "det"]:
+        pr = acha(det, "prod")
+        f = lambda n: float(txt(pr, n) or 0)
+        itens.append({"item": det.get("nItem") or str(len(itens) + 1), "cprod": txt(pr, "cProd").upper(),
+                      "descricao": txt(pr, "xProd"), "qtd": f("qCom"), "unit": f("vUnCom"), "total": f("vProd")})
+    return {"chave": chave, "nf": txt(ide, "nNF"), "data": data, "emitente": txt(emit, "xNome"),
+            "conta": txt(dest, "xNome") or txt(dest, "CNPJ") or txt(dest, "CPF"), "itens": itens}
+
+
+def importar_nfe(xml):
+    """Guarda a compra (sem duplicar) e atualiza o custo de cada produto com o ultimo preco pago na XBZ."""
+    n = ler_nfe(xml)
+    if not n or not n["itens"]:
+        return {"ok": False, "erro": "nao e uma NF-e valida"}
+    novos = 0
+    with _lock, conn() as c:
+        for it in n["itens"]:
+            r = c.execute("""INSERT OR IGNORE INTO compras(chave,nf,data,conta,cprod,descricao,qtd,unit,total,importado_em)
+                             VALUES(?,?,?,?,?,?,?,?,?,?)""", (f"{n['chave'] or n['nf']}|{it['item']}", n["nf"], n["data"],
+                             n["conta"], it["cprod"], it["descricao"], it["qtd"], it["unit"], it["total"], agora()))
+            novos += r.rowcount
+            if it["cprod"] and it["unit"]:
+                ant = c.execute("SELECT atualizado_em FROM custos WHERE sku=?", (it["cprod"],)).fetchone()
+                if not ant or (ant[0] or "") <= n["data"] + "T99":
+                    c.execute("INSERT OR REPLACE INTO custos(sku,descricao,custo,atualizado_em) VALUES(?,?,?,?)",
+                              (it["cprod"], it["descricao"], round(it["unit"], 2), n["data"]))
+    return {"ok": True, "nf": n["nf"], "data": n["data"], "conta": n["conta"], "itens": len(n["itens"]), "novos": novos,
+            "total": round(sum(i["total"] for i in n["itens"]), 2)}
+
+
+def _pecas_do_item(i):
+    try:
+        pec = json.loads(i.get("pecas") or "[]")
+    except Exception:
+        pec = []
+    if pec:
+        return [(str(p.get("sku") or "").upper(), str(p.get("cor") or ""), int(p.get("qtd") or 1)) for p in pec]
+    skus = [x.strip().upper() for x in (i.get("sku") or "").split("+") if x.strip()] or ["(SEM SKU)"]
+    q = int(i.get("qtd") or 1) if len(skus) == 1 else 1
+    return [(s_, i.get("cor") or "", q) for s_ in skus]
+
+
+def materiais(de, ate):
+    """Produto por produto (SKU + cor): quanto subiu, separou, expediu, falta (bipado 'nao tem'), custo XBZ."""
+    ini, _ = dia_utc(de)
+    _, fim = dia_utc(ate)
+    hoje = datetime.now(BR).strftime("%Y-%m-%d")
+    with conn() as c:
+        q = "SELECT * FROM itens WHERE ((criado_em>=? AND criado_em<?)"
+        if ate >= hoje:
+            q += " OR status NOT IN ('EXPEDIDO','DEVOLVIDO')"
+        itens = [dict(r) for r in c.execute(q + ") AND COALESCE(lote,'')<>'DEVOLUCAO'", (ini, fim))]
+        prod, plat, lojas = {}, {}, {}
+        for i in itens:
+            g = grupo_envio(i)
+            for sku, cor, qtd in _pecas_do_item(i):
+                k = (sku, cor.upper())
+                d = prod.setdefault(k, {"sku": sku, "cor": cor, "pedidos": 0, "unidades": 0, "aguardando": 0,
+                                        "separadas": 0, "expedidas": 0, "devolvidas": 0, "falta": 0})
+                d["pedidos"] += 1
+                d["unidades"] += qtd
+                st = i["status"]
+                if st == "DEVOLVIDO":
+                    d["devolvidas"] += qtd
+                elif st == "EXPEDIDO":
+                    d["expedidas"] += qtd
+                elif st == "AGUARDANDO":
+                    d["aguardando"] += qtd
+                else:
+                    d["separadas"] += qtd
+                if i["falta_material"] and st not in ("EXPEDIDO", "DEVOLVIDO"):
+                    d["falta"] += qtd
+                cu = custo_de(c, sku) or 0
+                for chave, mapa in ((g, plat), ((i.get("loja") or "").strip().upper() or ("TIKTOK" if g == "TIKTOK" else "SEM LOJA"), lojas)):
+                    x = mapa.setdefault(chave, {"nome": chave, "unidades": 0, "custo": 0.0})
+                    x["unidades"] += qtd
+                    x["custo"] += cu * qtd
+        lista = []
+        for d in prod.values():
+            cu = custo_de(c, d["sku"])
+            d["custo_unit"] = cu
+            d["custo_total"] = round((cu or 0) * d["unidades"], 2)
+            lista.append(d)
+    lista.sort(key=lambda d: (-d["unidades"], d["sku"]))
+    arred = lambda m: sorted(({**v, "custo": round(v["custo"], 2)} for v in m.values()), key=lambda v: -v["unidades"])
+    return {"de": de, "ate": ate, "produtos": lista, "comprar": [d for d in lista if d["falta"]],
+            "por_plataforma": arred(plat), "por_loja": arred(lojas),
+            "sem_custo": sorted({d["sku"] for d in lista if d["custo_unit"] is None})}
+
+
+def compras(de, ate):
+    with conn() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM compras WHERE data>=? AND data<=? ORDER BY data, nf", (de, ate))]
+    por_prod, por_conta, nfs = {}, {}, {}
+    for r in rows:
+        p = por_prod.setdefault(r["cprod"], {"cprod": r["cprod"], "descricao": r["descricao"], "qtd": 0, "total": 0.0})
+        p["qtd"] += r["qtd"]; p["total"] += r["total"]
+        k = por_conta.setdefault(r["conta"] or "-", {"conta": r["conta"] or "-", "nfs": set(), "total": 0.0})
+        k["nfs"].add(r["nf"]); k["total"] += r["total"]
+        n = nfs.setdefault(r["nf"], {"nf": r["nf"], "data": r["data"], "conta": r["conta"], "itens": 0, "total": 0.0})
+        n["itens"] += 1; n["total"] += r["total"]
+    for p in por_prod.values():
+        p["total"] = round(p["total"], 2); p["unit_medio"] = round(p["total"] / p["qtd"], 2) if p["qtd"] else None
+    contas = [{"conta": k["conta"], "nfs": len(k["nfs"]), "total": round(k["total"], 2)} for k in por_conta.values()]
+    return {"de": de, "ate": ate, "total": round(sum(r["total"] for r in rows), 2),
+            "por_produto": sorted(por_prod.values(), key=lambda p: -p["total"]),
+            "por_conta": sorted(contas, key=lambda k: -k["total"]),
+            "notas": sorted(({**n, "total": round(n["total"], 2)} for n in nfs.values()), key=lambda n: n["data"], reverse=True)}
+
+
 # ------------------------------------------------------------------ etiquetas por e-mail
 # Mande (ou encaminhe) o PDF de etiquetas do UpSeller para o e-mail da Central: ela le e inclui sozinha.
 EMAIL_USUARIO = os.environ.get("EMAIL_USUARIO", "").strip()
@@ -810,12 +973,16 @@ def ler_etiqueta_txt(t):
         canal = "OUTROS"
     # itens do pedido (rodape do UpSeller): "1. 18726I-Personalizado (Rosa Claro, Personalizado com Nome) / ..."
     rod = re.split(r"#UPPUS\d+[^\n]*\n", t, maxsplit=1)
-    skus, cores, pers = [], [], []
+    skus, cores, pers, pecas = [], [], [], []
     if len(rod) == 2:
         for it in re.split(r"(?m)^\s*\d+\.\s*", rod[1])[1:]:
             mm = re.match(r"\s*([A-Za-z0-9]+)", it)
+            mq = re.search(r"\*\s*(\d+)\s*\)?\s*$", it.strip())
+            par0 = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
             if mm:
                 skus.append(mm.group(1).upper())
+                pecas.append({"sku": mm.group(1).upper(), "cor": par0[-1].split(",")[0].strip() if par0 else "",
+                              "qtd": int(mq.group(1)) if mq else 1})
             par = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
             if par:
                 cores.append(par[-1].split(",")[0].strip())
@@ -824,6 +991,12 @@ def ler_etiqueta_txt(t):
     if not skus:
         skus = [x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z][A-Za-z0-9._\-/]{1,40})", t, re.I)]
     cli = re.search(r"Customer:\s*(.+)", t)
+    # loja (remetente) na etiqueta Shopee: linha logo depois do rastreio BR...
+    loja = ""
+    if ras:
+        ml = re.search(re.escape(ras) + r"\s*\n\s*([A-Za-z][A-Za-z0-9 &.\-]{1,30})\s*\n", t)
+        if ml:
+            loja = ml.group(1).strip().upper()
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
     etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
     if etq:
@@ -837,11 +1010,25 @@ def ler_etiqueta_txt(t):
             "fonte": re.sub(r"^\s*Fonte\s*[:\-]\s*", "", fl, flags=re.I).strip(),
             "obs": ("Cliente: " + cli.group(1).strip()) if cli else "",
             "etiqueta": int(etq.group(1)) if etq else None, "personalizado": personalizado,
+            "pecas": pecas, "loja": loja,
             "codigos": [x for x in dict.fromkeys((sn, tid, erid, ras, ups)) if x]}
 
 
-def itens_do_pdf(dados):
+def dica_arquivo(nome):
+    """A automacao separa os arquivos por tipo: etiquetas_<data>_<hora>_<n>_<tipo>.pdf - o nome manda no canal."""
+    n = (nome or "").lower().replace(" ", "_")
+    if "tiktok" in n:
+        return {"canal": "TIKTOK", "envio": ""}
+    if "entrega_rapida" in n or "entrega_direta" in n or "turbo" in n:
+        return {"canal": "SHOPEE", "envio": "ENTREGA DIRETA"}
+    if "shopee" in n or "xpress" in n:
+        return {"canal": "SHOPEE", "envio": "SHOPEE XPRESS"}
+    return {}
+
+
+def itens_do_pdf(dados, nome=""):
     from pypdf import PdfReader
+    dica = dica_arquivo(nome)
     itens, ign = [], 0
     for pg in PdfReader(io.BytesIO(dados)).pages:
         it = ler_etiqueta_txt(pg.extract_text() or "")
@@ -854,8 +1041,11 @@ def itens_do_pdf(dados):
             for k in ("sku", "cor"):
                 ant[k] = " + ".join(dict.fromkeys([x for x in (ant[k] + " + " + it[k]).split(" + ") if x]))
             ant["personalizado"] = ant["personalizado"] or it["personalizado"]
+            ant["pecas"] = ant.get("pecas", []) + it.get("pecas", [])
             continue
         itens.append(it)
+    for it in itens:
+        it.update(dica)
     return itens, ign
 
 
@@ -883,7 +1073,16 @@ def checar_email():
             rem = parseaddr(msg.get("From", ""))[1].lower()
             assunto = str(make_header(decode_header(msg.get("Subject", ""))))[:200]
             reg = dict(uid=uid, em=agora(), remetente=rem, assunto=assunto, arquivos="", etiquetas=0, novos=0, atualizados=0, erro="")
-            if EMAIL_REMETENTES and rem not in EMAIL_REMETENTES:
+            xmls = [pt for pt in msg.walk() if (pt.get_filename() or "").lower().endswith(".xml")
+                    or pt.get_content_type() in ("text/xml", "application/xml")]
+            nfe = [pt for pt in xmls if b"infNFe" in (pt.get_payload(decode=True) or b"")]
+            if nfe and (rem.endswith("@xbzbrindes.com.br") or not EMAIL_REMETENTES or rem in EMAIL_REMETENTES):
+                # nota fiscal (ex.: XBZ): so o XML interessa; o PDF (DANFE) nao e etiqueta
+                res = [importar_nfe(pt.get_payload(decode=True)) for pt in nfe]
+                reg["arquivos"] = ", ".join(str(make_header(decode_header(pt.get_filename() or "nfe.xml"))) for pt in nfe)
+                reg["erro"] = "; ".join(f"NF {r.get('nf')} {r.get('conta','')}: R$ {r.get('total')}" if r.get("ok")
+                                        else r.get("erro", "") for r in res)
+            elif EMAIL_REMETENTES and rem not in EMAIL_REMETENTES:
                 reg["erro"] = "remetente nao autorizado (ignorado)"
             else:
                 nomes = []
@@ -894,7 +1093,7 @@ def checar_email():
                         continue
                     nomes.append(nome or "anexo.pdf")
                     try:
-                        itens, _ = itens_do_pdf(parte.get_payload(decode=True) or b"")
+                        itens, _ = itens_do_pdf(parte.get_payload(decode=True) or b"", nome)
                         reg["etiquetas"] += len(itens)
                         if itens:
                             r = importar_lote({"lote": "EMAIL " + datetime.now(BR).strftime("%d/%m %H:%M"), "itens": itens})

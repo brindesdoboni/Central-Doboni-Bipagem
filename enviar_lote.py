@@ -30,17 +30,40 @@ def textos_pdf(caminho):
         return [p.extract_text() or "" for p in PdfReader(caminho).pages]
 
 
+def _pecas(pecas):
+    """[(sku,cor,nome), ...] -> [{sku,cor,qtd}] (cada linha do spec = 1 unidade; aceita (sku,cor,nome,qtd))."""
+    agg = {}
+    for p in pecas or []:
+        if not p:
+            continue
+        sku = str(p[0]).upper(); cor = str(p[1]) if len(p) > 1 and p[1] else ""
+        q = int(p[3]) if len(p) > 3 and str(p[3]).isdigit() else 1
+        agg[(sku, cor)] = agg.get((sku, cor), 0) + q
+    return [{"sku": k[0], "cor": k[1], "qtd": v} for k, v in agg.items()]
+
+
 def montar(spec_path, pdf_path=None):
-    P = runpy.run_path(spec_path)["P"]
+    sp = runpy.run_path(spec_path)
+    P = sp["P"]
+    U = sp.get("U") or {}  # opcional: {pedido: "UPPUS..."} - acha tambem a etiqueta original sem o nº do pedido
     info = {}
     if pdf_path:
         compacto = lambda s: re.sub(r"[^A-Z0-9]", "", s.upper())
         paginas = [(t, compacto(t)) for t in textos_pdf(pdf_path)]
         for reg in P:
             ped = str(reg[0]); pc = compacto(ped)
+            uc = compacto(str(U.get(ped) or U.get(reg[0]) or ""))
             for t, tc in paginas:
-                if pc and pc in tc:
-                    d = info.setdefault(ped, {"etiquetas": [], "rastreio": "", "envio": ""})
+                if (pc and pc in tc) or (uc and re.search(uc + r"(?!\d)", tc)):
+                    d = info.setdefault(ped, {"etiquetas": [], "rastreio": "", "envio": "", "codigos": []})
+                    T0 = t.upper()
+                    # codigos de barras da etiqueta: Entrega Rapida (Pedido: 999...), TikTok (5 + 17 digitos), UPPUS
+                    for rx in (r"PEDIDO:\s*(9\d{13,15})(?!\d)", r"(?<!\d)(5\d{17})(?!\d)", r"(UPPUS\d+)"):
+                        for cod in re.findall(rx, T0):
+                            if cod not in d["codigos"]:
+                                d["codigos"].append(cod)
+                    if re.search(r"PEDIDO:\s*9\d{13,15}(?!\d)", T0) and not d["envio"]:
+                        d["envio"] = "ENTREGA DIRETA"
                     m = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
                     if m and int(m.group(1)) not in d["etiquetas"]:
                         d["etiquetas"].append(int(m.group(1)))
@@ -73,6 +96,8 @@ def montar(spec_path, pdf_path=None):
             "etiqueta": etqs[n - 1] if len(etqs) >= n else (etqs[0] if etqs else None),
             "rastreio": d.get("rastreio", ""),
             "envio": "ENTREGA DIRETA" if canal == "ER" else d.get("envio", ""),
+            "pecas": _pecas(pecas),
+            "codigos": list(dict.fromkeys(d.get("codigos", []) + ([str(U[pedido])] if U.get(pedido) else []))),
         })
     return itens
 
