@@ -62,6 +62,16 @@ def iniciar_db():
             c.execute("ALTER TABLE itens ADD COLUMN qtd INTEGER DEFAULT 1")
         if "pecas" not in cols_it:
             c.execute("ALTER TABLE itens ADD COLUMN pecas TEXT DEFAULT ''")
+        c.execute("DELETE FROM custos WHERE length(COALESCE(atualizado_em,''))=10")  # custos vindos de nota (valor nao real)
+        c.execute("""CREATE TABLE IF NOT EXISTS estoque_mov(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
+            qtd REAL, tipo TEXT, ref TEXT UNIQUE, obs TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_mov_sku ON estoque_mov(sku, cor)")
+        c.execute("""CREATE TABLE IF NOT EXISTS compra_aprendizado(sku TEXT PRIMARY KEY, fator REAL, pedidos INTEGER,
+            atualizado TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
+            cor TEXT, preco REAL, estoque INTEGER, status TEXT, reposicao TEXT, atualizado TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_xbz_cod ON xbz(codigo)")
         c.execute("""CREATE TABLE IF NOT EXISTS compras(id INTEGER PRIMARY KEY, chave TEXT UNIQUE, nf TEXT, data TEXT,
             conta TEXT, cprod TEXT, descricao TEXT, qtd REAL, unit REAL, total REAL, importado_em TEXT)""")
         if "uid" not in [r[1] for r in c.execute("PRAGMA table_info(emails)")]:
@@ -157,6 +167,7 @@ def importar_lote(dados):
     lote = dados.get("lote") or datetime.now(BR).strftime("%Y%m%d-%H%M")
     n_novo = n_atual = 0
     ocorr = {}
+    tocados = []
     with _lock, conn() as c:
         for i, it in enumerate(dados.get("itens", [])):
             pedido = str(it.get("pedido") or "").strip()
@@ -195,6 +206,7 @@ def importar_lote(dados):
                     for cod in {pedido, campos["rastreio"], *(it.get("codigos") or [])}:
                         if norm(cod):
                             c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (norm(cod), iid))
+                    tocados.append(iid)
                     continue
             if ant:
                 iid = ant["id"]
@@ -212,7 +224,9 @@ def importar_lote(dados):
             for cod in {pedido, campos["rastreio"], *(it.get("codigos") or [])}:
                 if norm(cod):
                     c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (norm(cod), iid))
-    return {"ok": True, "lote": lote, "novos": n_novo, "atualizados": n_atual}
+            tocados.append(iid)
+        sem = sum(checar_falta(c, iid) for iid in dict.fromkeys(tocados))
+    return {"ok": True, "lote": lote, "novos": n_novo, "atualizados": n_atual, "sem_estoque": sem}
 
 
 # ------------------------------------------------------------------ bipe
@@ -235,6 +249,8 @@ def bipar(posto, codigo, operador, modo):
                 return {"tipo": "aviso", "msg": "Nada para desfazer."}
             c.execute("UPDATE eventos SET desfeito=1 WHERE id=?", (ev["id"],))
             recalcular(c, ev["item_id"])
+            if c.execute("SELECT status FROM itens WHERE id=?", (ev["item_id"],)).fetchone()[0] == "AGUARDANDO":
+                c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{ev['item_id']}|%",))  # volta para o estoque
             return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}"}
         itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
                           "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
@@ -251,6 +267,8 @@ def bipar(posto, codigo, operador, modo):
             c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
                       (it["id"], etapa, op["id"], posto, agora(), alerta))
             recalcular(c, it["id"])
+            if etapa in ("SEPARADO", "GRAVACAO_INICIO", "EXPEDIDO"):
+                baixar_estoque(c, it["id"])  # baixa no estoque quando o material sai para a separacao
             return dict(c.execute("SELECT * FROM itens WHERE id=?", (it["id"],)).fetchone())
 
         if modo == "FALTA":
@@ -359,6 +377,8 @@ def painel(data):
         equipe = {}
         ultimo_grav = {}
         for e in evs:
+            if e["colaborador_id"] is None:
+                continue  # marcacao automatica (estoque), nao e de ninguem da equipe
             p = equipe.setdefault(e["nome"] or "?", {"separados": 0, "gravados": 0, "expedidos": 0,
                                                      "min_gravacao": [], "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
             p["ultimo"] = e["em"]
@@ -444,6 +464,18 @@ def _num(v):
 
 
 def custo_de(c, sku):
+    v = _custo_manual(c, sku)
+    if v is not None:
+        return v
+    total, achou = 0.0, False
+    for parte in [x.strip() for x in (sku or "").split("+") if x.strip()]:
+        x = xbz_de(c, parte)
+        if x and x.get("preco"):
+            total += x["preco"]; achou = True
+    return round(total, 2) if achou else None
+
+
+def _custo_manual(c, sku):
     """Custo do SKU (soma se for 'A + B'). Aceita codigo exato ou prefixo cadastrado (ex.: 06016B -> 06016B-PRETA)."""
     if not sku:
         return None
@@ -504,7 +536,7 @@ def produtividade(de, ate):
         pessoas = {}
         for r in c.execute("""SELECT k.nome, e.etapa, COUNT(*), MIN(e.em), MAX(e.em) FROM eventos e
                 LEFT JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.desfeito=0 AND e.em>=? AND e.em<?
-                GROUP BY k.nome, e.etapa""", (ini, fim)):
+                AND e.colaborador_id IS NOT NULL GROUP BY k.nome, e.etapa""", (ini, fim)):
             p = pessoas.setdefault(r[0] or "?", {"nome": r[0] or "?", "separados": 0, "gravados": 0, "expedidos": 0,
                                                  "devolucoes": 0, "faltas": 0})
             chave = {"SEPARADO": "separados", "GRAVACAO_INICIO": "gravados", "EXPEDIDO": "expedidos",
@@ -641,6 +673,14 @@ class H(BaseHTTPRequestHandler):
             with conn() as c:
                 ult = [dict(r) for r in c.execute("SELECT * FROM emails ORDER BY id DESC LIMIT 30")]
             return self._envia(200, {"status": _email_status, "recebidos": ult})
+        if p == "/api/estoque":
+            return self._envia(200, estoque())
+        if p == "/api/compra/sugestao":
+            return self._envia(200, sugestao_compra())
+        if p == "/api/estoque/movimentos":
+            with conn() as c:
+                return self._envia(200, [dict(r) for r in c.execute(
+                    "SELECT * FROM estoque_mov WHERE sku=? ORDER BY id DESC LIMIT 200", (sku_base(q.get("sku", "")),))])
         if p == "/api/materiais":
             return self._envia(200, materiais(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/compras":
@@ -718,6 +758,15 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, importar_lote(d))
         if not self._admin():
             return self._envia(401, {"erro": "login necessario"})
+        if p == "/api/compra/confirmar":
+            return self._envia(200, confirmar_pedido_xbz(d.get("itens") or []))
+        if p == "/api/estoque/contagem":
+            return self._envia(200, contagem_estoque(str(d.get("texto") or "").splitlines()))
+        if p == "/api/estoque/distribuir":
+            return self._envia(200, distribuir_cor(d.get("sku", ""), d.get("partes") or {}))
+        if p == "/api/xbz/sincronizar":
+            threading.Thread(target=xbz_sincronizar, daemon=True).start()
+            return self._envia(200, {"ok": True, "msg": "atualizando em segundo plano"})
         if p == "/api/compras/importar":
             import base64
             res = []
@@ -758,6 +807,7 @@ class H(BaseHTTPRequestHandler):
             ids = [int(x) for x in d.get("ids", [])]
             with _lock, conn() as c:
                 c.executemany("DELETE FROM itens WHERE id=?", [(i,) for i in ids])
+                c.executemany("DELETE FROM estoque_mov WHERE ref LIKE ?", [(f"ETQ|{i}|%",) for i in ids])
             return self._envia(200, {"ok": True, "excluidos": len(ids)})
         if p == "/api/itens/adicionar":
             if not str(d.get("pedido", "")).strip():
@@ -807,6 +857,331 @@ class H(BaseHTTPRequestHandler):
 
 
 # ------------------------------------------------------------------ compras XBZ (NF-e) e materiais
+ESTOQUE_IGNORAR = [x.strip().upper() for x in os.environ.get("ESTOQUE_IGNORAR_CONTAS", "LAURA").split(",") if x.strip()]
+ESTOQUE_DIAS_COMPRA = int(os.environ.get("ESTOQUE_DIAS_COMPRA", "6"))
+
+
+def codigo_xbz_nf(cprod):
+    """Codigo da nota da XBZ -> codigo do produto (o mesmo SKU das etiquetas). Ex.: I*4083 -> 04083, I*18781 -> 18781."""
+    c = re.sub(r"^[A-Z]\*", "", (cprod or "").upper().strip())
+    return c.zfill(5) if c.isdigit() and len(c) < 5 else c
+
+
+def cor_norm(cor):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(cor or "")).encode("ascii", "ignore").decode().upper()
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", t)).strip()
+
+
+def sku_base(sku):
+    """SKU das etiquetas -> codigo do produto XBZ (ex.: '18726I' fica 18726I; '05063-PRETO' vira 05063)."""
+    return re.split(r"[-/ ]", (sku or "").upper().strip())[0]
+
+
+def _controlado(c, sku, cn):
+    """Produto/cor ja contado? (so entao o sistema pode dizer sozinho que 'nao tem')."""
+    if c.execute("SELECT 1 FROM estoque_mov WHERE sku=? AND cor=? AND tipo='CONTAGEM' LIMIT 1", (sku, cn)).fetchone():
+        return "cor"
+    if c.execute("SELECT 1 FROM estoque_mov WHERE sku=? AND cor='' AND tipo='CONTAGEM' LIMIT 1", (sku,)).fetchone():
+        return "sku"
+    return None
+
+
+def baixar_estoque(c, iid):
+    """Baixa do estoque as pecas da etiqueta quando o material sai para a separacao (uma vez so por etiqueta)."""
+    r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
+    if not r or r["lote"] == "DEVOLUCAO":
+        return
+    for sku, cor, qtd in _pecas_do_item(dict(r)):
+        sku, cn = sku_base(sku), cor_norm(cor)
+        if not sku or sku.startswith("("):
+            continue
+        c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                  (agora(), sku, cn, -qtd, "ETIQUETA", f"ETQ|{iid}|{sku}|{cn}", f"pedido {r['pedido']}"))
+
+
+def _reservado(c, sku, cn, nivel, antes_de):
+    """Unidades de etiquetas que entraram antes desta e ainda nao foram separadas (vao sair da prateleira)."""
+    tot = 0
+    for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO'", (antes_de,)):
+        for s_, c_, q in _pecas_do_item(dict(i)):
+            if sku_base(s_) == sku and (nivel == "sku" or cor_norm(c_) == cn):
+                tot += q
+    return tot
+
+
+def checar_falta(c, iid):
+    """Etiqueta nova: se o que tem na prateleira (menos o que ja esta reservado) nao cobre, marca NAO TEM sozinho."""
+    r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
+    if not r or r["lote"] == "DEVOLUCAO" or r["status"] != "AGUARDANDO" or r["falta_material"]:
+        return 0
+    falta = False
+    for sku, cor, qtd in _pecas_do_item(dict(r)):
+        sku, cn = sku_base(sku), cor_norm(cor)
+        nivel = _controlado(c, sku, cn)
+        if not nivel:
+            continue
+        if nivel == "cor":
+            saldo = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cn)).fetchone()[0]
+        else:
+            saldo = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=?", (sku,)).fetchone()[0]
+        if saldo - _reservado(c, sku, cn, nivel, iid) < qtd:
+            falta = True
+    if falta:
+        c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
+                  (iid, "FALTA_MATERIAL", None, "ESTOQUE", agora(), "sem estoque"))
+        recalcular(c, iid)
+        return 1
+    return 0
+
+
+def contagem_estoque(linhas):
+    """'SKU;COR;QTD' por linha (cor pode ficar vazia). Define o saldo exato daquele produto/cor agora."""
+    feitos, erros = 0, []
+    with _lock, conn() as c:
+        for ln in linhas:
+            cols = [x.strip() for x in re.split(r"\t|;", ln)]
+            if not cols or not cols[0]:
+                continue
+            try:
+                sku, cor, qtd = sku_base(cols[0]), cor_norm(cols[1] if len(cols) > 2 else ""), _num(cols[-1])
+            except Exception:
+                erros.append(ln.strip()); continue
+            atual = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cor)).fetchone()[0]
+            c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                      (agora(), sku, cor, qtd - atual, "CONTAGEM", f"CONT|{sku}|{cor}|{agora()}|{secrets.token_hex(3)}",
+                       f"contagem: {qtd:g}"))
+            feitos += 1
+    return {"ok": True, "feitos": feitos, "erros": erros}
+
+
+def distribuir_cor(sku, partes):
+    """Passa unidades que entraram sem cor (nota da XBZ) para as cores certas: partes = {cor: qtd}."""
+    sku = sku_base(sku)
+    with _lock, conn() as c:
+        for cor, q in partes.items():
+            q = _num(q)
+            if not q:
+                continue
+            marca = f"{agora()}|{secrets.token_hex(3)}"
+            c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                      (agora(), sku, "", -q, "DISTRIBUI", f"DIST-|{sku}|{cor}|{marca}", f"para {cor}"))
+            c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                      (agora(), sku, cor_norm(cor), q, "DISTRIBUI", f"DIST+|{sku}|{cor}|{marca}", "entrada sem cor"))
+    return {"ok": True}
+
+
+def xbz_sincronizar():
+    """Le o catalogo da XBZ (preco de custo e estoque do fornecedor). So leitura. Nunca registra a URL (tem o token)."""
+    import urllib.request
+    cnpj, tok = os.environ.get("XBZ_CNPJ", ""), os.environ.get("XBZ_TOKEN", "")
+    if not (cnpj and tok):
+        return {"ok": False, "erro": "XBZ_CNPJ/XBZ_TOKEN nao configurados no Railway"}
+    from urllib.parse import urlencode
+    base = os.environ.get("XBZ_URL", "https://api.minhaxbz.com.br:5001/api/clientes/GetListaDeProdutos")
+    url = base + "?" + urlencode({"cnpj": cnpj, "token": tok})
+    ini = datetime.now()
+    try:
+        with urllib.request.urlopen(url, timeout=90) as r:
+            dados = json.loads(r.read())
+    except Exception as e:
+        msg = re.sub(r"token=[^&\s]+", "token=***", str(e))
+        _xbz_status.update(ok=False, erro=msg[:200], ultima=agora())
+        return {"ok": False, "erro": msg[:200]}
+    if not isinstance(dados, list) or len(dados) < 500 or any(not x.get("CodigoXbz") for x in dados[:50]):
+        _xbz_status.update(ok=False, erro="resposta incompleta da XBZ - catalogo anterior mantido", ultima=agora())
+        return {"ok": False, "erro": _xbz_status["erro"]}
+    with _lock, conn() as c:
+        for x in dados:
+            try:
+                preco, est = float(x.get("PrecoVenda") or 0), max(0, int(float(x.get("QuantidadeDisponivel") or 0)))
+            except Exception:
+                continue
+            c.execute("INSERT OR REPLACE INTO xbz VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (str(x["CodigoXbz"]).strip(), str(x.get("CodigoAmigavel") or x.get("IdProduto") or "").strip().upper(),
+                       str(x.get("CodigoComposto") or "").strip().upper(), re.sub(r"\s+", " ", str(x.get("Nome") or "")).strip(),
+                       cor_norm(x.get("CorWebPrincipal")), preco, est, str(x.get("StatusConfiabilidade") or "")[:120],
+                       str(x.get("ReposicaoDataPrevista") or "")[:10], agora()))
+    _xbz_status.update(ok=True, erro="", ultima=agora(), registros=len(dados),
+                       segundos=round((datetime.now() - ini).total_seconds(), 1))
+    return {"ok": True, "registros": len(dados)}
+
+
+_xbz_status = {"ok": None, "erro": "", "ultima": "", "registros": 0}
+
+
+def _xbz_loop():
+    import time
+    while True:
+        r = xbz_sincronizar()
+        if not r.get("ok"):
+            print("XBZ:", r.get("erro"), flush=True)
+            time.sleep(15 * 60)  # tenta de novo em 15 min
+        else:
+            time.sleep(6 * 3600)
+
+
+def xbz_de(c, sku, cor=""):
+    """Preco de custo e estoque da XBZ para o produto (e a cor, se achar)."""
+    sku = sku_base(sku)
+    rows = c.execute("SELECT * FROM xbz WHERE codigo=?", (sku,)).fetchall()
+    if not rows:
+        return None
+    cn = cor_norm(cor)
+    sel = [r for r in rows if cn and (r["cor"] == cn or cn.startswith(r["cor"] + " ") or r["cor"].startswith(cn))] or rows
+    precos = [r["preco"] for r in sel if r["preco"]]
+    return {"preco": round(sum(precos) / len(precos), 2) if precos else None, "estoque": sum(r["estoque"] for r in sel),
+            "nome": rows[0]["nome"], "cor_xbz": ", ".join(sorted({r["cor"] for r in sel})),
+            "reposicao": min((r["reposicao"] for r in sel if r["reposicao"] and not r["reposicao"].startswith("0001")), default="")}
+
+
+def estoque():
+    """Uma pagina so: saldo, saidas, cobertura, quanto comprar, preco e estoque da XBZ."""
+    hoje = datetime.now(timezone.utc)
+    d7, d15 = (hoje - timedelta(days=7)).isoformat(), (hoje - timedelta(days=15)).isoformat()
+    with conn() as c:
+        linhas = {}
+        for r in c.execute("""SELECT sku, cor, SUM(qtd) saldo,
+                 -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s7,
+                 -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s15,
+                 MAX(CASE WHEN tipo='CONTAGEM' THEN em END) contado,
+                 SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF') THEN 1 ELSE 0 END) conhecido,
+                 SUM(CASE WHEN tipo='ENTRADA_NF' AND em>=? THEN qtd ELSE 0 END) e15
+                 FROM estoque_mov GROUP BY sku, cor""", (d7, d15, d15)):
+            linhas[(r["sku"], r["cor"])] = dict(r)
+        pend = {}
+        # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
+        for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO'"):
+            for sku, cor, q in _pecas_do_item(dict(i)):
+                k = (sku_base(sku), cor_norm(cor))
+                if k[0] and not k[0].startswith("("):
+                    pend[k] = pend.get(k, 0) + q
+        for k in pend:
+            linhas.setdefault(k, {"sku": k[0], "cor": k[1], "saldo": 0, "s7": 0, "s15": 0, "contado": None,
+                                  "conhecido": 0, "e15": 0})
+        out = []
+        for (sku, cor), r in linhas.items():
+            media = (r["s15"] or 0) / 15
+            fisico = r["saldo"] or 0
+            saldo = fisico - pend.get((sku, cor), 0)  # disponivel
+            x = xbz_de(c, sku, cor) or {}
+            cu = x.get("preco") if x.get("preco") is not None else custo_de(c, sku)
+            conhecido = bool(r["conhecido"])
+            comprar = max(0, round(media * ESTOQUE_DIAS_COMPRA - saldo)) if cor != "" and conhecido else 0
+            out.append({"sku": sku, "cor": cor or "(cor a definir)", "sem_cor": cor == "", "saldo": round(saldo, 2),
+                        "fisico": round(fisico, 2),
+                        "pendente_hoje": pend.get((sku, cor), 0), "saidas_7d": r["s7"] or 0, "saidas_15d": r["s15"] or 0,
+                        "media_dia": round(media, 1), "dias": round(saldo / media, 1) if media > 0 and saldo > 0 else (0 if saldo <= 0 else None),
+                        "comprar": comprar, "custo": cu, "valor_compra": round((cu or 0) * comprar, 2),
+                        "contado": r["contado"], "xbz_estoque": x.get("estoque"), "xbz_cor": x.get("cor_xbz", ""),
+                        "xbz_reposicao": x.get("reposicao", ""), "nome": x.get("nome", ""),
+                        "conhecido": conhecido,
+                        "alerta": ("FALTA CONTAR" if not conhecido else "") or
+                                  ("SEM ESTOQUE" if saldo <= 0 and not cor == "" else "") or
+                                  ("XBZ ACABOU" if x and x.get("estoque") == 0 else "") or
+                                  ("XBZ ABAIXO DE 200" if x and x.get("estoque") is not None and x["estoque"] < 200 else "")})
+    out.sort(key=lambda d: (d["sem_cor"], not d["conhecido"], -(d["comprar"] or 0), d["saldo"], d["sku"]))
+    return {"itens": out, "dias_compra": ESTOQUE_DIAS_COMPRA, "xbz": _xbz_status,
+            "total_compra": round(sum(d["valor_compra"] for d in out), 2)}
+
+
+ESTOQUE_PRAZO_XBZ = int(os.environ.get("ESTOQUE_PRAZO_XBZ", "2"))
+
+
+def _habito_compra(c, sku):
+    """Aprende com as notas da XBZ como voces costumam comprar esse produto: de quantos em quantos dias e em qual multiplo."""
+    por_data = {}
+    for r in c.execute("SELECT data, cprod, qtd FROM compras ORDER BY data"):
+        if codigo_xbz_nf(r["cprod"]) == sku:
+            por_data[r["data"]] = por_data.get(r["data"], 0) + (r["qtd"] or 0)
+    rows = [{"data": d_, "q": q_} for d_, q_ in sorted(por_data.items())]
+    datas = [datetime.fromisoformat(r["data"]) for r in rows]
+    gaps = sorted((b - a).days for a, b in zip(datas, datas[1:]) if (b - a).days > 0)
+    ciclo = max(3, min(14, gaps[len(gaps) // 2])) if gaps else ESTOQUE_DIAS_COMPRA
+    qs = [int(r["q"]) for r in rows if r["q"]]
+    mult = 1
+    for m in (100, 50, 25, 20, 10, 5):
+        if qs and sum(1 for q in qs if q % m == 0) >= max(1, 0.7 * len(qs)):
+            mult = m
+            break
+    return {"ciclo": ciclo, "multiplo": mult, "compras": len(qs), "lote_tipico": sorted(qs)[len(qs) // 2] if qs else None}
+
+
+def sugestao_compra():
+    """Pedido sugerido para a XBZ: venda recente (mais peso nos ultimos 7 dias) x ciclo de compra aprendido + prazo da XBZ,
+    menos o que tem na prateleira, mais o que ja esta reservado; arredonda no multiplo que voces costumam pedir e
+    aplica o fator aprendido com os pedidos confirmados."""
+    import math
+    agora_ = datetime.now(timezone.utc)
+    d7, d28 = (agora_ - timedelta(days=7)).isoformat(), (agora_ - timedelta(days=28)).isoformat()
+    est = {(i["sku"], "" if i["sem_cor"] else i["cor"]): i for i in estoque()["itens"]}
+    out, sem_contagem = [], []
+    with conn() as c:
+        prim = c.execute("SELECT MIN(em) FROM estoque_mov WHERE tipo='ETIQUETA'").fetchone()[0]
+        dias_hist = max(1, min(28, (agora_ - datetime.fromisoformat(prim)).days + 1)) if prim else 1
+        vendas = {}
+        for r in c.execute("""SELECT sku, cor, -SUM(CASE WHEN em>=? THEN qtd ELSE 0 END) v7, -SUM(qtd) v28 FROM estoque_mov
+                              WHERE tipo='ETIQUETA' AND em>=? GROUP BY sku, cor""", (d7, d28)):
+            vendas[(r["sku"], r["cor"])] = (r["v7"] or 0, r["v28"] or 0)
+        fatores = {r["sku"]: r["fator"] for r in c.execute("SELECT sku, fator FROM compra_aprendizado")}
+        habitos = {}
+        chaves = set(vendas) | {k for k, v in est.items() if v["pendente_hoje"]}
+        for sku, cor in sorted(chaves):
+            if not cor:
+                continue
+            v7, v28 = vendas.get((sku, cor), (0, 0))
+            media = 0.6 * (v7 / 7) + 0.4 * (v28 / max(7, dias_hist))  # no comeco (pouco historico) nao exagera
+            h = habitos.setdefault(sku, _habito_compra(c, sku))
+            e = est.get((sku, cor), {})
+            reservado = e.get("pendente_hoje", 0)
+            fisico = e.get("fisico", 0)
+            alvo = media * (h["ciclo"] + ESTOQUE_PRAZO_XBZ) * fatores.get(sku, 1.0)
+            precisa = alvo + reservado - max(fisico, 0)
+            x = xbz_de(c, sku, cor) or {}
+            linha = {"sku": sku, "cor": cor, "nome": x.get("nome", e.get("nome", "")), "media_dia": round(media, 1),
+                     "na_prateleira": fisico, "reservado": reservado, "ciclo_dias": h["ciclo"], "multiplo": h["multiplo"],
+                     "fator": round(fatores.get(sku, 1.0), 2), "preco": x.get("preco"), "xbz_estoque": x.get("estoque")}
+            if not e.get("conhecido"):
+                linha["qtd"] = math.ceil(alvo + reservado)
+                if linha["qtd"] > 0:
+                    sem_contagem.append(linha)
+                continue
+            if precisa <= 0:
+                continue
+            q = math.ceil(precisa / h["multiplo"]) * h["multiplo"]
+            if x.get("estoque") is not None and q > x["estoque"]:
+                linha["aviso"] = f"XBZ so tem {x['estoque']}"
+                q = x["estoque"]
+            if q <= 0:
+                continue
+            linha["qtd"] = q
+            linha["total"] = round((x.get("preco") or 0) * q, 2)
+            out.append(linha)
+    out.sort(key=lambda l: (l["sku"], l["cor"]))
+    return {"itens": out, "sem_contagem": sem_contagem, "total": round(sum(l.get("total", 0) for l in out), 2),
+            "prazo_xbz": ESTOQUE_PRAZO_XBZ, "dias_historico": dias_hist}
+
+
+def confirmar_pedido_xbz(itens):
+    """Voces confirmam o que pediram de verdade; o sistema aprende a diferenca (fator por produto) para a proxima vez."""
+    with _lock, conn() as c:
+        por_sku = {}
+        for it in itens:
+            sug, q = float(it.get("sugerido") or 0), float(it.get("qtd") or 0)
+            a = por_sku.setdefault(sku_base(it.get("sku")), [0.0, 0.0])
+            a[0] += sug; a[1] += q
+        for sku, (sug, q) in por_sku.items():
+            if sug <= 0:
+                continue
+            r = c.execute("SELECT fator, pedidos FROM compra_aprendizado WHERE sku=?", (sku,)).fetchone()
+            f, n = (r[0], r[1]) if r else (1.0, 0)
+            f = max(0.3, min(3.0, 0.7 * f + 0.3 * (q / sug)))
+            c.execute("INSERT OR REPLACE INTO compra_aprendizado VALUES(?,?,?,?)", (sku, f, n + 1, agora()))
+        total = sum(float(i.get("qtd") or 0) * float(i.get("preco") or 0) for i in itens)
+        c.execute("INSERT INTO pedidos_xbz(em,itens,total) VALUES(?,?,?)", (agora(), json.dumps(itens, ensure_ascii=False), total))
+    return {"ok": True}
+
+
 def ler_nfe(xml):
     """NF-e (XML) -> nf, data, conta (destinatario) e itens. Aceita nfeProc ou NFe."""
     import xml.etree.ElementTree as ET
@@ -844,11 +1219,11 @@ def importar_nfe(xml):
                              VALUES(?,?,?,?,?,?,?,?,?,?)""", (f"{n['chave'] or n['nf']}|{it['item']}", n["nf"], n["data"],
                              n["conta"], it["cprod"], it["descricao"], it["qtd"], it["unit"], it["total"], agora()))
             novos += r.rowcount
-            if it["cprod"] and it["unit"]:
-                ant = c.execute("SELECT atualizado_em FROM custos WHERE sku=?", (it["cprod"],)).fetchone()
-                if not ant or (ant[0] or "") <= n["data"] + "T99":
-                    c.execute("INSERT OR REPLACE INTO custos(sku,descricao,custo,atualizado_em) VALUES(?,?,?,?)",
-                              (it["cprod"], it["descricao"], round(it["unit"], 2), n["data"]))
+            if it["cprod"] and it["qtd"] and not any(x and x in (n["conta"] or "").upper() for x in ESTOQUE_IGNORAR):
+                # entrada no estoque proprio (a nota nao traz a cor: entra como "cor a definir")
+                c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                          (agora(), codigo_xbz_nf(it["cprod"]), "", it["qtd"], "ENTRADA_NF",
+                           f"NF|{n['chave'] or n['nf']}|{it['item']}", f"NF {n['nf']} {n['conta']}"))
     return {"ok": True, "nf": n["nf"], "data": n["data"], "conta": n["conta"], "itens": len(n["itens"]), "novos": novos,
             "total": round(sum(i["total"] for i in n["itens"]), 2)}
 
@@ -924,10 +1299,17 @@ def compras(de, ate):
         k["nfs"].add(r["nf"]); k["total"] += r["total"]
         n = nfs.setdefault(r["nf"], {"nf": r["nf"], "data": r["data"], "conta": r["conta"], "itens": 0, "total": 0.0})
         n["itens"] += 1; n["total"] += r["total"]
-    for p in por_prod.values():
-        p["total"] = round(p["total"], 2); p["unit_medio"] = round(p["total"] / p["qtd"], 2) if p["qtd"] else None
+    with conn() as c:
+        for p in por_prod.values():
+            p["total"] = round(p["total"], 2); p["unit_medio"] = round(p["total"] / p["qtd"], 2) if p["qtd"] else None
+            p["codigo"] = codigo_xbz_nf(p["cprod"])
+            x = xbz_de(c, p["codigo"]) or {}
+            p["nome_xbz"] = x.get("nome", "")
+            p["preco_xbz"] = x.get("preco")
+            p["custo_real"] = round(x["preco"] * p["qtd"], 2) if x.get("preco") else None
     contas = [{"conta": k["conta"], "nfs": len(k["nfs"]), "total": round(k["total"], 2)} for k in por_conta.values()]
     return {"de": de, "ate": ate, "total": round(sum(r["total"] for r in rows), 2),
+            "total_real": round(sum(p["custo_real"] or 0 for p in por_prod.values()), 2),
             "por_produto": sorted(por_prod.values(), key=lambda p: -p["total"]),
             "por_conta": sorted(contas, key=lambda k: -k["total"]),
             "notas": sorted(({**n, "total": round(n["total"], 2)} for n in nfs.values()), key=lambda n: n["data"], reverse=True)}
@@ -1135,6 +1517,8 @@ if __name__ == "__main__":
     iniciar_db()
     if _email_status["ativo"]:
         threading.Thread(target=_email_loop, daemon=True).start()
+    if os.environ.get("XBZ_TOKEN"):
+        threading.Thread(target=_xbz_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))
     print(f"Central Boni rodando na porta {porta} (banco: {DB})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", porta), H).serve_forever()
