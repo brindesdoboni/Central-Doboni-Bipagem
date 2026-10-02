@@ -25,7 +25,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 @keyframes ent{from{opacity:0;transform:translateY(10px)}}
 </style></head><body>
 <header><h1>Central Boni · Produção</h1>
-<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/setores" target="_blank">Etiquetas de setor</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="dlgMail.showModal();carregarMail()">E-mail de etiquetas</button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
+<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/setores" target="_blank">Etiquetas de setor</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="dlgMail.showModal();carregarMail()">E-mail de etiquetas</button><button onclick="abrirEst()"><b>Estoque</b></button><button onclick="abrirMat()"><b>Materiais e compras</b></button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
 <div class="wrap">
 <div class="kpis" id="kpis"></div>
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
@@ -61,6 +61,38 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <textarea id="cTxt" placeholder="06016B;12,90&#10;09824;8,50"></textarea><div class="row" style="margin:8px 0"><button onclick="importCus()">Importar lista</button> ou um só: <input id="cSku" placeholder="SKU" size="12"><input id="cVal" placeholder="Custo (ex.: 12,90)" size="10"><button onclick="addCus()">Salvar</button><span id="cMsg" class="mut"></span></div>
 <div class="dbody"><table id="cus"></table></div><p><button onclick="dlgCus.close()">Fechar</button></p></dialog>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
+<dialog id="dlgEst" class="largo"><h2>Estoque</h2>
+<p class="mut">Entra: notas da XBZ (contas da Beatriz e Lucmarix). Sai: quando a etiqueta é bipada na separação (uma vez só). Etiqueta que chegou e ainda não foi separada fica "reservada". Comprar = <span id="esDias"></span> dias de vendas (média dos últimos 15 dias) menos o que tem.</p>
+<p id="esXbz"></p>
+<div class="row"><input id="esBusca" placeholder="Filtrar SKU, cor ou nome" oninput="renderEst()"><label><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só o que precisa comprar / alerta</label><b id="esTotal" style="margin-left:auto"></b></div>
+<div id="esSemCor"></div>
+<div style="overflow-x:auto"><table id="esTab"></table></div>
+<div class="box" style="margin-top:14px;border:2px solid #1d4ed8"><h3 style="margin-top:0">🧾 Pedido sugerido para a XBZ <button onclick="carregarSug()">Calcular agora</button></h3>
+<p class="mut">Calculado pela venda recente (mais peso na última semana), de quantos em quantos dias vocês costumam comprar cada produto, o prazo da XBZ (<span id="sgPrazo"></span> dias), o que já está na prateleira e o que está reservado nas etiquetas. Arredonda no múltiplo que vocês costumam pedir. Mude as quantidades à vontade e clique em <b>Confirmar</b>: o sistema aprende como vocês compram e sugere mais parecido da próxima vez.</p>
+<div style="overflow-x:auto"><table id="sgTab"></table></div><p id="sgTot" style="font-size:18px"></p>
+<button onclick="copiarSug()">Copiar lista (WhatsApp / pedido)</button> <button onclick="confirmarSug()"><b>Confirmar que pedi assim</b></button> <span id="sgMsg"></span>
+<div id="sgSem"></div></div>
+<details style="margin-top:14px"><summary><b>Contagem / estoque inicial</b> (o que tem aqui de verdade)</summary>
+<p class="mut">Uma linha por produto e cor: <b>SKU;COR;QUANTIDADE</b> — ex.: <code>18726I;Azul Escuro;35</code>. Pode colar da planilha (colunas SKU, COR, QTD). O número informado vira o saldo exato a partir de agora. Depois da contagem, se uma etiqueta chegar e não tiver, ela já entra como "não tem".</p>
+<textarea id="esCont" rows="6" style="width:100%" placeholder="18726I;Azul Escuro;35&#10;18726I;Rosa Claro;12&#10;05063;Preto;40"></textarea>
+<button onclick="salvarCont()">Salvar contagem</button> <span id="esContMsg"></span></details>
+<p><button onclick="dlgEst.close()">Fechar</button></p></dialog>
+<dialog id="dlgMat" class="largo"><h2>Materiais e compras XBZ</h2>
+<div class="row"><input type="date" id="mtDe"> até <input type="date" id="mtAte"><button onclick="carregarMat()">Ver</button>
+<button onclick="mtDe.value=mtAte.value=hojeISO();carregarMat()">Hoje</button><button onclick="mtDe.value=hojeISO().slice(0,8)+'01';mtAte.value=hojeISO();carregarMat()">Este mês</button>
+<span class="mut">"Hoje" inclui o que ainda não saiu de dias anteriores.</span></div>
+<h3 style="color:#d7263d">🛒 Comprar / está faltando (bipado "não tem")</h3><table id="mtComprar"></table>
+<h3>Produtos (mais vendidos primeiro)</h3><input id="mtBusca" placeholder="Filtrar SKU ou cor" oninput="renderMat()"><div style="overflow-x:auto"><table id="mtProd"></table></div>
+<div class="row" style="align-items:flex-start;gap:24px"><div><h3>Custo do que saiu, por plataforma</h3><table id="mtPlat"></table></div>
+<div><h3>Por loja</h3><table id="mtLoja"></table></div></div>
+<p id="mtSemCusto" class="mut"></p>
+<hr><h3>Compras na XBZ (notas fiscais)</h3>
+<p class="mut">Entram sozinhas quando a nota da XBZ chega no e-mail da Central (encaminhamento automático). Também dá para subir os XML aqui:
+<input type="file" id="xmlIn" accept=".xml" multiple onchange="importarXML(this.files)"> <span id="xmlMsg"></span></p>
+<p id="cpTotal" style="font-size:20px"></p>
+<div class="row" style="align-items:flex-start;gap:24px"><div><h4>Por produto</h4><table id="cpProd"></table></div>
+<div><h4>Por conta XBZ</h4><table id="cpConta"></table><h4>Notas</h4><table id="cpNotas"></table></div></div>
+<p><button onclick="dlgMat.close()">Fechar</button></p></dialog>
 <dialog id="dlgMail" class="largo"><h2>Etiquetas por e-mail</h2><p id="mSt"></p>
 <p class="mut">Mande ou encaminhe o PDF de etiquetas do UpSeller para o e-mail da Central. A cada 1 minuto ela lê os e-mails novos e inclui as etiquetas sozinha (reenviar o mesmo PDF não duplica).</p>
 <table id="mLista"></table><p><button onclick="carregarMail()">Atualizar</button> <button onclick="dlgMail.close()">Fechar</button></p></dialog>
@@ -108,9 +140,56 @@ async function carregarPau(){const L=await (await fetch("/api/pausas")).json();
  $("paus").innerHTML="<tr><th>Hora</th><th>Pausa</th><th>Quem</th><th>Duração (min)</th><th></th></tr>"+L.map(p=>`<tr><td><b>${esc(p.hora)}</b></td><td>${esc(p.nome)}</td><td>${esc(p.pessoas)}</td><td><input type="number" min="1" max="240" value="${p.duracao||15}" style="width:70px" onchange="durPau(${p.id},this.value)"></td><td><button onclick="delPau(${p.id})">Excluir</button></td></tr>`).join("")}
 async function addPau(){if(!pHora.value)return alert("Informe a hora");await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({nome:pNome.value,hora:pHora.value,pessoas:pPes.value,duracao:+pDur.value||15})});pPes.value="";carregarPau()}
 async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,duracao:+v||15})});carregarPau()}
+const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number(v).toFixed(2).replace(".",",");
+let MT=null,ES=null;
+function abrirEst(){dlgEst.showModal();carregarEst()}
+async function carregarEst(){carregarSug();ES=await (await fetch("/api/estoque")).json();$("esDias").textContent=ES.dias_compra;const x=ES.xbz;
+ $("esXbz").innerHTML=`XBZ (preço de custo e estoque deles): `+(x.ok?`✅ atualizado ${new Date(x.ultima).toLocaleString("pt-BR")} (${x.registros} itens)`:x.ok===false?`<b style="color:#d7263d">${esc(x.erro)}</b>`:"ainda não atualizou")+` <button onclick="sincXbz()">Atualizar XBZ agora</button>`;renderEst()}
+async function sincXbz(){await POST("/api/xbz/sincronizar",{});$("esXbz").innerHTML="Atualizando… (pode levar até 1 minuto)";setTimeout(carregarEst,45000)}
+function renderEst(){if(!ES)return;const f=(esBusca.value||"").toUpperCase(),so=esSoComprar.checked;
+ const L=ES.itens.filter(i=>!i.sem_cor&&(!f||(i.sku+" "+i.cor+" "+i.nome).toUpperCase().includes(f))&&(!so||i.comprar>0||i.alerta));
+ const sc=ES.itens.filter(i=>i.sem_cor&&i.saldo>0);
+ $("esSemCor").innerHTML=sc.length?`<div class="al"><b>Entrou da XBZ sem cor (a nota não informa a cor) — diga quanto é de cada cor:</b>`+sc.map(i=>`<div class="row" style="margin-top:6px"><b>${esc(i.sku)}</b> ${esc(i.nome)} — <b>${i.saldo}</b> un. <input id="dc_${esc(i.sku)}" placeholder="Preto=20, Azul=30" style="width:240px"><button onclick="distribuir('${esc(i.sku)}')">Distribuir</button></div>`).join("")+"</div>":"";
+ const dd=v=>v==null?"—":v;
+ $("esTab").innerHTML="<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Na prateleira</th><th>Reservado (etiquetas)</th><th>Disponível</th><th>Separado 7 dias</th><th>Média/dia</th><th>Dá para</th><th>Comprar</th><th>Custo XBZ</th><th>Valor</th><th>Estoque XBZ</th><th>Alerta</th></tr>"+
+  L.map(i=>`<tr><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${i.fisico}</td><td>${i.pendente_hoje}</td><td style="color:${i.saldo<=0?"#d7263d":"inherit"}"><b>${i.saldo}</b></td><td>${i.saidas_7d}</td><td>${i.media_dia}</td><td>${i.dias==null?"—":i.dias+" dias"}</td><td><b>${i.comprar||""}</b></td><td>${R$(i.custo)}</td><td>${i.comprar?R$(i.valor_compra):""}</td><td>${dd(i.xbz_estoque)}${i.xbz_reposicao?" <span class=mut>repõe "+esc(i.xbz_reposicao.split("-").reverse().join("/"))+"</span>":""}</td><td style="color:#d7263d"><b>${esc(i.alerta)}</b></td></tr>`).join("");
+ $("esTotal").textContent="Compra sugerida: "+R$(ES.total_compra).replace(/<[^>]+>/g,"")}
+let SG=null;
+async function carregarSug(){SG=await (await fetch("/api/compra/sugestao")).json();$("sgPrazo").textContent=SG.prazo_xbz;
+ $("sgTab").innerHTML=SG.itens.length?"<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Vende/dia</th><th>Prateleira</th><th>Reservado</th><th>Compra a cada</th><th>Sugerido</th><th>Vou pedir</th><th>Preço XBZ</th><th>Total</th><th>XBZ tem</th></tr>"+
+  SG.itens.map((l,i)=>`<tr><td><b>${esc(l.sku)}</b></td><td>${esc(l.nome)}</td><td>${esc(l.cor)}</td><td>${l.media_dia}</td><td>${l.na_prateleira}</td><td>${l.reservado}</td><td>${l.ciclo_dias} dias</td><td>${l.qtd}</td><td><input type="number" min="0" step="${l.multiplo}" value="${l.qtd}" id="sg_${i}" style="width:80px" oninput="totSug()"></td><td>${R$(l.preco)}</td><td id="sgt_${i}"></td><td>${l.xbz_estoque??"—"}${l.aviso?` <b style="color:#d7263d">${esc(l.aviso)}</b>`:""}</td></tr>`).join(""):"<tr><td>Nada para comprar agora 👍 (ou faltam contagem/histórico de vendas)</td></tr>";
+ $("sgSem").innerHTML=SG.sem_contagem.length?`<p class="mut"><b>Sem contagem ainda</b> (não sei quanto tem na prateleira) — venda prevista até a próxima compra: `+SG.sem_contagem.map(l=>`${esc(l.sku)} ${esc(l.cor)}: ${l.qtd}`).join(" · ")+"</p>":"";totSug()}
+function totSug(){if(!SG)return;let t=0;SG.itens.forEach((l,i)=>{const v=(+$("sg_"+i).value||0)*(l.preco||0);t+=v;$("sgt_"+i).innerHTML=R$(v)});$("sgTot").innerHTML="Total do pedido: <b>"+R$(t)+"</b>"}
+function linhasSug(){return SG.itens.map((l,i)=>({sku:l.sku,cor:l.cor,nome:l.nome,sugerido:l.qtd,qtd:+$("sg_"+i).value||0,preco:l.preco})).filter(l=>l.qtd>0||l.sugerido>0)}
+async function copiarSug(){const t="Pedido XBZ - "+new Date().toLocaleDateString("pt-BR")+"\n"+linhasSug().filter(l=>l.qtd>0).map(l=>`${l.sku} ${l.nome} - ${l.cor}: ${l.qtd}`).join("\n");
+ try{await navigator.clipboard.writeText(t);$("sgMsg").textContent="✅ Copiado"}catch(e){prompt("Copie a lista:",t)}}
+async function confirmarSug(){if(!SG||!confirm("Confirmar que este foi o pedido feito na XBZ? (o sistema aprende com as quantidades)"))return;
+ await POST("/api/compra/confirmar",{itens:linhasSug()});$("sgMsg").textContent="✅ Registrado — aprendi com este pedido"}
+async function salvarCont(){const r=await POST("/api/estoque/contagem",{texto:esCont.value});$("esContMsg").textContent=`✅ ${r.feitos} linha(s) salvas`+(r.erros.length?` · não entendi: ${r.erros.join(" | ")}`:"");if(r.feitos)esCont.value="";carregarEst()}
+async function distribuir(sku){const t=$("dc_"+sku).value,partes={};for(const p of t.split(",")){const[a,b]=p.split("=");if(a&&b)partes[a.trim()]=b.trim()}
+ if(!Object.keys(partes).length)return alert("Escreva assim: Preto=20, Azul=30");await POST("/api/estoque/distribuir",{sku,partes});carregarEst()}
+function abrirMat(){if(!mtDe.value){mtDe.value=hojeISO();mtAte.value=hojeISO()}dlgMat.showModal();carregarMat()}
+async function carregarMat(){MT=await (await fetch(`/api/materiais?de=${mtDe.value}&ate=${mtAte.value}`)).json();renderMat();
+ const mes=mtDe.value.slice(0,8)+"01",C=await (await fetch(`/api/compras?de=${mtDe.value===mtAte.value?mes:mtDe.value}&ate=${mtAte.value}`)).json();
+ $("cpTotal").innerHTML=`Compras na XBZ de ${C.de.split("-").reverse().join("/")} a ${C.ate.split("-").reverse().join("/")}: <b>${R$(C.total_real)}</b> pelo preço de custo da XBZ <span class="mut">(valor nas notas: ${R$(C.total).replace(/<[^>]+>/g,"")})</span>`;
+ $("cpProd").innerHTML="<tr><th>Código</th><th>Produto</th><th>Qtd</th><th>Custo XBZ</th><th>Total (custo)</th><th>Na nota</th></tr>"+C.por_produto.map(p=>`<tr><td><b>${esc(p.codigo)}</b></td><td>${esc(p.nome_xbz||p.descricao)}</td><td>${p.qtd}</td><td>${R$(p.preco_xbz)}</td><td><b>${R$(p.custo_real)}</b></td><td class="mut">${R$(p.total)}</td></tr>`).join("");
+ $("cpConta").innerHTML="<tr><th>Conta</th><th>Notas</th><th>Total</th></tr>"+C.por_conta.map(k=>`<tr><td>${esc(k.conta)}</td><td>${k.nfs}</td><td><b>${R$(k.total)}</b></td></tr>`).join("");
+ $("cpNotas").innerHTML="<tr><th>Data</th><th>NF</th><th>Conta</th><th>Itens</th><th>Total</th></tr>"+C.notas.map(n=>`<tr><td>${n.data.split("-").reverse().join("/")}</td><td>${esc(n.nf)}</td><td>${esc(n.conta)}</td><td>${n.itens}</td><td>${R$(n.total)}</td></tr>`).join("")}
+function renderMat(){if(!MT)return;const f=(mtBusca.value||"").toUpperCase(),P=MT.produtos.filter(p=>!f||(p.sku+" "+p.cor).toUpperCase().includes(f));
+ const cab="<tr><th>SKU</th><th>Cor</th><th>Pedidos</th><th>Unidades</th><th>Aguardando</th><th>Separadas</th><th>Expedidas</th><th>Não tem</th><th>Custo XBZ</th><th>Custo total</th></tr>";
+ const lin=p=>`<tr><td><b>${esc(p.sku)}</b></td><td>${esc(p.cor)}</td><td>${p.pedidos}</td><td><b>${p.unidades}</b></td><td>${p.aguardando}</td><td>${p.separadas}</td><td>${p.expedidas}</td><td style="color:${p.falta?"#d7263d":"inherit"}"><b>${p.falta}</b></td><td>${R$(p.custo_unit)}</td><td>${R$(p.custo_total)}</td></tr>`;
+ $("mtComprar").innerHTML=MT.comprar.length?cab+MT.comprar.map(lin).join(""):"<tr><td>Nada faltando 👍</td></tr>";
+ const tot=P.reduce((a,p)=>a+p.unidades,0),ct=P.reduce((a,p)=>a+p.custo_total,0);
+ $("mtProd").innerHTML=cab+P.map(lin).join("")+`<tr><td colspan="3"><b>TOTAL</b></td><td><b>${tot}</b></td><td colspan="5"></td><td><b>${R$(ct)}</b></td></tr>`;
+ const t=L=>"<tr><th></th><th>Unidades</th><th>Custo XBZ</th></tr>"+L.map(x=>`<tr><td><b>${esc(x.nome)}</b></td><td>${x.unidades}</td><td>${R$(x.custo)}</td></tr>`).join("");
+ $("mtPlat").innerHTML=t(MT.por_plataforma);$("mtLoja").innerHTML=t(MT.por_loja);
+ $("mtSemCusto").textContent=MT.sem_custo.length?"Sem preço da XBZ ainda: "+MT.sem_custo.join(", ")+" (entra sozinho quando chegar uma nota com esse código, ou cadastre em Custos).":""}
+async function importarXML(files){const m=$("xmlMsg");m.textContent="Lendo…";const arqs=[];
+ for(const f of files){arqs.push({nome:f.name,dados:await new Promise(ok=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(",")[1]);r.readAsDataURL(f)})})}
+ const r=await POST("/api/compras/importar",{arquivos:arqs});m.innerHTML=r.resultados.map(x=>x.ok?`✅ NF ${esc(x.nf)} (${R$(x.total)})${x.novos?"":" já estava"}`:`❌ ${esc(x.nome)}: ${esc(x.erro)}`).join(" · ");$("xmlIn").value="";carregarMat()}
 async function carregarMail(){const d=await (await fetch("/api/emails")).json(),s=d.status,dt=v=>v?new Date(v).toLocaleString("pt-BR"):"—";
  $("mSt").innerHTML=!s.ativo?"⚠️ Ainda não configurado: crie no Railway as variáveis <b>EMAIL_USUARIO</b> e <b>EMAIL_SENHA</b>.":
-  `Conta: <b>${esc(s.conta)}</b> · última checagem: ${dt(s.ultima)} · `+(s.ok===false?`<b style="color:#d7263d">ERRO: ${esc(s.erro)}</b>`:s.ok?"✅ funcionando":"aguardando 1ª checagem");
+  `Conta: <b>${esc(s.conta)}</b> · última checagem: ${dt(s.ultima)} · `+(s.ok===false?`<b style="color:#d7263d">ERRO: ${esc(s.erro)}</b>`:s.ok?"✅ funcionando":"aguardando 1ª checagem")+"<br>Notas da XBZ: "+(!s.xbz_conta?"⚠️ configure XBZ_EMAIL_USUARIO e XBZ_EMAIL_SENHA no Railway":`lendo direto do <b>${esc(s.xbz_conta)}</b> · `+(s.xbz_ok===false?`<b style="color:#d7263d">ERRO: ${esc(s.xbz_erro)}</b>`:s.xbz_ok?"✅ funcionando":"aguardando 1ª checagem"));
  $("mLista").innerHTML="<tr><th>Quando</th><th>De</th><th>Arquivo</th><th>Etiquetas</th><th>Novas</th><th>Já existiam</th><th>Problema</th></tr>"+
   d.recebidos.map(e=>`<tr><td>${dt(e.em)}</td><td>${esc(e.remetente)}</td><td>${esc(e.arquivos)}</td><td>${e.etiquetas}</td><td><b>${e.novos}</b></td><td>${e.atualizados}</td><td style="color:#d7263d">${esc(e.erro)}</td></tr>`).join("")}
 async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
@@ -151,16 +230,12 @@ function lerEtiqueta(linhas){const t=linhas.join("\n"),T=t.toUpperCase();
  const etq=(t.match(/ETIQUETA\s*N?[ºo°.]?\s*(\d+)/i)||[])[1];
  const semPers=/SEM PERSONALIZ/.test(T)&&!etq;
  return {pedido:ped||ras,rastreio:ras,canal,envio,sku:skus.join(" + "),fonte,etiqueta:etq?Number(etq):null,personalizado:!semPers}}
-async function importarPDF(files){if(!files.length)return;const msg=$("pdfMsg");msg.textContent="Lendo PDF…";
- try{const pdfjs=await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
-  let novos=0,atual=0,ign=0,pags=0;
-  for(const f of files){const doc=await pdfjs.getDocument({data:await f.arrayBuffer()}).promise;const itens=[],vez={};
-   for(let n=1;n<=doc.numPages;n++){pags++;msg.textContent=`Lendo ${f.name}: página ${n}/${doc.numPages}…`;
-    const e=lerEtiqueta(linhasPagina(await (await doc.getPage(n)).getTextContent()));if(!e){ign++;continue}
-    e.seq="pdf"+(vez[e.pedido]=(vez[e.pedido]||0)+1);itens.push(e)}
-   for(let i=0;i<itens.length;i+=200){const r=await POST("/api/lotes",{lote:"PDF "+f.name,itens:itens.slice(i,i+200)});if(!r.ok)throw new Error(r.erro||"erro");novos+=r.novos;atual+=r.atualizados}}
-  msg.innerHTML=`✅ ${pags} página(s): <b>${novos}</b> nova(s), <b>${atual}</b> já existiam (atualizadas), ${ign} ignorada(s) (separadores/sem código).`;carregar()}
+async function importarPDF(files){if(!files.length)return;const msg=$("pdfMsg");let novos=0,atual=0,etq=0;
+ try{for(const f of files){msg.textContent=`Enviando ${f.name}…`;
+   const b64=await new Promise((ok,er)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(",")[1]);r.onerror=er;r.readAsDataURL(f)});
+   msg.textContent=`Lendo ${f.name}… (pode levar alguns segundos)`;
+   const r=await POST("/api/importar-pdf",{nome:f.name,dados:b64});if(!r.ok)throw new Error(r.erro||"erro");etq+=r.etiquetas;novos+=r.novos;atual+=r.atualizados}
+  msg.innerHTML=`✅ ${etq} etiqueta(s) lida(s): <b>${novos}</b> nova(s), <b>${atual}</b> já existiam (atualizadas).`;carregar()}
  catch(x){msg.textContent="❌ Não consegui ler o PDF: "+x.message}$("pdfIn").value=""}
 function abrirAdd(){dlgAdd.showModal();setTimeout(()=>bIn.focus(),50)}
 bIn.addEventListener("keydown",async e=>{if(e.key!=="Enter")return;e.preventDefault();const cod=bIn.value.trim();bIn.value="";if(!cod)return;

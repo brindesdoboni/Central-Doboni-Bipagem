@@ -15,7 +15,7 @@ const S=[["SETOR","SEPARAÇÃO","Bipe para este PC virar Separação","CMD-SEPAR
  ["SETOR","GRAVAÇÃO","Bipe para este PC virar Gravação","CMD-GRAVACAO"],
  ["SETOR","EXPEDIÇÃO","Bipe para este PC virar Expedição","CMD-EXPEDICAO"],
  ["SETOR","DEVOLUÇÃO","Bipe para este PC virar Devolução","CMD-DEVOLUCAO"],
- ["AÇÃO","FALTA DE MATERIAL","Bipe isto e depois a etiqueta do pedido","CMD-FALTA"],
+ ["AÇÃO","NÃO TEM","Liga o modo NÃO TEM: bipe todas as etiquetas em seguida. Bipe de novo (ou o setor) para sair","CMD-FALTA"],
  ["AÇÃO","DESFAZER","Desfaz o seu último bipe neste posto","CMD-DESFAZER"]];
 for(const [t,n,d,c] of S){const e=document.createElement("div");e.className="et";e.innerHTML=`<small>${t}</small><h1>${n}</h1><p>${d}</p><svg></svg>`;
  lista.appendChild(e);JsBarcode(e.querySelector("svg"),c,{format:"CODE128",height:110,width:3,fontSize:18,margin:0})}

@@ -20,7 +20,7 @@ a{color:#aaa}
 </style></head><body>
 <header><div id="posto">-</div><div id="op">Bipe seu CRACHÁ</div></header>
 <div id="pausa"></div><div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alNomes" style="font-size:48px;margin-top:16px"></div></div>
-<main id="tela"><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO: FALTA DE MATERIAL — bipe a etiqueta</div></main>
+<main id="tela"><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO NÃO TEM (contínuo) — bipe as etiquetas; para sair bipe o setor ou NÃO TEM de novo</div></main>
 <div id="emPausa"></div><footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe) · bipe o código do posto para trocar</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
 <input id="in" autocomplete="off">
 <script>
@@ -47,12 +47,12 @@ async function enviar(codigo){
    $("posto").textContent=POSTOS[posto];modo=null;$("modo").style.display="none";
    return tela("operador","Posto: "+POSTOS[posto],op?"Operador: "+esc(op.nome):"Bipe seu CRACHÁ")}
  if(c.replace(/[^A-Z]/g,"")==="CMDFALTA"){ if(!op)return tela("erro","Bipe o seu CRACHÁ primeiro.");
-   modo="FALTA";$("modo").style.display="block";return tela("aviso","Falta de material","Agora bipe a etiqueta do pedido")}
+   if(modo==="FALTA"){modo=null;$("modo").style.display="none";return tela("ok","Modo NÃO TEM desligado","Voltou ao normal")}
+   modo="FALTA";$("modo").style.display="block";return tela("aviso","Modo NÃO TEM ligado","Bipe todas as etiquetas que não tem. Para sair: bipe o setor ou NÃO TEM de novo.")}
  try{const r=await fetch("/api/bipe",{method:"POST",headers:{"Content-Type":"application/json","X-Chave":chave},
    body:JSON.stringify({posto,codigo:c,operador:op&&op.codigo,modo})});const d=await r.json();
   if(r.status===403){S("chave","");chave=null;return tela("erro","Chave do posto inválida","Recarregue a página e digite a chave")}
   if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome}
-  modo=null;$("modo").style.display="none";
   const i=d.item;let det="";
   if(i)det=`Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}<br>${esc(i.sku)} ${esc(i.cor)}`+
     (i.nomes?`<br>Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"");
