@@ -157,8 +157,9 @@ def importar_lote(dados):
             if not ant:
                 # mesma etiqueta vinda de outra fonte (Zebra, automacao, PDF, bipe): junta em vez de duplicar
                 n = ocorr[norm(pedido)] = ocorr.get(norm(pedido), 0) + 1
-                cand = [r[0] for r in c.execute("""SELECT DISTINCT item_id FROM codigos WHERE codigo IN (?,?)
-                        ORDER BY item_id""", (norm(pedido), norm(campos["rastreio"]) or "-"))]
+                chaves_cod = list({norm(x) for x in [pedido, campos["rastreio"], *(it.get("codigos") or [])] if norm(x)})
+                cand = [r[0] for r in c.execute(f"""SELECT DISTINCT item_id FROM codigos WHERE codigo IN
+                        ({",".join("?" * len(chaves_cod))}) ORDER BY item_id""", chaves_cod)]
                 if len(cand) >= n:
                     iid = cand[n - 1]
                     novos = {k: v for k, v in campos.items() if v not in ("", None) and k not in ("lote", "personalizado")
@@ -674,13 +675,9 @@ class H(BaseHTTPRequestHandler):
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
             return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo")))
-        if p == "/api/lotes":
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "token invalido"})
-            return self._envia(200, importar_lote(d))
-        if not self._admin():
-            return self._envia(401, {"erro": "login necessario"})
         if p == "/api/importar-pdf":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"ok": False, "erro": "token invalido"})
             import base64
             try:
                 itens, ign = itens_do_pdf(base64.b64decode(d.get("dados") or ""))
@@ -688,6 +685,12 @@ class H(BaseHTTPRequestHandler):
                 return self._envia(200, {"ok": False, "erro": f"nao consegui ler o PDF ({e})"})
             r = importar_lote({"lote": "PDF " + str(d.get("nome") or "")[:60], "itens": itens}) if itens else {"novos": 0, "atualizados": 0}
             return self._envia(200, {"ok": True, "etiquetas": len(itens), "ignoradas": ign, "novos": r["novos"], "atualizados": r["atualizados"]})
+        if p == "/api/lotes":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "token invalido"})
+            return self._envia(200, importar_lote(d))
+        if not self._admin():
+            return self._envia(401, {"erro": "login necessario"})
         if p == "/api/custos":
             with _lock, conn() as c:
                 if d.get("excluir"):
@@ -783,26 +786,28 @@ def ler_etiqueta_txt(t):
     junto = re.sub(r"(?<=[0-9A-Z]) (?=[0-9A-Z])", "", T)
     sn = next((m for m in re.findall(r"(?<![0-9A-Z])(2\d{5}[0-9A-Z]{8})", T) + re.findall(r"(?<![0-9A-Z])(2\d{5}[0-9A-Z]{8})", junto)
                if re.search(r"[A-Z]", m)), "")
-    m = re.search(r"PEDIDO:\s*(\d{12,20})", T) or re.search(r"(?<!\d)(5\d{17})(?!\d)", T)
+    # TikTok: nº do pedido com 18 digitos comecando com 5
+    m = re.search(r"(?<!\d)(5\d{17})(?!\d)", T)
     tid = m.group(1) if m else ""
+    # Shopee Entrega Rapida: etiqueta sem DANFE com "Pedido: 999882..." (15 digitos) - e esse o codigo de barras
+    m = re.search(r"PEDIDO:\s*(9\d{13,15})(?!\d)", T)
+    erid = m.group(1) if m else ""
     m = re.search(r"BR\d{12,14}[0-9A-Z]?", T)
     ras = m.group(0) if m else ""
     m = re.search(r"UPPUS\d+", T)
     ups = m.group(0) if m else ""
-    ped = sn or tid or ras or ups
+    ped = sn or tid or erid or ras or ups
     if not ped:
         return None
-    if sn or ras or "DANFE" in T or "SHOPEE" in T or "SPX" in T:
-        canal = "SHOPEE"
-    elif tid or "TIKTOK" in T or "TIK TOK" in T:
+    envio = ""
+    if tid or "TIKTOK" in T or "TIK TOK" in T:
         canal = "TIKTOK"
+    elif erid or re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
+        canal, envio = "SHOPEE", "ENTREGA DIRETA"
+    elif sn or ras or "DANFE" in T or "SHOPEE" in T or "SPX" in T:
+        canal, envio = "SHOPEE", "SHOPEE XPRESS"
     else:
         canal = "OUTROS"
-    envio = ""
-    if re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
-        envio = "ENTREGA DIRETA"
-    elif canal == "SHOPEE":
-        envio = "SHOPEE XPRESS"
     # itens do pedido (rodape do UpSeller): "1. 18726I-Personalizado (Rosa Claro, Personalizado com Nome) / ..."
     rod = re.split(r"#UPPUS\d+[^\n]*\n", t, maxsplit=1)
     skus, cores, pers = [], [], []
@@ -832,7 +837,7 @@ def ler_etiqueta_txt(t):
             "fonte": re.sub(r"^\s*Fonte\s*[:\-]\s*", "", fl, flags=re.I).strip(),
             "obs": ("Cliente: " + cli.group(1).strip()) if cli else "",
             "etiqueta": int(etq.group(1)) if etq else None, "personalizado": personalizado,
-            "codigos": [x for x in dict.fromkeys((sn, tid, ras, ups)) if x]}
+            "codigos": [x for x in dict.fromkeys((sn, tid, erid, ras, ups)) if x]}
 
 
 def itens_do_pdf(dados):
