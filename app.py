@@ -1498,24 +1498,78 @@ def checar_email():
             pass
 
 
+XBZ_EMAIL_USUARIO = os.environ.get("XBZ_EMAIL_USUARIO", "").strip()
+XBZ_EMAIL_SENHA = os.environ.get("XBZ_EMAIL_SENHA", "").replace(" ", "")
+
+
+def checar_notas_xbz():
+    """Le SO os e-mails da XBZ (notas fiscais) direto na caixa do brindesdoboni. Nao marca como lido, nao apaga,
+    nao mexe em nenhum outro e-mail."""
+    import imaplib, email
+    from email.header import decode_header, make_header
+    im = imaplib.IMAP4_SSL(EMAIL_IMAP)
+    novas = 0
+    try:
+        im.login(XBZ_EMAIL_USUARIO, XBZ_EMAIL_SENHA)
+        im.select("INBOX", readonly=True)
+        desde = (datetime.now(BR) - timedelta(days=40)).strftime("%d-%b-%Y")
+        _, ids = im.uid("SEARCH", None, f'(FROM "xbzbrindes.com.br" SINCE "{desde}")')
+        with conn() as c:
+            feitos = {r[0] for r in c.execute("SELECT uid FROM emails WHERE uid LIKE 'xbz:%'")}
+        for mid in ids[0].split():
+            uid = "xbz:" + mid.decode()
+            if uid in feitos:
+                continue
+            _, dd = im.uid("FETCH", mid, "(BODY.PEEK[])")
+            if not dd or not isinstance(dd[0], tuple):
+                continue
+            msg = email.message_from_bytes(dd[0][1])
+            nfe = [pt for pt in msg.walk() if b"infNFe" in (pt.get_payload(decode=True) or b"")]
+            res = [importar_nfe(pt.get_payload(decode=True)) for pt in nfe]
+            reg = dict(uid=uid, em=agora(), remetente="XBZ (direto do " + XBZ_EMAIL_USUARIO + ")",
+                       assunto=str(make_header(decode_header(msg.get("Subject", ""))))[:200],
+                       arquivos=", ".join(str(make_header(decode_header(pt.get_filename() or "nfe.xml"))) for pt in nfe),
+                       etiquetas=0, novos=0, atualizados=0,
+                       erro="; ".join(f"NF {r.get('nf')} {r.get('conta','')}" if r.get("ok") else r.get("erro", "")
+                                      for r in res) or "sem XML de nota")
+            with _lock, conn() as c:
+                c.execute(f"INSERT INTO emails({','.join(reg)}) VALUES({','.join('?' * len(reg))})", list(reg.values()))
+            novas += 1
+    finally:
+        try:
+            im.logout()
+        except Exception:
+            pass
+    return novas
+
+
 def _email_loop():
     import time
     while True:
-        try:
-            checar_email()
-            _email_status.update(ok=True, erro="", ultima=agora())
-        except Exception as e:
-            _email_status.update(ok=False, erro=str(e)[:300], ultima=agora())
-            print("E-mail:", e, flush=True)
+        if EMAIL_USUARIO and EMAIL_SENHA:
+            try:
+                checar_email()
+                _email_status.update(ok=True, erro="", ultima=agora())
+            except Exception as e:
+                _email_status.update(ok=False, erro=str(e)[:300], ultima=agora())
+                print("E-mail:", e, flush=True)
+        if XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA:
+            try:
+                checar_notas_xbz()
+                _email_status.update(xbz_ok=True, xbz_erro="", xbz_ultima=agora())
+            except Exception as e:
+                _email_status.update(xbz_ok=False, xbz_erro=str(e)[:300], xbz_ultima=agora())
+                print("Notas XBZ:", e, flush=True)
         time.sleep(max(EMAIL_INTERVALO, 20))
 
 
-_email_status = {"ativo": bool(EMAIL_USUARIO and EMAIL_SENHA), "conta": EMAIL_USUARIO, "ok": None, "erro": "", "ultima": ""}
+_email_status = {"ativo": bool(EMAIL_USUARIO and EMAIL_SENHA), "conta": EMAIL_USUARIO, "ok": None, "erro": "", "ultima": "",
+                 "xbz_conta": XBZ_EMAIL_USUARIO, "xbz_ok": None, "xbz_erro": "", "xbz_ultima": ""}
 
 
 if __name__ == "__main__":
     iniciar_db()
-    if _email_status["ativo"]:
+    if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
