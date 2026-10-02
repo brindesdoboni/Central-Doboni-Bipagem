@@ -76,6 +76,9 @@ def iniciar_db():
             conta TEXT, cprod TEXT, descricao TEXT, qtd REAL, unit REAL, total REAL, importado_em TEXT)""")
         if "uid" not in [r[1] for r in c.execute("PRAGMA table_info(emails)")]:
             c.execute("ALTER TABLE emails ADD COLUMN uid TEXT")
+        # e-mails recusados antes podem ser lidos de novo se o remetente for liberado
+        c.execute("""UPDATE emails SET uid='neg:'||uid WHERE erro LIKE 'remetente nao autorizado%'
+                     AND uid IS NOT NULL AND uid NOT LIKE 'neg:%' AND uid NOT LIKE 'xbz:%'""")
         if "duracao" not in [r[1] for r in c.execute("PRAGMA table_info(pausas)")]:
             c.execute("ALTER TABLE pausas ADD COLUMN duracao INTEGER DEFAULT 15")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
@@ -1444,6 +1447,8 @@ def checar_email():
         _, ids = im.uid("SEARCH", None, f'(SINCE "{desde}")')
         with conn() as c:
             feitos = {r[0] for r in c.execute("SELECT uid FROM emails WHERE uid IS NOT NULL")}
+        permitidos = set(EMAIL_REMETENTES) | {x for x in (EMAIL_USUARIO.lower(), XBZ_EMAIL_USUARIO.lower(),
+                                                          "brindesdoboni@gmail.com", "bexluuh@gmail.com") if x}
         for mid in ids[0].split():
             uid = mid.decode()
             if uid in feitos:
@@ -1458,14 +1463,19 @@ def checar_email():
             xmls = [pt for pt in msg.walk() if (pt.get_filename() or "").lower().endswith(".xml")
                     or pt.get_content_type() in ("text/xml", "application/xml")]
             nfe = [pt for pt in xmls if b"infNFe" in (pt.get_payload(decode=True) or b"")]
-            if nfe and (rem.endswith("@xbzbrindes.com.br") or not EMAIL_REMETENTES or rem in EMAIL_REMETENTES):
+            if nfe and (rem.endswith("@xbzbrindes.com.br") or rem in permitidos):
                 # nota fiscal (ex.: XBZ): so o XML interessa; o PDF (DANFE) nao e etiqueta
                 res = [importar_nfe(pt.get_payload(decode=True)) for pt in nfe]
                 reg["arquivos"] = ", ".join(str(make_header(decode_header(pt.get_filename() or "nfe.xml"))) for pt in nfe)
                 reg["erro"] = "; ".join(f"NF {r.get('nf')} {r.get('conta','')}: R$ {r.get('total')}" if r.get("ok")
                                         else r.get("erro", "") for r in res)
-            elif EMAIL_REMETENTES and rem not in EMAIL_REMETENTES:
-                reg["erro"] = "remetente nao autorizado (ignorado)"
+            elif rem not in permitidos:
+                # registra uma vez so; se o remetente for liberado depois, o e-mail e lido normalmente
+                if "neg:" + uid not in feitos:
+                    reg.update(uid="neg:" + uid, erro="remetente nao autorizado (ignorado)")
+                    with _lock, conn() as c:
+                        c.execute(f"INSERT INTO emails({','.join(reg)}) VALUES({','.join('?' * len(reg))})", list(reg.values()))
+                continue
             else:
                 nomes = []
                 for parte in msg.walk():
