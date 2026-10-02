@@ -65,6 +65,11 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <p class="mut">Entra: notas da XBZ (contas da Beatriz e Lucmarix). Sai: quando a etiqueta é bipada na separação (uma vez só). Etiqueta que chegou e ainda não foi separada fica "reservada". Comprar = <span id="esDias"></span> dias de vendas (média dos últimos 15 dias) menos o que tem.</p>
 <p id="esXbz"></p>
 <div class="row"><input id="esBusca" placeholder="Filtrar SKU, cor ou nome" oninput="renderEst()"><label><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só o que precisa comprar / alerta</label><b id="esTotal" style="margin-left:auto"></b></div>
+<div class="row" style="margin:8px 0"><button onclick="folhaCont(0)"><b>📄 Folha de contagem (PDF)</b></button><button onclick="folhaCont(1)">📄 Contagem às cegas (sem o saldo)</button><button onclick="window.open('/contagem','_blank')"><b>📱 Contar pelo celular</b></button><span class="mut">Por prateleira → SKU → cor, 2 colunas por folha. Usa o filtro acima se preenchido. Na tela que abrir, clique em "Imprimir / Salvar em PDF".</span></div>
+<details style="margin:6px 0"><summary><b>Prateleiras</b> <span id="prQtd" class="mut"></span></summary>
+<p class="mut">Escolha o arquivo <b>prateleiras.csv</b> (colunas SKU e Prateleira) ou cole linhas <b>SKU;PRATELEIRA</b> — ex.: <code>18726I;A3</code>. O que já existe é atualizado.</p>
+<input type="file" id="prArq" accept=".csv,.txt" onchange="lerPrArq()"><textarea id="prTxt" rows="4" style="width:100%" placeholder="SKU;Prateleira&#10;18726I;A3&#10;09824;B1"></textarea>
+<button onclick="salvarPrat()">Salvar prateleiras</button> <span id="prMsg"></span></details>
 <div id="esAlXbz"></div><div id="esSemCor"></div>
 <div style="overflow-x:auto"><table id="esTab"></table></div>
 <div class="box" style="margin-top:14px;border:2px solid #1d4ed8"><h3 style="margin-top:0">🧾 Pedido sugerido para a XBZ — projeção para <input id="sgDias" type="number" min="1" max="60" placeholder="auto" style="width:70px"> dias <button onclick="carregarSug()">Calcular</button></h3>
@@ -149,7 +154,7 @@ async function addPau(){if(!pHora.value)return alert("Informe a hora");await fet
 async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,duracao:+v||15})});carregarPau()}
 const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number(v).toFixed(2).replace(".",",");
 let MT=null,ES=null;
-function abrirEst(){dlgEst.showModal();carregarEst()}
+function abrirEst(){dlgEst.showModal();carregarEst();contarPrat()}
 async function carregarEst(){carregarSug();ES=await (await fetch("/api/estoque")).json();
  $("esAlXbz").innerHTML=(ES.alertas_xbz||[]).length?`<div class="al"><b>Avisos da XBZ:</b> `+ES.alertas_xbz.slice(0,15).map(a=>`${esc(a.tipo)} — ${esc(a.sku)} ${esc(a.cor)}: ${esc(a.detalhe)} <span class="mut">(${new Date(a.em).toLocaleString("pt-BR")})</span>`).join("<br>")+"</div>":"";$("esDias").textContent=ES.dias_compra;const x=ES.xbz;
  $("esXbz").innerHTML=`XBZ (preço de custo e estoque deles): `+(x.ok?`✅ atualizado ${new Date(x.ultima).toLocaleString("pt-BR")} (${x.registros} itens)`:x.ok===false?`<b style="color:#d7263d">${esc(x.erro)}</b>`:"ainda não atualizou")+` <button onclick="sincXbz()">Atualizar XBZ agora</button>`;renderEst()}
@@ -159,9 +164,13 @@ function renderEst(){if(!ES)return;const f=(esBusca.value||"").toUpperCase(),so=
  const sc=ES.itens.filter(i=>i.sem_cor&&i.saldo>0);
  $("esSemCor").innerHTML=sc.length?`<div class="al"><b>Entrou da XBZ sem cor (a nota não informa a cor) — diga quanto é de cada cor:</b>`+sc.map(i=>`<div class="row" style="margin-top:6px"><b>${esc(i.sku)}</b> ${esc(i.nome)} — <b>${i.saldo}</b> un. <input id="dc_${esc(i.sku)}" placeholder="Preto=20, Azul=30" style="width:240px"><button onclick="distribuir('${esc(i.sku)}')">Distribuir</button></div>`).join("")+"</div>":"";
  const dd=v=>v==null?"—":v;
- $("esTab").innerHTML="<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Na prateleira</th><th>Reservado (etiquetas)</th><th>Disponível</th><th>Separado 7 dias</th><th>Média/dia</th><th>Dá para</th><th>Comprar</th><th>Custo XBZ</th><th>Valor</th><th>Estoque XBZ</th><th>Alerta</th></tr>"+
-  L.map(i=>`<tr><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${i.fisico}</td><td>${i.pendente_hoje}</td><td style="color:${i.saldo<=0?"#d7263d":"inherit"}"><b>${i.saldo}</b></td><td>${i.saidas_7d}</td><td>${i.media_dia}</td><td>${i.dias==null?"—":i.dias+" dias"}</td><td><b>${i.comprar||""}</b></td><td>${R$(i.custo)}</td><td>${i.comprar?R$(i.valor_compra):""}</td><td>${dd(i.xbz_estoque)}${i.xbz_reposicao?" <span class=mut>repõe "+esc(i.xbz_reposicao.split("-").reverse().join("/"))+"</span>":""}</td><td style="color:#d7263d"><b>${esc(i.alerta)}</b></td></tr>`).join("");
+ $("esTab").innerHTML="<tr><th>Prat.</th><th>SKU</th><th>Produto</th><th>Cor</th><th>Na prateleira</th><th>Reservado (etiquetas)</th><th>Disponível</th><th>Separado 7 dias</th><th>Média/dia</th><th>Dá para</th><th>Comprar</th><th>Custo XBZ</th><th>Valor</th><th>Estoque XBZ</th><th>Alerta</th></tr>"+
+  L.map(i=>`<tr><td>${esc(i.prateleira||"")}</td><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${i.fisico}</td><td>${i.pendente_hoje}</td><td style="color:${i.saldo<=0?"#d7263d":"inherit"}"><b>${i.saldo}</b></td><td>${i.saidas_7d}</td><td>${i.media_dia}</td><td>${i.dias==null?"—":i.dias+" dias"}</td><td><b>${i.comprar||""}</b></td><td>${R$(i.custo)}</td><td>${i.comprar?R$(i.valor_compra):""}</td><td>${dd(i.xbz_estoque)}${i.xbz_reposicao?" <span class=mut>repõe "+esc(i.xbz_reposicao.split("-").reverse().join("/"))+"</span>":""}</td><td style="color:#d7263d"><b>${esc(i.alerta)}</b></td></tr>`).join("");
  $("esTotal").textContent="Compra sugerida: "+R$(ES.total_compra).replace(/<[^>]+>/g,"")}
+function folhaCont(cego){const f=(esBusca.value||"").trim();window.open("/estoque/folha?cego="+cego+(f?"&filtro="+encodeURIComponent(f):""),"_blank")}
+async function contarPrat(){try{const l=await (await fetch("/api/prateleiras")).json();$("prQtd").textContent=l.length?"("+l.length+" SKUs com prateleira)":"(nenhuma cadastrada ainda)"}catch(e){}}
+function lerPrArq(){const f=prArq.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{prTxt.value=r.result};r.readAsText(f,"utf-8")}
+async function salvarPrat(){const r=await POST("/api/prateleiras",{texto:prTxt.value});$("prMsg").textContent=r.ok?"✅ "+r.salvas+" salvas":"❌ "+(r.erro||"erro");if(r.ok){prTxt.value="";contarPrat();carregarEst()}}
 let SG=null;
 async function carregarSug(){SG=await (await fetch("/api/compra/sugestao"+(sgDias.value?"?dias="+sgDias.value:""))).json();$("sgPrazo").textContent=SG.prazo_xbz;
  $("sgTab").innerHTML=SG.itens.length?"<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Vende/dia</th><th>Prateleira</th><th>Reservado</th><th>Projeção</th><th>Sugerido</th><th>Vou pedir</th><th>Preço XBZ</th><th>Total</th><th>XBZ tem</th></tr>"+

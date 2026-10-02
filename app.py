@@ -71,6 +71,7 @@ def iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS compra_aprendizado(sku TEXT PRIMARY KEY, fator REAL, pedidos INTEGER,
             atualizado TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
+        c.execute("CREATE TABLE IF NOT EXISTS prateleiras(sku TEXT PRIMARY KEY, prateleira TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             tipo TEXT, detalhe TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
@@ -660,6 +661,8 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
+        if p == "/contagem":
+            return self._pagina("contagem.html" if self._admin() else "login.html")
         if p in ("/operacao", "/tv"):
             return self._pagina("operacao.html")
         if p == "/api/operacao":
@@ -683,6 +686,17 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"status": _email_status, "recebidos": ult})
         if p == "/api/estoque":
             return self._envia(200, estoque())
+        if p in ("/estoque/folha", "/estoque/contagem.pdf"):
+            b = folha_contagem(q.get("cego") == "1", q.get("filtro", "")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+        if p == "/api/prateleiras":
+            with conn() as c:
+                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM prateleiras ORDER BY prateleira, sku")])
         if p == "/api/compra/sugestao":
             return self._envia(200, sugestao_compra(int(q["dias"]) if (q.get("dias") or "").isdigit() else None))
         if p == "/api/estoque/movimentos":
@@ -770,6 +784,8 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, confirmar_pedido_xbz(d.get("itens") or []))
         if p == "/api/estoque/contagem":
             return self._envia(200, contagem_estoque(str(d.get("texto") or "").splitlines()))
+        if p == "/api/prateleiras":
+            return self._envia(200, salvar_prateleiras(d.get("texto", "")))
         if p == "/api/estoque/movimento":
             return self._envia(200, movimento_manual(str(d.get("texto") or "").splitlines()))
         if p == "/api/estoque/distribuir":
@@ -1455,6 +1471,73 @@ def movimento_manual(linhas):
     return {"ok": True, "feitos": feitos, "erros": erros}
 
 
+def salvar_prateleiras(texto):
+    """Aceita o prateleiras.csv (com cabecalho SKU/Prateleira em qualquer ordem) ou linhas 'SKU;PRATELEIRA'."""
+    linhas = [l for l in (texto or "").replace("\r", "").split("\n") if l.strip()]
+    if not linhas:
+        return {"ok": False, "erro": "vazio"}
+    sep = max(";,\t", key=lambda x: linhas[0].count(x))
+    cab = [x.strip().strip('"').upper() for x in linhas[0].split(sep)]
+    i_sku, i_pr = 0, 1
+    if any("PRATEL" in x for x in cab) or any("SKU" in x for x in cab):
+        i_pr = next((i for i, x in enumerate(cab) if "PRATEL" in x or "LOCAL" in x or "ENDERE" in x), 1)
+        i_sku = next((i for i, x in enumerate(cab) if "SKU" in x or "COD" in x), 0 if i_pr != 0 else 1)
+        linhas = linhas[1:]
+    n = 0
+    with _lock, conn() as c:
+        for l in linhas:
+            cols = [x.strip().strip('"') for x in l.split(sep)]
+            if len(cols) <= max(i_sku, i_pr) or not cols[i_sku] or not cols[i_pr]:
+                continue
+            c.execute("INSERT OR REPLACE INTO prateleiras VALUES(?,?)", (estoque_chave(cols[i_sku])[0], cols[i_pr].upper()))
+            n += 1
+    return {"ok": True, "salvas": n}
+
+
+def _ordem_prateleira(p):
+    """Ordem natural: A2 antes de A10; sem prateleira vai para o fim."""
+    if not p:
+        return (1, [])
+    return (0, [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.findall(r"\d+|[A-Z]+", p.upper())])
+
+
+def folha_contagem(cego=False, filtro=""):
+    """Pagina para imprimir (ou salvar em PDF) a contagem: prateleira > SKU > cor, em 2 colunas para gastar pouco papel."""
+    import html as H
+    itens = [i for i in estoque()["itens"] if not (i["sem_cor"] and not i["fisico"])]
+    with conn() as c:
+        prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
+    f = (filtro or "").upper().strip()
+    rows = []
+    for i in itens:
+        pr = prat.get(i["sku"]) or prat.get(re.sub(r"[PMG]$", "", i["sku"]), "")
+        if f and f not in (pr + " " + i["sku"] + " " + i["nome"]).upper():
+            continue
+        rows.append((pr, i))
+    rows.sort(key=lambda x: (_ordem_prateleira(x[0]), x[1]["sku"], x[1]["cor"]))
+    hoje = datetime.now(BR).strftime("%d/%m/%Y %H:%M")
+    corpo, atual = [], None
+    for pr, i in rows:
+        if pr != atual:
+            atual = pr
+            corpo.append(f'<tr class="g"><td colspan="5">{H.escape(pr or "SEM PRATELEIRA")}</td></tr>')
+        sis = "" if cego else f'{i["fisico"]:g}'
+        corpo.append(f'<tr><td class="s">{H.escape(i["sku"])}</td><td class="n">{H.escape((i["nome"] or "")[:26])}</td>'
+                     f'<td>{H.escape(i["cor"])}</td><td class="q">{sis}</td><td class="c"></td></tr>')
+    return f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Contagem de estoque {hoje}</title>
+<style>@page{{size:A4;margin:8mm}}body{{font:8.5pt Arial,sans-serif;margin:0}}
+h1{{font-size:11pt;margin:0 0 4px}}.top{{display:flex;justify-content:space-between;align-items:end;margin-bottom:4px}}
+.cols{{column-count:2;column-gap:6mm}}table{{width:100%;border-collapse:collapse}}
+td{{border-bottom:.3pt solid #999;padding:.8mm 1mm;vertical-align:bottom}}tr{{break-inside:avoid}}
+tr.g td{{background:#e5e5e5;font-weight:bold;border:0;padding:1mm}}.s{{font-weight:bold;white-space:nowrap}}
+.n{{font-size:7pt;color:#444}}.q{{text-align:right;width:9mm;color:#777}}.c{{width:14mm;border-bottom:.8pt solid #000}}
+@media screen{{body{{margin:12px}}#bt{{margin-bottom:8px}}}}@media print{{#bt{{display:none}}}}</style></head><body>
+<div id="bt"><button onclick="print()" style="font-size:15px;padding:6px 14px">Imprimir / Salvar em PDF</button>
+<a href="?cego={0 if cego else 1}&filtro={H.escape(filtro or '')}">{'mostrar' if cego else 'esconder'} o saldo do sistema</a></div>
+<div class="top"><h1>Contagem de estoque — Brindes do Boni</h1><span>{hoje} · {len(rows)} linhas · {'contagem às cegas' if cego else 'coluna cinza = sistema'} · Contou: ____________</span></div>
+<div class="cols"><table>{''.join(corpo)}</table></div></body></html>"""
+
+
 def distribuir_cor(sku, partes):
     """Passa unidades que entraram sem cor (nota da XBZ) para as cores certas: partes = {cor: qtd}."""
     sku = estoque_chave(sku)[0]
@@ -1593,6 +1676,7 @@ def estoque():
             linhas.setdefault(k, {"sku": k[0], "cor": k[1], "saldo": 0, "s7": 0, "s15": 0, "contado": None,
                                   "conhecido": 0, "e15": 0})
         com_cor = {k[0] for k in linhas if k[1]}
+        prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
         out = []
         for (sku, cor), r in linhas.items():
             sem_cor = cor == "" and sku in com_cor  # produto com cores: entrada sem cor ainda precisa ser distribuida
@@ -1605,7 +1689,7 @@ def estoque():
             comprar = max(0, round(media * ESTOQUE_DIAS_COMPRA - saldo)) if not sem_cor and conhecido else 0
             out.append({"sku": sku, "cor": cor or ("(cor a definir)" if sem_cor else "PADRAO"), "sem_cor": sem_cor,
                         "saldo": round(saldo, 2),
-                        "fisico": round(fisico, 2),
+                        "fisico": round(fisico, 2), "prateleira": prat.get(sku) or prat.get(re.sub(r"[PMG]$", "", sku), ""),
                         "pendente_hoje": pend.get((sku, cor), 0), "saidas_7d": r["s7"] or 0, "saidas_15d": r["s15"] or 0,
                         "media_dia": round(media, 1), "dias": round(saldo / media, 1) if media > 0 and saldo > 0 else (0 if saldo <= 0 else None),
                         "comprar": comprar, "custo": cu, "valor_compra": round((cu or 0) * comprar, 2),
