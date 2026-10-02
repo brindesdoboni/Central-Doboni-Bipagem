@@ -13,7 +13,10 @@ label{font-size:14px}
 .lin .t b{font-size:18px}.lin .t .c{font-size:16px;margin-left:4px}
 .lin .s{font-size:12px;color:#777;margin-top:2px}
 .lin .acao{display:flex;gap:8px;margin-top:8px}
-.lin input{flex:1;min-width:0;font-size:24px;padding:8px;text-align:center;border:2px solid #999;border-radius:8px}
+.lin input{flex:1;min-width:0;font-size:24px;padding:8px;text-align:center;border:2px solid #dc2626;border-radius:8px;color:#dc2626;font-weight:bold;background:#fef2f2}
+.lin input:focus{outline:3px solid #93c5fd}
+.lin input.alt{border-color:#16a34a;color:#15803d;background:#f0fdf4}
+.leg{font-size:13px;margin-top:4px}.leg b.r{color:#fecaca}.leg b.v{color:#bbf7d0}
 .lin button{font-size:17px;padding:0 16px;border:0;border-radius:8px;background:#1d4ed8;color:#fff;font-weight:bold}
 .lin .ok{font-size:14px;color:#15803d;margin-top:6px;font-weight:bold}
 footer{position:sticky;bottom:0;background:#fff;padding:10px;border-top:1px solid #ddd}
@@ -30,7 +33,7 @@ details.box{background:#fff;margin:8px;padding:10px;border-radius:10px}details.b
 <header><h1>📦 Contagem de estoque <small id="prog"></small></h1>
 <select id="prat" onchange="render()"></select>
 <input id="busca" placeholder="Procurar SKU ou cor" oninput="render()">
-<label><input type="checkbox" id="verSis" onchange="render()" style="width:auto"> mostrar saldo do sistema</label></header>
+<div class="leg"><b class="r">Vermelho</b> = o que está no sistema · <b class="v">Verde</b> = você alterou / confirmou</div></header>
 <details class="box add"><summary>➕ Acrescentar SKU</summary>
 <input id="aSku" placeholder="SKU (ex.: 18726I)" autocapitalize="characters"><input id="aCor" placeholder="Cor (vazio = sem cor)" autocapitalize="characters">
 <input id="aQtd" inputmode="numeric" pattern="[0-9]*" placeholder="Quantidade que tem aqui"><input id="aPrat" placeholder="Prateleira (opcional, ex.: A3)" autocapitalize="characters">
@@ -39,7 +42,7 @@ details.box{background:#fff;margin:8px;padding:10px;border-radius:10px}details.b
 <details class="box oc" id="ocBox"><summary>🗄️ Arquivados e excluídos <span id="ocN"></span></summary><p style="font-size:13px;color:#666">Arquivado = sem estoque aqui e no fornecedor; volta sozinho para a lista quando entrar material. Excluído = não trabalha mais. Nada é apagado: dá para reativar.</p><div id="ocLista"></div></details>
 <footer><button id="voltar" onclick="voltar()" disabled>↩ Voltar</button><div id="msg"></div></footer>
 <script>
-let IT=[],OC=[],ARM={};const $=id=>document.getElementById(id);
+let IT=[],OC=[],ARM={},DR={};const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const chave=i=>i.sku+"|"+i.cor;
 // pilha do que foi confirmado neste celular (para o botao Voltar, quantas vezes quiser)
@@ -58,13 +61,13 @@ async function carregar(){const r=await fetch("/api/estoque");if(r.status==401){
  if(sel)$("prat").value=sel;render()}
 function visiveis(){const p=$("prat").value,f=($("busca").value||"").toUpperCase();
  return IT.filter(i=>(p=="*"||(i.prateleira||"")==p)&&(!f||(i.sku+" "+i.cor).toUpperCase().includes(f)))}
-function render(){const vs=$("verSis").checked,F=feitos(),L=visiveis();let at=null,h="";
+function render(){const vs=false,F=feitos(),L=visiveis();let at=null,h="";
  L.forEach((i,n)=>{
   if((i.prateleira||"")!==at){at=i.prateleira||"";h+=`<div class="g">${at?"Prateleira "+esc(at):"Sem prateleira"}</div>`}
   const k=chave(i),f=F[k];
   h+=`<div class="lin ${f!=null?"feito":""}" id="l${n}"><div class="t"><b>${esc(i.sku)}</b><span class="c">${esc(i.cor)}</span></div>
   <div class="s">${esc((i.nome||"").slice(0,45))}${vs?" · sistema: "+i.fisico:""}</div>
-  <div class="acao"><input inputmode="numeric" pattern="[0-9]*" placeholder="Quantidade" id="q${n}" onkeydown="if(event.key=='Enter'){event.preventDefault();confirmar(${n})}"><button onclick="confirmar(${n})">Confirmar</button></div>
+  <div class="acao"><input inputmode="numeric" pattern="[0-9]*" ${DR[k]!=null?`class="alt" value="${esc(DR[k])}"`:f!=null?`class="alt" value="${f}"`:(i.fisico>=0?`value="${Math.round(i.fisico)}"`:`placeholder="sistema: ${Math.round(i.fisico)}"`)} data-k="${esc(k)}" oninput="this.classList.add('alt');DR[this.dataset.k]=this.value" onfocus="this.select()" id="q${n}" onkeydown="if(event.key=='Enter'){event.preventDefault();confirmar(${n})}"><button onclick="confirmar(${n})">Confirmar</button></div>
   ${f!=null?`<div class="ok">✅ Contado: ${f}</div>`:""}
   <div class="mais"><button class="${ARM[n]=="ARQUIVADO"?"arm":""}" onclick="marcar(${n},'ARQUIVADO')">${ARM[n]=="ARQUIVADO"?"Toque de novo p/ arquivar":"🗄️ Arquivar (sem estoque)"}</button><button class="${ARM[n]=="EXCLUIDO"?"arm":""}" onclick="marcar(${n},'EXCLUIDO')">${ARM[n]=="EXCLUIDO"?"Toque de novo p/ excluir":"🗑️ Excluir"}</button></div></div>`});
  $("lista").innerHTML=h||'<p style="padding:12px">Nada aqui.</p>';
@@ -100,7 +103,7 @@ async function confirmar(n){const i=visiveis()[n],el=$("q"+n),v=(el.value||"").r
  try{const r=await fetch("/api/estoque/contagem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({texto:i.sku+";"+i.cor+";"+v})});
   if(r.status==401){$("msg").textContent="Login expirou — entre de novo";return}
   const d=await r.json();if(!d.ok||!d.refs||!d.refs.length)throw 0;
-  PILHA.push({k:chave(i),sku:i.sku,cor:i.cor,qtd:+v,ref:d.refs[0].ref});guarda();i.fisico=+v;
+  delete DR[chave(i)];PILHA.push({k:chave(i),sku:i.sku,cor:i.cor,qtd:+v,ref:d.refs[0].ref});guarda();i.fisico=+v;
   $("msg").textContent=`✅ ${i.sku} ${i.cor} = ${v}`;render();
   const nx=$("q"+(n+1));if(nx){nx.focus();$("l"+(n+1)).scrollIntoView({block:"center"})}}
  catch(e){$("msg").textContent="❌ Não salvou (sem internet?) — tente de novo"}}
