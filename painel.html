@@ -65,15 +65,19 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <p class="mut">Entra: notas da XBZ (contas da Beatriz e Lucmarix). Sai: quando a etiqueta é bipada na separação (uma vez só). Etiqueta que chegou e ainda não foi separada fica "reservada". Comprar = <span id="esDias"></span> dias de vendas (média dos últimos 15 dias) menos o que tem.</p>
 <p id="esXbz"></p>
 <div class="row"><input id="esBusca" placeholder="Filtrar SKU, cor ou nome" oninput="renderEst()"><label><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só o que precisa comprar / alerta</label><b id="esTotal" style="margin-left:auto"></b></div>
-<div id="esSemCor"></div>
+<div id="esAlXbz"></div><div id="esSemCor"></div>
 <div style="overflow-x:auto"><table id="esTab"></table></div>
-<div class="box" style="margin-top:14px;border:2px solid #1d4ed8"><h3 style="margin-top:0">🧾 Pedido sugerido para a XBZ <button onclick="carregarSug()">Calcular agora</button></h3>
+<div class="box" style="margin-top:14px;border:2px solid #1d4ed8"><h3 style="margin-top:0">🧾 Pedido sugerido para a XBZ — projeção para <input id="sgDias" type="number" min="1" max="60" placeholder="auto" style="width:70px"> dias <button onclick="carregarSug()">Calcular</button></h3>
 <p class="mut">Calculado pela venda recente (mais peso na última semana), de quantos em quantos dias vocês costumam comprar cada produto, o prazo da XBZ (<span id="sgPrazo"></span> dias), o que já está na prateleira e o que está reservado nas etiquetas. Arredonda no múltiplo que vocês costumam pedir. Mude as quantidades à vontade e clique em <b>Confirmar</b>: o sistema aprende como vocês compram e sugere mais parecido da próxima vez.</p>
 <div style="overflow-x:auto"><table id="sgTab"></table></div><p id="sgTot" style="font-size:18px"></p>
 <button onclick="copiarSug()">Copiar lista (WhatsApp / pedido)</button> <button onclick="confirmarSug()"><b>Confirmar que pedi assim</b></button> <span id="sgMsg"></span>
-<div id="sgSem"></div></div>
+<div id="sgFora"></div><div id="sgSem"></div></div>
+<details style="margin-top:14px"><summary><b>Acrescentar / baixar na mão</b></summary>
+<p class="mut">Uma linha por produto: <b>SKU;COR;+QTD</b> para acrescentar ou <b>SKU;COR;-QTD</b> para baixar — ex.: <code>09824;Preto;+100</code>. Saldo negativo não é zerado (é falta física).</p>
+<textarea id="esMov" rows="4" style="width:100%" placeholder="09824;Preto;+100&#10;18726I;Cinza;-1"></textarea>
+<button onclick="salvarMov()">Lançar</button> <span id="esMovMsg"></span></details>
 <details style="margin-top:14px"><summary><b>Contagem / estoque inicial</b> (o que tem aqui de verdade)</summary>
-<p class="mut">Uma linha por produto e cor: <b>SKU;COR;QUANTIDADE</b> — ex.: <code>18726I;Azul Escuro;35</code>. Pode colar da planilha (colunas SKU, COR, QTD). O número informado vira o saldo exato a partir de agora. Depois da contagem, se uma etiqueta chegar e não tiver, ela já entra como "não tem".</p>
+<p class="mut">Uma linha por produto e cor: <b>SKU;COR;QUANTIDADE</b> — ex.: <code>18726I;Azul Escuro;35</code>. Pode colar da planilha (colunas SKU, COR, QTD). O número informado <b>substitui</b> o saldo (contagem física prevalece; "temos somente 130" = 130). Depois da contagem, se uma etiqueta chegar e não tiver, ela já entra como "não tem".</p>
 <textarea id="esCont" rows="6" style="width:100%" placeholder="18726I;Azul Escuro;35&#10;18726I;Rosa Claro;12&#10;05063;Preto;40"></textarea>
 <button onclick="salvarCont()">Salvar contagem</button> <span id="esContMsg"></span></details>
 <p><button onclick="dlgEst.close()">Fechar</button></p></dialog>
@@ -86,6 +90,9 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <div class="row" style="align-items:flex-start;gap:24px"><div><h3>Custo do que saiu, por plataforma</h3><table id="mtPlat"></table></div>
 <div><h3>Por loja</h3><table id="mtLoja"></table></div></div>
 <p id="mtSemCusto" class="mut"></p>
+<hr><h3>Calculadora Shopee (lucro bruto)</h3>
+<div class="row">Preço de venda R$ <input id="cvPreco" type="number" step="0.01" style="width:100px" oninput="calcShopee()"> SKU <input id="cvSku" style="width:100px" placeholder="18726I" oninput="calcShopee()"> ou custo R$ <input id="cvCusto" type="number" step="0.01" style="width:90px" oninput="calcShopee()"></div>
+<p id="cvRes"></p><p class="mut">Comissão CNPJ desde 01/03/2026: até R$79,99 = 20% + R$4 · R$80–99,99 = 14% + R$16 · R$100–199,99 = 14% + R$20 · R$200–499,99 = 14% + R$26 · acima de R$500 = 14% + R$26 (subsídio Pix pago pela Shopee). Lucro bruto não inclui impostos, anúncios, embalagem, personalização e mão de obra.</p>
 <hr><h3>Compras na XBZ (notas fiscais)</h3>
 <p class="mut">Entram sozinhas quando a nota da XBZ chega no e-mail da Central (encaminhamento automático). Também dá para subir os XML aqui:
 <input type="file" id="xmlIn" accept=".xml" multiple onchange="importarXML(this.files)"> <span id="xmlMsg"></span></p>
@@ -143,7 +150,8 @@ async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"C
 const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number(v).toFixed(2).replace(".",",");
 let MT=null,ES=null;
 function abrirEst(){dlgEst.showModal();carregarEst()}
-async function carregarEst(){carregarSug();ES=await (await fetch("/api/estoque")).json();$("esDias").textContent=ES.dias_compra;const x=ES.xbz;
+async function carregarEst(){carregarSug();ES=await (await fetch("/api/estoque")).json();
+ $("esAlXbz").innerHTML=(ES.alertas_xbz||[]).length?`<div class="al"><b>Avisos da XBZ:</b> `+ES.alertas_xbz.slice(0,15).map(a=>`${esc(a.tipo)} — ${esc(a.sku)} ${esc(a.cor)}: ${esc(a.detalhe)} <span class="mut">(${new Date(a.em).toLocaleString("pt-BR")})</span>`).join("<br>")+"</div>":"";$("esDias").textContent=ES.dias_compra;const x=ES.xbz;
  $("esXbz").innerHTML=`XBZ (preço de custo e estoque deles): `+(x.ok?`✅ atualizado ${new Date(x.ultima).toLocaleString("pt-BR")} (${x.registros} itens)`:x.ok===false?`<b style="color:#d7263d">${esc(x.erro)}</b>`:"ainda não atualizou")+` <button onclick="sincXbz()">Atualizar XBZ agora</button>`;renderEst()}
 async function sincXbz(){await POST("/api/xbz/sincronizar",{});$("esXbz").innerHTML="Atualizando… (pode levar até 1 minuto)";setTimeout(carregarEst,45000)}
 function renderEst(){if(!ES)return;const f=(esBusca.value||"").toUpperCase(),so=esSoComprar.checked;
@@ -155,16 +163,20 @@ function renderEst(){if(!ES)return;const f=(esBusca.value||"").toUpperCase(),so=
   L.map(i=>`<tr><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${i.fisico}</td><td>${i.pendente_hoje}</td><td style="color:${i.saldo<=0?"#d7263d":"inherit"}"><b>${i.saldo}</b></td><td>${i.saidas_7d}</td><td>${i.media_dia}</td><td>${i.dias==null?"—":i.dias+" dias"}</td><td><b>${i.comprar||""}</b></td><td>${R$(i.custo)}</td><td>${i.comprar?R$(i.valor_compra):""}</td><td>${dd(i.xbz_estoque)}${i.xbz_reposicao?" <span class=mut>repõe "+esc(i.xbz_reposicao.split("-").reverse().join("/"))+"</span>":""}</td><td style="color:#d7263d"><b>${esc(i.alerta)}</b></td></tr>`).join("");
  $("esTotal").textContent="Compra sugerida: "+R$(ES.total_compra).replace(/<[^>]+>/g,"")}
 let SG=null;
-async function carregarSug(){SG=await (await fetch("/api/compra/sugestao")).json();$("sgPrazo").textContent=SG.prazo_xbz;
- $("sgTab").innerHTML=SG.itens.length?"<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Vende/dia</th><th>Prateleira</th><th>Reservado</th><th>Compra a cada</th><th>Sugerido</th><th>Vou pedir</th><th>Preço XBZ</th><th>Total</th><th>XBZ tem</th></tr>"+
-  SG.itens.map((l,i)=>`<tr><td><b>${esc(l.sku)}</b></td><td>${esc(l.nome)}</td><td>${esc(l.cor)}</td><td>${l.media_dia}</td><td>${l.na_prateleira}</td><td>${l.reservado}</td><td>${l.ciclo_dias} dias</td><td>${l.qtd}</td><td><input type="number" min="0" step="${l.multiplo}" value="${l.qtd}" id="sg_${i}" style="width:80px" oninput="totSug()"></td><td>${R$(l.preco)}</td><td id="sgt_${i}"></td><td>${l.xbz_estoque??"—"}${l.aviso?` <b style="color:#d7263d">${esc(l.aviso)}</b>`:""}</td></tr>`).join(""):"<tr><td>Nada para comprar agora 👍 (ou faltam contagem/histórico de vendas)</td></tr>";
+async function carregarSug(){SG=await (await fetch("/api/compra/sugestao"+(sgDias.value?"?dias="+sgDias.value:""))).json();$("sgPrazo").textContent=SG.prazo_xbz;
+ $("sgTab").innerHTML=SG.itens.length?"<tr><th>SKU</th><th>Produto</th><th>Cor</th><th>Vende/dia</th><th>Prateleira</th><th>Reservado</th><th>Projeção</th><th>Sugerido</th><th>Vou pedir</th><th>Preço XBZ</th><th>Total</th><th>XBZ tem</th></tr>"+
+  SG.itens.map((l,i)=>`<tr><td><b>${esc(l.sku)}</b></td><td>${esc(l.nome)}</td><td>${esc(l.cor)}</td><td>${l.media_dia}</td><td style="color:${l.na_prateleira<0?"#d7263d":"inherit"}">${l.na_prateleira}</td><td>${l.reservado}</td><td>${l.projecao}</td><td>${l.critico?"🔴 ":""}${l.estrategico?"⭐ ":""}${l.qtd}</td><td><input type="number" min="0" step="${l.multiplo}" value="${l.qtd}" id="sg_${i}" style="width:80px" oninput="totSug()"></td><td>${R$(l.preco)}</td><td id="sgt_${i}"></td><td>${l.xbz_estoque??"—"}${l.aviso?` <b style="color:#d7263d">${esc(l.aviso)}</b>`:""}</td></tr>`).join(""):"<tr><td>Nada para comprar agora 👍 (ou faltam contagem/histórico de vendas)</td></tr>";
+ $("sgFora").innerHTML=SG.fora.length?`<p class="mut"><b>Não sugeridos</b> (fornecedor sem estoque / demanda baixa): `+SG.fora.map(l=>`${esc(l.sku)} ${esc(l.cor)} (${esc(l.motivo)}, precisaria ${l.qtd})`).join(" · ")+"</p>":"";
  $("sgSem").innerHTML=SG.sem_contagem.length?`<p class="mut"><b>Sem contagem ainda</b> (não sei quanto tem na prateleira) — venda prevista até a próxima compra: `+SG.sem_contagem.map(l=>`${esc(l.sku)} ${esc(l.cor)}: ${l.qtd}`).join(" · ")+"</p>":"";totSug()}
-function totSug(){if(!SG)return;let t=0;SG.itens.forEach((l,i)=>{const v=(+$("sg_"+i).value||0)*(l.preco||0);t+=v;$("sgt_"+i).innerHTML=R$(v)});$("sgTot").innerHTML="Total do pedido: <b>"+R$(t)+"</b>"}
+function totSug(){if(!SG)return;let t=0,u=0;SG.itens.forEach((l,i)=>{const q=+$("sg_"+i).value||0,v=q*(l.preco||0);t+=v;u+=q;$("sgt_"+i).innerHTML=R$(v)});
+ $("sgTot").innerHTML=`Total: <b>${u}</b> unidades · <b>${R$(t)}</b> · críticos: <b>${SG.criticos}</b> · variações negativas: <b>${SG.negativos}</b>`+(t>SG.limite_semana?` · <b style="color:#d7263d">acima do limite de referência de ${R$(SG.limite_semana).replace(/<[^>]+>/g,"")} na semana</b>`:"")}
 function linhasSug(){return SG.itens.map((l,i)=>({sku:l.sku,cor:l.cor,nome:l.nome,sugerido:l.qtd,qtd:+$("sg_"+i).value||0,preco:l.preco})).filter(l=>l.qtd>0||l.sugerido>0)}
 async function copiarSug(){const t="Pedido XBZ - "+new Date().toLocaleDateString("pt-BR")+"\n"+linhasSug().filter(l=>l.qtd>0).map(l=>`${l.sku} ${l.nome} - ${l.cor}: ${l.qtd}`).join("\n");
  try{await navigator.clipboard.writeText(t);$("sgMsg").textContent="✅ Copiado"}catch(e){prompt("Copie a lista:",t)}}
 async function confirmarSug(){if(!SG||!confirm("Confirmar que este foi o pedido feito na XBZ? (o sistema aprende com as quantidades)"))return;
  await POST("/api/compra/confirmar",{itens:linhasSug()});$("sgMsg").textContent="✅ Registrado — aprendi com este pedido"}
+async function salvarMov(){const r=await POST("/api/estoque/movimento",{texto:esMov.value});
+ $("esMovMsg").innerHTML=r.feitos.map(f=>`${esc(f.sku)} ${esc(f.cor)}: ${f.antes} ${f.mov>0?"+":""}${f.mov} → <b>${f.depois}</b>`).join(" · ")+(r.erros.length?` · não entendi: ${esc(r.erros.join(" | "))}`:"");if(r.feitos.length)esMov.value="";carregarEst()}
 async function salvarCont(){const r=await POST("/api/estoque/contagem",{texto:esCont.value});$("esContMsg").textContent=`✅ ${r.feitos} linha(s) salvas`+(r.erros.length?` · não entendi: ${r.erros.join(" | ")}`:"");if(r.feitos)esCont.value="";carregarEst()}
 async function distribuir(sku){const t=$("dc_"+sku).value,partes={};for(const p of t.split(",")){const[a,b]=p.split("=");if(a&&b)partes[a.trim()]=b.trim()}
  if(!Object.keys(partes).length)return alert("Escreva assim: Preto=20, Azul=30");await POST("/api/estoque/distribuir",{sku,partes});carregarEst()}
@@ -184,6 +196,12 @@ function renderMat(){if(!MT)return;const f=(mtBusca.value||"").toUpperCase(),P=M
  const t=L=>"<tr><th></th><th>Unidades</th><th>Custo XBZ</th></tr>"+L.map(x=>`<tr><td><b>${esc(x.nome)}</b></td><td>${x.unidades}</td><td>${R$(x.custo)}</td></tr>`).join("");
  $("mtPlat").innerHTML=t(MT.por_plataforma);$("mtLoja").innerHTML=t(MT.por_loja);
  $("mtSemCusto").textContent=MT.sem_custo.length?"Sem preço da XBZ ainda: "+MT.sem_custo.join(", ")+" (entra sozinho quando chegar uma nota com esse código, ou cadastre em Custos).":""}
+function calcShopee(){const p=+cvPreco.value||0;if(!p){$("cvRes").textContent="";return}
+ const [pc,fx]=p<80?[.20,4]:p<100?[.14,16]:p<200?[.14,20]:[.14,26];
+ let cu=+cvCusto.value||0;const sk=(cvSku.value||"").toUpperCase().trim();
+ if(!cu&&sk&&MT){const x=MT.produtos.find(q=>q.sku===sk&&q.custo_unit);if(x)cu=x.custo_unit}
+ const com=p*pc+fx,lb=p-com-cu;
+ $("cvRes").innerHTML=`Comissão: <b>${R$(com)}</b> (${pc*100}% + R$${fx}) · Custo XBZ: <b>${R$(cu||null)}</b> · <b style="color:${lb<0?"#d7263d":"#16a34a"}">Lucro bruto: ${R$(lb)} (${p?Math.round(lb/p*100):0}%)</b>`}
 async function importarXML(files){const m=$("xmlMsg");m.textContent="Lendo…";const arqs=[];
  for(const f of files){arqs.push({nome:f.name,dados:await new Promise(ok=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(",")[1]);r.readAsDataURL(f)})})}
  const r=await POST("/api/compras/importar",{arquivos:arqs});m.innerHTML=r.resultados.map(x=>x.ok?`✅ NF ${esc(x.nf)} (${R$(x.total)})${x.novos?"":" já estava"}`:`❌ ${esc(x.nome)}: ${esc(x.erro)}`).join(" · ");$("xmlIn").value="";carregarMat()}

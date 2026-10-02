@@ -60,6 +60,8 @@ def iniciar_db():
         cols_it = [r[1] for r in c.execute("PRAGMA table_info(itens)")]
         if "qtd" not in cols_it:
             c.execute("ALTER TABLE itens ADD COLUMN qtd INTEGER DEFAULT 1")
+        if "impresso" not in cols_it:
+            c.execute("ALTER TABLE itens ADD COLUMN impresso TEXT DEFAULT ''")
         if "pecas" not in cols_it:
             c.execute("ALTER TABLE itens ADD COLUMN pecas TEXT DEFAULT ''")
         c.execute("DELETE FROM custos WHERE length(COALESCE(atualizado_em,''))=10")  # custos vindos de nota (valor nao real)
@@ -69,6 +71,8 @@ def iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS compra_aprendizado(sku TEXT PRIMARY KEY, fator REAL, pedidos INTEGER,
             atualizado TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
+            tipo TEXT, detalhe TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
             cor TEXT, preco REAL, estoque INTEGER, status TEXT, reposicao TEXT, atualizado TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_xbz_cod ON xbz(codigo)")
@@ -187,7 +191,8 @@ def importar_lote(dados):
                           envio=(it.get("envio") or _envio_obs(it.get("obs"))).upper(),
                           loja=it.get("loja") or "", sku=it.get("sku") or "", cor=it.get("cor") or "",
                           nomes=nomes, fonte=it.get("fonte") or "", tipo=tipo, obs=it.get("obs") or "",
-                          personalizado=pers, atualizado_em=agora(), **_qtd_pecas(it))
+                          personalizado=pers, atualizado_em=agora(), **_qtd_pecas(it),
+                          **({"impresso": it["impresso"]} if it.get("impresso") else {}))
             ant = c.execute("SELECT id FROM itens WHERE chave=?", (chave,)).fetchone()
             if not ant:
                 # mesma etiqueta vinda de outra fonte (Zebra, automacao, PDF, bipe): junta em vez de duplicar
@@ -679,11 +684,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/estoque":
             return self._envia(200, estoque())
         if p == "/api/compra/sugestao":
-            return self._envia(200, sugestao_compra())
+            return self._envia(200, sugestao_compra(int(q["dias"]) if (q.get("dias") or "").isdigit() else None))
         if p == "/api/estoque/movimentos":
             with conn() as c:
                 return self._envia(200, [dict(r) for r in c.execute(
-                    "SELECT * FROM estoque_mov WHERE sku=? ORDER BY id DESC LIMIT 200", (sku_base(q.get("sku", "")),))])
+                    "SELECT * FROM estoque_mov WHERE sku=? ORDER BY id DESC LIMIT 200", (estoque_chave(q.get("sku", ""))[0],))])
         if p == "/api/materiais":
             return self._envia(200, materiais(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/compras":
@@ -765,6 +770,8 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, confirmar_pedido_xbz(d.get("itens") or []))
         if p == "/api/estoque/contagem":
             return self._envia(200, contagem_estoque(str(d.get("texto") or "").splitlines()))
+        if p == "/api/estoque/movimento":
+            return self._envia(200, movimento_manual(str(d.get("texto") or "").splitlines()))
         if p == "/api/estoque/distribuir":
             return self._envia(200, distribuir_cor(d.get("sku", ""), d.get("partes") or {}))
         if p == "/api/xbz/sincronizar":
@@ -890,13 +897,478 @@ def _controlado(c, sku, cn):
     return None
 
 
+# ------------------------------------------------------------------ conhecimento do agente de estoque (handoff 02/10/2026)
+ESTOQUE_ABERTURA = "2026-10-02"   # data-base do snapshot: o que foi impresso antes ja esta descontado nele
+ESTOQUE_SNAPSHOT = """## 01093
+Transparente 130
+Cinza -60
+Preto 400
+Verde 280
+Vermelho 200
+Laranja 130
+Azul 360
+Roxo/Lilás 20
+Fumê 100
+## 01228P
+Preto 2
+Rosa 4
+## 01622B
+Rosa 4
+Azul 3
+Branco 2
+Salmão -1
+## 01895
+Azul 19
+Cinza 10
+Preto 25
+Roxo/Lilás 19
+Verde 12
+Vermelho 9
+Laranja 1
+## 02090
+Azul 3
+Verde 1
+## 02121
+Rosa -23
+Roxo/Lilás 78
+Verde -25
+## 03493
+Padrão 8
+## 03590
+Azul Claro 6
+Azul Escuro 6
+Roxo/Lilás 5
+Branco 8
+Laranja 4
+Vermelho 0
+Cinza 4
+Verde 3
+Rosa 5
+## 03968
+Branco 11
+Azul Claro 8
+Azul Escuro -1
+Turquesa 15
+Rosa Claro 12
+Pink 9
+Vermelho 11
+## 04205
+Branco 30
+Azul 29
+Preto 29
+Creme 26
+Verde 20
+Inox 29
+Rosa 59
+## 05063
+Prata 5
+Preto 1
+Laranja 3
+Verde 2
+Inox 1
+Azul 1
+Vermelho -2
+## 05932
+Branco 3
+Azul 2
+Cinza 1
+Preto 1
+Verde 2
+## 06010P
+Preto 37
+Verde 20
+Azul Escuro 14
+Azul Claro 5
+Roxo/Lilás 14
+Vermelho 22
+## 06011G
+Preto 19
+Verde 15
+Azul Escuro 14
+Azul Claro 24
+Roxo/Lilás 14
+Vermelho 18
+## 06012
+Verde 31
+Cinza/Cinza Escuro 28
+Branco 16
+Azul 52
+Rosa -4
+## 06016B
+Rosa Claro 20
+Roxo/Lilás 39
+Laranja 100
+Preto 40
+## 06078
+Azul 0
+Prata -9
+Verde 8
+Vermelho -5
+## 07030
+Preto 12
+Verde 8
+Laranja 8
+Azul 8
+Rosa 4
+## 07392
+Inox 130
+## 07447
+Padrão 31
+## 08280
+Preto 2
+Azul Claro 3
+Roxo/Lilás 2
+## 09181
+Cinza 2
+Verde 22
+Rosa 2
+Azul Claro 13
+Roxo/Lilás 6
+Branco e Rosa -5
+## 09183
+Vermelho 2
+Preto 1
+## 09185
+Dourado 10
+Preto 2
+Rosa Escuro 11
+Prata 8
+Verde 5
+Vermelho 8
+## 09188
+Azul 129
+Preto 14
+Vermelho 14
+Verde 31
+Branco 38
+Prata 17
+## 09198
+Branco 7
+Preto 6
+## 09227
+Verde 3
+Azul 23
+Roxo/Lilás 11
+Vermelho 22
+## 09256
+Verde 10
+Azul 11
+Roxo/Lilás -3
+Cinza -1
+## 09260
+Preto 3
+Laranja 4
+Vermelho 4
+Branco 1
+Verde 1
+Rosa 2
+## 09306
+Preto 2
+## 09824
+Azul 5079
+Champagne 540
+Dourado 1449
+Laranja 600
+Preto 2640
+Prata 1100
+Rosa 1199
+Roxo/Lilás 550
+Verde 2550
+Vermelho 1400
+## 14011
+Padrão 3
+## 18549
+Azul -1
+Branco 5
+Rosa 9
+Verde 9
+## 18552
+Azul 9
+Branco 8
+Cinza 25
+Inox 18
+Laranja -2
+Prata 13
+Preto 13
+Verde 7
+Vermelho 20
+## 18601
+Azul 13
+Azul Escuro 3
+Cinza 13
+Preto -3
+Verde 8
+Rosa 7
+Laranja 6
+Vermelho 6
+## 18622
+Azul 10
+Inox -6
+Preto 14
+Verde 17
+Rosa 16
+## 18623
+Branco 11
+Inox 8
+Preto 7
+Azul 8
+Cobre 13
+## 18637
+Chumbo 8
+Azul 9
+Branco 12
+Roxo/Lilás 15
+Rosa 20
+## 18647P
+Rosa Claro 5
+Roxo/Lilás 8
+Azul 2
+Verde 10
+Preto 8
+## 18647M
+Verde 10
+Preto 6
+## 18647G
+Preto 8
+Roxo/Lilás 5
+Azul 10
+Rosa Claro 2
+## 18650
+Lilás/Roxo 8
+Preto 2
+Rosa Claro 13
+Rosa Escuro 3
+Azul -4
+## 18677
+Preto 1
+Azul 9
+## 18678
+Branco 5
+Azul -3
+Bronze 7
+## 18699
+Inox -26
+Lilás/Roxo 4
+Preto 43
+Vermelho 12
+## 18726I
+Preto 12
+Azul Escuro 5
+Cinza 19
+Verde Escuro 29
+Rosa Claro 19
+Lilás/Roxo 8
+Verde Claro 14
+Branco 19
+Vermelho 7
+## 18781
+Cinza 150
+Preto 150
+Rosa Escuro 401
+Verde 6
+## 18786
+Azul 14
+Bege 14
+Rosa -11
+Verde 13
+## 18904
+Inox 13
+Grafite 26
+Laranja 17
+Preto 12
+Vermelho 18
+Branco 4
+## 18910
+Inox 4
+## 18921
+Azul 37
+Lilás/Roxo 2
+Branco 23
+Rosa Claro 47
+Rosa Escuro 30
+Verde/Verde Água 24
+## 18949P
+Azul 47
+Azul Claro -13
+Cinza 20
+Creme -3
+Preto 16
+Rosa 27
+Verde 11
+Branco 26
+Avariada -1
+## 18949M
+Azul 11
+Creme 16
+Preto 18
+Rosa 5
+Roxo/Lilás 1
+Verde -4
+Verde Claro 11
+Verde Escuro 6
+Branco 5
+Laranja 3
+Vermelho 8
+## 18975
+Azul 15
+Branco 13
+Preto 1
+Rosa 14
+Roxo/Lilás 13
+Verde 12
+## 19005
+Creme 6
+Rosa Escuro 2
+Inox 3
+Verde 7
+Preto 2
+Vermelho 4
+Azul 3
+## 19006
+Vermelho 3
+Creme 5
+Azul Claro 5
+Rosa 2
+Verde 2
+Preto 2
+## 19062
+Avariada 0
+Bege 11
+Preto 23
+Rosa 9
+Verde -3
+Azul 8
+Inox 6
+Cinza Claro 23
+Cinza Escuro 15
+Vermelho 12
+## 19065
+Vermelho 1
+Rosa 4
+Laranja 9
+## 19124
+Padrão 1
+## 19181
+Preto -1
+## 9139A
+Rosa 18
+Branco 11
+Marrom 4
+Verde 16
+Vermelho 2
+Lilás/Roxo 11
+Azul Claro 15
+Azul Escuro 8
+Preto 7
+## FY001
+Branco Transparente/Transparente 90
+Branco Leitoso 90
+Azul Leitoso 320
+Azul Transparente -50
+Laranja Transparente 80
+Vermelho Transparente 330
+Vermelho Leitoso 50
+Fumê 150
+Verde Transparente 70
+Verde Leitoso -10
+Sortidos -70
+"""
+
+# SKU escrito diferente -> SKU certo (confirmados)
+SKU_ALIAS = {"18726": "18726I", "09139A": "9139A", "9188": "09188", "9185": "09185", "9227": "09227",
+             "018781": "18781", "018921": "18921", "018552": "18552", "01622": "01622B", "1622": "01622B",
+             "06016": "06016B", "3493": "03493", "1949": "18949P", "1899": "18949M", "9256": "09256",
+             "9181": "09181", "9183": "09183", "9198": "09198", "9260": "09260", "9306": "09306", "9824": "09824"}
+COR_ABREV = {"PTO": "PRETO", "BCO": "BRANCO", "VM": "VERMELHO", "VD": "VERDE", "AZU": "AZUL", "CZ": "CINZA"}
+COR_ALIAS = {"LILAS": "ROXO", "ROXO LILAS": "ROXO", "LILAS ROXO": "ROXO", "VERDE VERDE AGUA": "VERDE AGUA",
+             "CINZA CINZA ESCURO": "CINZA", "BRANCO TRANSPARENTE TRANSPARENTE": "TRANSPARENTE",
+             "BRANCO TRANSPARENTE": "TRANSPARENTE", "PADRAO": "", "UNICA": "", "UNICO": ""}
+# correcoes de cor por produto (confirmadas)
+COR_POR_SKU = {("18726I", "VEDRE"): "VERDE ESCURO", ("19062", "MARROM"): "BEGE", ("9139A", "TURQUESA"): "VERDE",
+               ("09181", "ROSA CLARO"): "ROSA", ("18921", "AZUL CLARO"): "AZUL", ("18781", "ROSA"): "ROSA ESCURO",
+               ("06012", "CINZA ESCURO"): "CINZA"}
+# fornecedor sem estoque / pouca demanda: nao sugerir compra automatica (ate nova evidencia)
+XBZ_INDISPONIVEL = {("02121", ""), ("18975", "PRETO"), ("06012", "ROSA"), ("09185", "BRANCO"), ("09256", "CINZA"),
+                    ("18678", "AZUL")}
+BAIXA_DEMANDA = {("09260", "BRANCO"), ("09260", "VERDE"), ("03493", "")}
+ESTRATEGICOS = {"09824"}
+# precos XBZ conhecidos (so valem se a API da XBZ nao trouxer o preco)
+PRECOS_REF = {"01622B": 9.50, "01895": 45.50, "03590": 12.08, "03968": 16.90, "05063": 36.75, "06012": 18.90,
+              "06016B": 2.70, "06078": 8.20, "07030": 13.90, "07392": 6.80, "09181": 27.00, "09188": 10.90,
+              "09256": 22.90, "09824": 0.83, "18552": 15.80, "18601": 10.90, "18623": 18.00, "18647": 14.50,
+              "18699": 20.90, "18726I": 14.50, "18781": 11.50, "18786": 11.50, "18904": 15.90, "18910": 34.80,
+              "18921": 12.20, "18949P": 21.90, "18949M": 31.20, "19062": 15.90, "19124": 37.90, "9139A": 9.45,
+              "FY001": 1.00, "18650": 9.50, "01093": 0.60, "18549": 17.60}
+# pedidos ja descontados no snapshot (nunca baixar de novo)
+UPPUS_PROCESSADOS = set("""UPPUS209361 UPPUS209459 UPPUS209644 UPPUS209680 UPPUS209720 UPPUS209781 UPPUS209845 UPPUS209853
+UPPUS209855 UPPUS209856 UPPUS209857 UPPUS209873 UPPUS209894 UPPUS209933 UPPUS210002 UPPUS210003 UPPUS210048 UPPUS210100
+UPPUS210111 UPPUS210278 UPPUS210302 UPPUS210331 UPPUS210391 UPPUS210405 UPPUS210443 UPPUS210452 UPPUS210468 UPPUS210469
+UPPUS210493 UPPUS210502 UPPUS210525 UPPUS210528 UPPUS210541 UPPUS210551 UPPUS210556 UPPUS210562 UPPUS210563 UPPUS210566
+UPPUS210575 UPPUS210581 UPPUS210585 UPPUS210589 UPPUS210592 UPPUS210594 UPPUS210602 UPPUS210611 UPPUS210613 UPPUS210614
+UPPUS210615 UPPUS210620 UPPUS210621 UPPUS210622 UPPUS210625 UPPUS210628 UPPUS210639 UPPUS210644 UPPUS210651 UPPUS210652
+UPPUS210663 UPPUS210666 UPPUS210676 UPPUS210678 UPPUS210679 UPPUS210681 UPPUS210701 UPPUS210703 UPPUS210709 UPPUS210717
+UPPUS210718 UPPUS210720 UPPUS210724 UPPUS210726 UPPUS210727 UPPUS210730 UPPUS210731 UPPUS210732 UPPUS210733 UPPUS210738
+UPPUS210739 UPPUS210745 UPPUS210764 UPPUS210765 UPPUS210772 UPPUS210773 UPPUS210774 UPPUS210776 UPPUS210780 UPPUS210781
+UPPUS210782 UPPUS210783 UPPUS210786 UPPUS210788 UPPUS210789 UPPUS210790 UPPUS210791 UPPUS210792 UPPUS210793 UPPUS210794
+UPPUS210795 UPPUS210799 UPPUS210801 UPPUS210802 UPPUS210803 UPPUS210804 UPPUS210806 UPPUS210809 UPPUS210810 UPPUS210811
+UPPUS210812 UPPUS210813 UPPUS210814 UPPUS210815 UPPUS210817 UPPUS210818 UPPUS210819 UPPUS210821 UPPUS210822 UPPUS210823
+UPPUS210824
+UPPUS210839 UPPUS210840 UPPUS210841""".split())  # + etiquetas impressas em 01/10 19:03 (PDF de teste ja importado)
+
+
+def estoque_chave(sku, cor="", texto=""):
+    """SKU e cor como o estoque conhece (aliases, abreviacoes e correcoes confirmadas)."""
+    s_ = sku_base(sku)
+    s_ = SKU_ALIAS.get(s_, s_)
+    t = (texto or "").upper()
+    if s_ == "18949":
+        if re.search(r"350\s*ML", t):
+            s_ = "18949P"
+        elif re.search(r"550\s*ML", t):
+            s_ = "18949M"
+    cn = " ".join(COR_ABREV.get(w, w) for w in cor_norm(cor).split())
+    cn = COR_ALIAS.get(cn, cn)
+    if s_ == "18691" and cn == "VERMELHO":
+        s_ = "18601"
+    cn = COR_POR_SKU.get((s_, cn), cn)
+    return s_, cn
+
+
+def _ja_no_snapshot(c, item):
+    """Etiqueta impressa antes da data-base, ou pedido ja processado pelo agente antigo: ja esta no snapshot."""
+    if (item.get("impresso") or "9999") < ESTOQUE_ABERTURA:
+        return True
+    cods = [r[0] for r in c.execute("SELECT codigo FROM codigos WHERE item_id=?", (item["id"],))]
+    return any(x in UPPUS_PROCESSADOS for x in cods)
+
+
+def carregar_abertura():
+    """Saldo inicial (snapshot autoritativo do agente antigo), uma vez so."""
+    with conn() as c:
+        if c.execute("SELECT 1 FROM meta WHERE chave='abertura_estoque'").fetchone():
+            return 0
+    linhas, sku = [], None
+    for ln in ESTOQUE_SNAPSHOT.splitlines():
+        ln = ln.strip()
+        if ln.startswith("##"):
+            sku = ln[2:].strip()
+        elif ln and sku:
+            m = re.match(r"(.+?)\s+(-?\d+)$", ln)
+            if m:
+                linhas.append(f"{sku};{m.group(1)};{m.group(2)}")
+    r = contagem_estoque(linhas, tipo_obs="saldo inicial (agente de estoque, 02/10/2026)")
+    with _lock, conn() as c:
+        c.execute("INSERT OR REPLACE INTO meta VALUES('abertura_estoque', ?)", (agora(),))
+    return r["feitos"]
+
+
 def baixar_estoque(c, iid):
     """Baixa do estoque as pecas da etiqueta quando o material sai para a separacao (uma vez so por etiqueta)."""
     r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
-    if not r or r["lote"] == "DEVOLUCAO":
+    if not r or r["lote"] == "DEVOLUCAO" or _ja_no_snapshot(c, dict(r)):
         return
     for sku, cor, qtd in _pecas_do_item(dict(r)):
-        sku, cn = sku_base(sku), cor_norm(cor)
+        sku, cn = estoque_chave(sku, cor)
         if not sku or sku.startswith("("):
             continue
         c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
@@ -907,8 +1379,11 @@ def _reservado(c, sku, cn, nivel, antes_de):
     """Unidades de etiquetas que entraram antes desta e ainda nao foram separadas (vao sair da prateleira)."""
     tot = 0
     for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO'", (antes_de,)):
+        if _ja_no_snapshot(c, dict(i)):
+            continue
         for s_, c_, q in _pecas_do_item(dict(i)):
-            if sku_base(s_) == sku and (nivel == "sku" or cor_norm(c_) == cn):
+            k = estoque_chave(s_, c_)
+            if k[0] == sku and (nivel == "sku" or k[1] == cn):
                 tot += q
     return tot
 
@@ -916,11 +1391,11 @@ def _reservado(c, sku, cn, nivel, antes_de):
 def checar_falta(c, iid):
     """Etiqueta nova: se o que tem na prateleira (menos o que ja esta reservado) nao cobre, marca NAO TEM sozinho."""
     r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
-    if not r or r["lote"] == "DEVOLUCAO" or r["status"] != "AGUARDANDO" or r["falta_material"]:
+    if not r or r["lote"] == "DEVOLUCAO" or r["status"] != "AGUARDANDO" or r["falta_material"] or _ja_no_snapshot(c, dict(r)):
         return 0
     falta = False
     for sku, cor, qtd in _pecas_do_item(dict(r)):
-        sku, cn = sku_base(sku), cor_norm(cor)
+        sku, cn = estoque_chave(sku, cor)
         nivel = _controlado(c, sku, cn)
         if not nivel:
             continue
@@ -938,7 +1413,7 @@ def checar_falta(c, iid):
     return 0
 
 
-def contagem_estoque(linhas):
+def contagem_estoque(linhas, tipo_obs=None):
     """'SKU;COR;QTD' por linha (cor pode ficar vazia). Define o saldo exato daquele produto/cor agora."""
     feitos, erros = 0, []
     with _lock, conn() as c:
@@ -947,20 +1422,42 @@ def contagem_estoque(linhas):
             if not cols or not cols[0]:
                 continue
             try:
-                sku, cor, qtd = sku_base(cols[0]), cor_norm(cols[1] if len(cols) > 2 else ""), _num(cols[-1])
+                sku, cor = estoque_chave(cols[0], cols[1] if len(cols) > 2 else "")
+                qtd = _num(cols[-1])
             except Exception:
                 erros.append(ln.strip()); continue
             atual = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cor)).fetchone()[0]
             c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
                       (agora(), sku, cor, qtd - atual, "CONTAGEM", f"CONT|{sku}|{cor}|{agora()}|{secrets.token_hex(3)}",
-                       f"contagem: {qtd:g}"))
+                       tipo_obs or f"contagem: {qtd:g}"))
             feitos += 1
+    return {"ok": True, "feitos": feitos, "erros": erros}
+
+
+def movimento_manual(linhas):
+    """'SKU;COR;+5' (acrescentar) ou 'SKU;COR;-3' (baixar). Nunca zera negativo: soma de verdade."""
+    feitos, erros = [], []
+    with _lock, conn() as c:
+        for ln in linhas:
+            cols = [x.strip() for x in re.split(r"\t|;", ln)]
+            if not cols or not cols[0]:
+                continue
+            try:
+                sku, cor = estoque_chave(cols[0], cols[1] if len(cols) > 2 else "")
+                q = _num(cols[-1].replace("+", ""))
+            except Exception:
+                erros.append(ln.strip()); continue
+            antes = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cor)).fetchone()[0]
+            c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                      (agora(), sku, cor, q, "AJUSTE", f"AJ|{sku}|{cor}|{agora()}|{secrets.token_hex(3)}",
+                       "acrescentar" if q > 0 else "baixar"))
+            feitos.append({"sku": sku, "cor": cor or "-", "antes": antes, "mov": q, "depois": antes + q})
     return {"ok": True, "feitos": feitos, "erros": erros}
 
 
 def distribuir_cor(sku, partes):
     """Passa unidades que entraram sem cor (nota da XBZ) para as cores certas: partes = {cor: qtd}."""
-    sku = sku_base(sku)
+    sku = estoque_chave(sku)[0]
     with _lock, conn() as c:
         for cor, q in partes.items():
             q = _num(q)
@@ -970,7 +1467,7 @@ def distribuir_cor(sku, partes):
             c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
                       (agora(), sku, "", -q, "DISTRIBUI", f"DIST-|{sku}|{cor}|{marca}", f"para {cor}"))
             c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
-                      (agora(), sku, cor_norm(cor), q, "DISTRIBUI", f"DIST+|{sku}|{cor}|{marca}", "entrada sem cor"))
+                      (agora(), sku, estoque_chave(sku, cor)[1], q, "DISTRIBUI", f"DIST+|{sku}|{cor}|{marca}", "entrada sem cor"))
     return {"ok": True}
 
 
@@ -995,16 +1492,34 @@ def xbz_sincronizar():
         _xbz_status.update(ok=False, erro="resposta incompleta da XBZ - catalogo anterior mantido", ultima=agora())
         return {"ok": False, "erro": _xbz_status["erro"]}
     with _lock, conn() as c:
+        vendidos = {r[0] for r in c.execute("SELECT DISTINCT sku FROM estoque_mov")}
+        antes = {r["codigo_xbz"]: (r["preco"], r["estoque"]) for r in c.execute("SELECT codigo_xbz, preco, estoque FROM xbz")}
+        alertas = []
         for x in dados:
             try:
                 preco, est = float(x.get("PrecoVenda") or 0), max(0, int(float(x.get("QuantidadeDisponivel") or 0)))
             except Exception:
                 continue
+            cod = str(x.get("CodigoAmigavel") or "").strip().upper()
+            cx = str(x["CodigoXbz"]).strip()
+            if cod in vendidos and cx in antes:
+                p0, e0 = antes[cx]
+                cor_ = cor_norm(x.get("CorWebPrincipal"))
+                if e0 > 0 and est == 0:
+                    alertas.append((cod, cor_, "XBZ ZEROU", "estoque da XBZ acabou"))
+                elif e0 == 0 and est > 0:
+                    alertas.append((cod, cor_, "XBZ VOLTOU", f"voltou a ter {est} na XBZ"))
+                elif e0 >= 200 > est:
+                    alertas.append((cod, cor_, "XBZ ABAIXO DE 200", f"XBZ tem {est}"))
+                if p0 and preco and abs(preco - p0) / p0 >= 0.05:
+                    alertas.append((cod, cor_, "PRECO MUDOU", f"R$ {p0:.2f} -> R$ {preco:.2f}".replace(".", ",")))
             c.execute("INSERT OR REPLACE INTO xbz VALUES(?,?,?,?,?,?,?,?,?,?)",
                       (str(x["CodigoXbz"]).strip(), str(x.get("CodigoAmigavel") or x.get("IdProduto") or "").strip().upper(),
                        str(x.get("CodigoComposto") or "").strip().upper(), re.sub(r"\s+", " ", str(x.get("Nome") or "")).strip(),
                        cor_norm(x.get("CorWebPrincipal")), preco, est, str(x.get("StatusConfiabilidade") or "")[:120],
                        str(x.get("ReposicaoDataPrevista") or "")[:10], agora()))
+        for a in alertas:
+            c.execute("INSERT INTO xbz_alertas(em,sku,cor,tipo,detalhe) VALUES(?,?,?,?,?)", (agora(), *a))
     _xbz_status.update(ok=True, erro="", ultima=agora(), registros=len(dados),
                        segundos=round((datetime.now() - ini).total_seconds(), 1))
     return {"ok": True, "registros": len(dados)}
@@ -1013,15 +1528,28 @@ def xbz_sincronizar():
 _xbz_status = {"ok": None, "erro": "", "ultima": "", "registros": 0}
 
 
+XBZ_HORARIOS = ["08:00", "08:45", "09:30", "10:15", "11:00", "11:45", "12:30", "13:15", "14:00", "14:45", "15:30",
+                "16:15", "17:00", "17:45", "18:30"]
+
+
 def _xbz_loop():
+    """Consulta a XBZ nos horarios combinados (15 por dia, menos de 24). Falhou: 1 nova tentativa 15 min depois."""
     import time
+    xbz_sincronizar()
     while True:
+        agora_br = datetime.now(BR)
+        prox = None
+        for d in range(0, 2):
+            for h in XBZ_HORARIOS:
+                t = (agora_br + timedelta(days=d)).replace(hour=int(h[:2]), minute=int(h[3:]), second=0, microsecond=0)
+                if t > agora_br and (prox is None or t < prox):
+                    prox = t
+        time.sleep(max(30, (prox - agora_br).total_seconds()))
         r = xbz_sincronizar()
         if not r.get("ok"):
             print("XBZ:", r.get("erro"), flush=True)
-            time.sleep(15 * 60)  # tenta de novo em 15 min
-        else:
-            time.sleep(6 * 3600)
+            time.sleep(15 * 60)
+            xbz_sincronizar()
 
 
 def xbz_de(c, sku, cor=""):
@@ -1048,30 +1576,35 @@ def estoque():
                  -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s7,
                  -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s15,
                  MAX(CASE WHEN tipo='CONTAGEM' THEN em END) contado,
-                 SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF') THEN 1 ELSE 0 END) conhecido,
+                 SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF','AJUSTE') THEN 1 ELSE 0 END) conhecido,
                  SUM(CASE WHEN tipo='ENTRADA_NF' AND em>=? THEN qtd ELSE 0 END) e15
                  FROM estoque_mov GROUP BY sku, cor""", (d7, d15, d15)):
             linhas[(r["sku"], r["cor"])] = dict(r)
         pend = {}
         # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
         for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO'"):
+            if _ja_no_snapshot(c, dict(i)):
+                continue
             for sku, cor, q in _pecas_do_item(dict(i)):
-                k = (sku_base(sku), cor_norm(cor))
+                k = estoque_chave(sku, cor)
                 if k[0] and not k[0].startswith("("):
                     pend[k] = pend.get(k, 0) + q
         for k in pend:
             linhas.setdefault(k, {"sku": k[0], "cor": k[1], "saldo": 0, "s7": 0, "s15": 0, "contado": None,
                                   "conhecido": 0, "e15": 0})
+        com_cor = {k[0] for k in linhas if k[1]}
         out = []
         for (sku, cor), r in linhas.items():
+            sem_cor = cor == "" and sku in com_cor  # produto com cores: entrada sem cor ainda precisa ser distribuida
             media = (r["s15"] or 0) / 15
             fisico = r["saldo"] or 0
             saldo = fisico - pend.get((sku, cor), 0)  # disponivel
             x = xbz_de(c, sku, cor) or {}
-            cu = x.get("preco") if x.get("preco") is not None else custo_de(c, sku)
+            cu = preco_xbz(c, sku, cor)
             conhecido = bool(r["conhecido"])
-            comprar = max(0, round(media * ESTOQUE_DIAS_COMPRA - saldo)) if cor != "" and conhecido else 0
-            out.append({"sku": sku, "cor": cor or "(cor a definir)", "sem_cor": cor == "", "saldo": round(saldo, 2),
+            comprar = max(0, round(media * ESTOQUE_DIAS_COMPRA - saldo)) if not sem_cor and conhecido else 0
+            out.append({"sku": sku, "cor": cor or ("(cor a definir)" if sem_cor else "PADRAO"), "sem_cor": sem_cor,
+                        "saldo": round(saldo, 2),
                         "fisico": round(fisico, 2),
                         "pendente_hoje": pend.get((sku, cor), 0), "saidas_7d": r["s7"] or 0, "saidas_15d": r["s15"] or 0,
                         "media_dia": round(media, 1), "dias": round(saldo / media, 1) if media > 0 and saldo > 0 else (0 if saldo <= 0 else None),
@@ -1080,15 +1613,19 @@ def estoque():
                         "xbz_reposicao": x.get("reposicao", ""), "nome": x.get("nome", ""),
                         "conhecido": conhecido,
                         "alerta": ("FALTA CONTAR" if not conhecido else "") or
-                                  ("SEM ESTOQUE" if saldo <= 0 and not cor == "" else "") or
+                                  ("ESTRATEGICO: ACABANDO" if sku in ESTRATEGICOS and media > 0 and saldo < media * 7 else "") or
+                                  ("SEM ESTOQUE" if saldo <= 0 and not sem_cor else "") or
                                   ("XBZ ACABOU" if x and x.get("estoque") == 0 else "") or
                                   ("XBZ ABAIXO DE 200" if x and x.get("estoque") is not None and x["estoque"] < 200 else "")})
     out.sort(key=lambda d: (d["sem_cor"], not d["conhecido"], -(d["comprar"] or 0), d["saldo"], d["sku"]))
-    return {"itens": out, "dias_compra": ESTOQUE_DIAS_COMPRA, "xbz": _xbz_status,
+    with conn() as c:
+        alertas_xbz = [dict(r) for r in c.execute("SELECT * FROM xbz_alertas ORDER BY id DESC LIMIT 40")]
+    return {"itens": out, "dias_compra": ESTOQUE_DIAS_COMPRA, "xbz": _xbz_status, "alertas_xbz": alertas_xbz,
             "total_compra": round(sum(d["valor_compra"] for d in out), 2)}
 
 
 ESTOQUE_PRAZO_XBZ = int(os.environ.get("ESTOQUE_PRAZO_XBZ", "2"))
+ESTOQUE_LIMITE_SEMANA = float(os.environ.get("ESTOQUE_LIMITE_SEMANA", "50000"))
 
 
 def _habito_compra(c, sku):
@@ -1110,40 +1647,65 @@ def _habito_compra(c, sku):
     return {"ciclo": ciclo, "multiplo": mult, "compras": len(qs), "lote_tipico": sorted(qs)[len(qs) // 2] if qs else None}
 
 
-def sugestao_compra():
-    """Pedido sugerido para a XBZ: venda recente (mais peso nos ultimos 7 dias) x ciclo de compra aprendido + prazo da XBZ,
-    menos o que tem na prateleira, mais o que ja esta reservado; arredonda no multiplo que voces costumam pedir e
-    aplica o fator aprendido com os pedidos confirmados."""
+def preco_xbz(c, sku, cor=""):
+    """Preco de custo: API da XBZ primeiro; senao o preco conhecido (agente antigo); senao o custo cadastrado."""
+    x = xbz_de(c, sku, cor) or {}
+    if x.get("preco"):
+        return x["preco"]
+    if sku in PRECOS_REF:
+        return PRECOS_REF[sku]
+    base = re.sub(r"[PMG]$", "", sku)
+    return PRECOS_REF.get(base) or custo_de(c, sku)
+
+
+def sugestao_compra(dias=None):
+    """Projecao de compra para a XBZ: venda dos ultimos 30 dias com mais peso na ultima semana (sem extrapolar pico),
+    estoque fisico, reservado nas etiquetas, prazo da XBZ, estoque e preco da XBZ; arredonda no multiplo que voces
+    costumam pedir e aplica o fator aprendido com os pedidos confirmados. Nunca envia pedido sozinho."""
     import math
     agora_ = datetime.now(timezone.utc)
-    d7, d28 = (agora_ - timedelta(days=7)).isoformat(), (agora_ - timedelta(days=28)).isoformat()
-    est = {(i["sku"], "" if i["sem_cor"] else i["cor"]): i for i in estoque()["itens"]}
-    out, sem_contagem = [], []
+    d7, d30 = (agora_ - timedelta(days=7)).isoformat(), (agora_ - timedelta(days=30)).isoformat()
+    est = {(i["sku"], "" if i["cor"] in ("PADRAO", "(cor a definir)") else i["cor"]): i for i in estoque()["itens"]}
+    out, sem_contagem, fora = [], [], []
     with conn() as c:
         prim = c.execute("SELECT MIN(em) FROM estoque_mov WHERE tipo='ETIQUETA'").fetchone()[0]
-        dias_hist = max(1, min(28, (agora_ - datetime.fromisoformat(prim)).days + 1)) if prim else 1
+        dias_hist = max(1, min(30, (agora_ - datetime.fromisoformat(prim)).days + 1)) if prim else 1
         vendas = {}
-        for r in c.execute("""SELECT sku, cor, -SUM(CASE WHEN em>=? THEN qtd ELSE 0 END) v7, -SUM(qtd) v28 FROM estoque_mov
-                              WHERE tipo='ETIQUETA' AND em>=? GROUP BY sku, cor""", (d7, d28)):
-            vendas[(r["sku"], r["cor"])] = (r["v7"] or 0, r["v28"] or 0)
+        for r in c.execute("""SELECT sku, cor, -SUM(CASE WHEN em>=? THEN qtd ELSE 0 END) v7, -SUM(qtd) v30 FROM estoque_mov
+                              WHERE tipo='ETIQUETA' AND em>=? GROUP BY sku, cor""", (d7, d30)):
+            vendas[(r["sku"], r["cor"])] = (r["v7"] or 0, r["v30"] or 0)
         fatores = {r["sku"]: r["fator"] for r in c.execute("SELECT sku, fator FROM compra_aprendizado")}
         habitos = {}
-        chaves = set(vendas) | {k for k, v in est.items() if v["pendente_hoje"]}
+        chaves = set(vendas) | {k for k, v in est.items() if v["pendente_hoje"]} | \
+            {k for k, v in est.items() if k[0] in ESTRATEGICOS and v.get("conhecido")}
         for sku, cor in sorted(chaves):
-            if not cor:
+            if not cor and (est.get((sku, ""), {}).get("sem_cor") or not est.get((sku, ""), {}).get("conhecido")):
                 continue
-            v7, v28 = vendas.get((sku, cor), (0, 0))
-            media = 0.6 * (v7 / 7) + 0.4 * (v28 / max(7, dias_hist))  # no comeco (pouco historico) nao exagera
+            v7, v30 = vendas.get((sku, cor), (0, 0))
+            m7, m30 = v7 / 7, v30 / max(7, dias_hist)
+            # aceleracao clara pesa mais; pico isolado nao e extrapolado (no maximo o dobro da media do mes)
+            media = m30 + 0.6 * (min(m7, 2 * m30 if m30 else m7) - m30) if m7 > m30 else 0.5 * m7 + 0.5 * m30
             h = habitos.setdefault(sku, _habito_compra(c, sku))
+            horizonte = (dias if dias else h["ciclo"]) + ESTOQUE_PRAZO_XBZ
             e = est.get((sku, cor), {})
             reservado = e.get("pendente_hoje", 0)
             fisico = e.get("fisico", 0)
-            alvo = media * (h["ciclo"] + ESTOQUE_PRAZO_XBZ) * fatores.get(sku, 1.0)
-            precisa = alvo + reservado - max(fisico, 0)
+            alvo = media * horizonte * fatores.get(sku, 1.0)
+            precisa = alvo + reservado - fisico  # estoque negativo aumenta a compra (falta fisica)
             x = xbz_de(c, sku, cor) or {}
+            preco = preco_xbz(c, sku, cor)
             linha = {"sku": sku, "cor": cor, "nome": x.get("nome", e.get("nome", "")), "media_dia": round(media, 1),
                      "na_prateleira": fisico, "reservado": reservado, "ciclo_dias": h["ciclo"], "multiplo": h["multiplo"],
-                     "fator": round(fatores.get(sku, 1.0), 2), "preco": x.get("preco"), "xbz_estoque": x.get("estoque")}
+                     "projecao": round(alvo), "fator": round(fatores.get(sku, 1.0), 2), "preco": preco,
+                     "xbz_estoque": x.get("estoque"), "estrategico": sku in ESTRATEGICOS}
+            if (sku, cor) in XBZ_INDISPONIVEL or (sku, "") in XBZ_INDISPONIVEL or x.get("estoque") == 0:
+                if precisa > 0:
+                    fora.append({**linha, "motivo": "fornecedor sem estoque", "qtd": math.ceil(precisa)})
+                continue
+            if (sku, cor) in BAIXA_DEMANDA or (sku, "") in BAIXA_DEMANDA:
+                if precisa > 0:
+                    fora.append({**linha, "motivo": "demanda baixa (so com nova evidencia)", "qtd": math.ceil(precisa)})
+                continue
             if not e.get("conhecido"):
                 linha["qtd"] = math.ceil(alvo + reservado)
                 if linha["qtd"] > 0:
@@ -1158,11 +1720,16 @@ def sugestao_compra():
             if q <= 0:
                 continue
             linha["qtd"] = q
-            linha["total"] = round((x.get("preco") or 0) * q, 2)
+            linha["total"] = round((preco or 0) * q, 2)
+            linha["critico"] = fisico - reservado <= 0 or (media > 0 and (fisico - reservado) / media < 2)
             out.append(linha)
-    out.sort(key=lambda l: (l["sku"], l["cor"]))
-    return {"itens": out, "sem_contagem": sem_contagem, "total": round(sum(l.get("total", 0) for l in out), 2),
-            "prazo_xbz": ESTOQUE_PRAZO_XBZ, "dias_historico": dias_hist}
+    out.sort(key=lambda l: (not l.get("critico"), l["sku"], l["cor"]))
+    total = round(sum(l.get("total", 0) for l in out), 2)
+    return {"itens": out, "sem_contagem": sem_contagem, "fora": fora, "total": total,
+            "unidades": sum(l["qtd"] for l in out), "criticos": sum(1 for l in out if l.get("critico")),
+            "negativos": sum(1 for v in est.values() if v.get("fisico", 0) < 0 and not v.get("sem_cor")),
+            "limite_semana": ESTOQUE_LIMITE_SEMANA, "acima_limite": total > ESTOQUE_LIMITE_SEMANA,
+            "prazo_xbz": ESTOQUE_PRAZO_XBZ, "dias_historico": dias_hist, "dias": dias}
 
 
 def confirmar_pedido_xbz(itens):
@@ -1171,7 +1738,7 @@ def confirmar_pedido_xbz(itens):
         por_sku = {}
         for it in itens:
             sug, q = float(it.get("sugerido") or 0), float(it.get("qtd") or 0)
-            a = por_sku.setdefault(sku_base(it.get("sku")), [0.0, 0.0])
+            a = por_sku.setdefault(estoque_chave(it.get("sku"))[0], [0.0, 0.0])
             a[0] += sug; a[1] += q
         for sku, (sug, q) in por_sku.items():
             if sug <= 0:
@@ -1225,7 +1792,7 @@ def importar_nfe(xml):
             if it["cprod"] and it["qtd"] and not any(x and x in (n["conta"] or "").upper() for x in ESTOQUE_IGNORAR):
                 # entrada no estoque proprio (a nota nao traz a cor: entra como "cor a definir")
                 c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
-                          (agora(), codigo_xbz_nf(it["cprod"]), "", it["qtd"], "ENTRADA_NF",
+                          (agora(), estoque_chave(codigo_xbz_nf(it["cprod"]))[0], "", it["qtd"], "ENTRADA_NF",
                            f"NF|{n['chave'] or n['nf']}|{it['item']}", f"NF {n['nf']} {n['conta']}"))
     return {"ok": True, "nf": n["nf"], "data": n["data"], "conta": n["conta"], "itens": len(n["itens"]), "novos": novos,
             "total": round(sum(i["total"] for i in n["itens"]), 2)}
@@ -1365,9 +1932,16 @@ def ler_etiqueta_txt(t):
             mq = re.search(r"\*\s*(\d+)\s*\)?\s*$", it.strip())
             par0 = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
             if mm:
-                skus.append(mm.group(1).upper())
-                pecas.append({"sku": mm.group(1).upper(), "cor": par0[-1].split(",")[0].strip() if par0 else "",
-                              "qtd": int(mq.group(1)) if mq else 1})
+                sku_it = mm.group(1).upper()
+                var = it.split(" / ")[0].upper()  # so a variacao (o titulo do anuncio pode ter numeros)
+                if sku_it == "18949":
+                    sku_it = "18949P" if re.search(r"350\s*ML", it.upper()) else "18949M" if re.search(r"550\s*ML", it.upper()) else sku_it
+                # kit: "AZUL - 100 UND", "KIT 50", "30 UNIDADES" -> unidades fisicas
+                mk = re.search(r"(\d{2,4})\s*(?:UND|UNID|UNIDS|UNIDADES|UN)\b", var) or re.search(r"\bKIT\s*(?:C/|COM|DE)?\s*(\d{2,4})\b", var)
+                kit = int(mk.group(1)) if mk else 1
+                skus.append(sku_it)
+                pecas.append({"sku": sku_it, "cor": par0[-1].split(",")[0].strip() if par0 else "",
+                              "qtd": (int(mq.group(1)) if mq else 1) * kit, **({"kit": kit} if kit > 1 else {})})
             par = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
             if par:
                 cores.append(par[-1].split(",")[0].strip())
@@ -1395,7 +1969,7 @@ def ler_etiqueta_txt(t):
             "fonte": re.sub(r"^\s*Fonte\s*[:\-]\s*", "", fl, flags=re.I).strip(),
             "obs": ("Cliente: " + cli.group(1).strip()) if cli else "",
             "etiqueta": int(etq.group(1)) if etq else None, "personalizado": personalizado,
-            "pecas": pecas, "loja": loja,
+            "pecas": pecas, "loja": loja, "impresso": _impresso_em(t),
             "codigos": [x for x in dict.fromkeys((sn, tid, erid, ras, ups)) if x]}
 
 
@@ -1409,6 +1983,12 @@ def dica_arquivo(nome):
     if "shopee" in n or "xpress" in n:
         return {"canal": "SHOPEE", "envio": "SHOPEE XPRESS"}
     return {}
+
+
+def _impresso_em(t):
+    """Data de impressao do UpSeller no rodape: 'UPPUS210840 01/10/2026 19:03:02' -> 2026-10-01."""
+    m = re.search(r"UPPUS\d+\s+(\d{2})/(\d{2})/(\d{4})", t or "")
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else ""
 
 
 def itens_do_pdf(dados, nome=""):
@@ -1579,6 +2159,12 @@ _email_status = {"ativo": bool(EMAIL_USUARIO and EMAIL_SENHA), "conta": EMAIL_US
 
 if __name__ == "__main__":
     iniciar_db()
+    try:
+        n = carregar_abertura()
+        if n:
+            print(f"Estoque: saldo inicial carregado ({n} produtos/cores)", flush=True)
+    except Exception as e:
+        print("Estoque: erro no saldo inicial:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
