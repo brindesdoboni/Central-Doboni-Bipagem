@@ -72,6 +72,9 @@ def iniciar_db():
             atualizado TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
         c.execute("CREATE TABLE IF NOT EXISTS prateleiras(sku TEXT PRIMARY KEY, prateleira TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS shopee_lojas(shop_id INTEGER PRIMARY KEY, nome TEXT, access_token TEXT,
+                     refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
+                     expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             tipo TEXT, detalhe TEXT)""")
@@ -241,13 +244,26 @@ def importar_lote(dados):
 
 # ------------------------------------------------------------------ bipe
 def bipar(posto, codigo, operador, modo):
+    """Devolve tambem 'colaborador' (nome de quem bipou) e 'evento' (para cada coisa tocar um som diferente)."""
+    r = _bipar(posto, codigo, operador, modo)
+    if not r.get("evento"):
+        r["evento"] = "erro" if r.get("tipo") == "erro" else ("repetido" if r.get("tipo") == "aviso" else "ok")
+    if not r.get("colaborador"):
+        with conn() as c:
+            quem = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1",
+                             (norm(codigo) if r.get("tipo") == "operador" else norm(operador),)).fetchone()
+        r["colaborador"] = quem[0] if quem else ""
+    return r
+
+
+def _bipar(posto, codigo, operador, modo):
     posto = (posto or "").upper()
     cod = norm(codigo)
     with _lock, conn() as c:
         col = c.execute("SELECT * FROM colaboradores WHERE codigo=? AND ativo=1", (cod,)).fetchone()
         if col:
             return {"tipo": "operador", "operador": {"codigo": col["codigo"], "nome": col["nome"]},
-                    "msg": f"Ola, {col['nome']}!"}
+                    "msg": f"Ola, {col['nome']}!", "evento": "operador", "colaborador": col["nome"]}
         op = c.execute("SELECT * FROM colaboradores WHERE codigo=? AND ativo=1", (norm(operador),)).fetchone()
         if not op:
             return {"tipo": "erro", "msg": "Bipe o seu CRACHA primeiro."}
@@ -261,7 +277,7 @@ def bipar(posto, codigo, operador, modo):
             recalcular(c, ev["item_id"])
             if c.execute("SELECT status FROM itens WHERE id=?", (ev["item_id"],)).fetchone()[0] == "AGUARDANDO":
                 c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{ev['item_id']}|%",))  # volta para o estoque
-            return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}"}
+            return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}", "evento": "desfazer"}
         itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
                           "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
         if not itens and posto == "DEVOLUCAO":
@@ -285,49 +301,46 @@ def bipar(posto, codigo, operador, modo):
             it = itens[0]
             if it["falta_material"]:
                 return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}", "item": dict(it)}
-            r = ev(it, "FALTA_MATERIAL", "falta de material")
-            if r["status"] == "AGUARDANDO":
-                c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{it['id']}|%",))
-            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']} (quando chegar: bipar na SEPARACAO)",
-                    "item": r}
+            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}", "evento": "falta",
+                    "item": ev(it, "FALTA_MATERIAL", "falta de material")}
 
         if posto == "SEPARACAO":
             alvo = next((i for i in itens if ORDEM[i["status"]] < ORDEM["SEPARADO"]), None)
             if not alvo:
                 return {"tipo": "aviso", "msg": "Ja separado.", "item": dict(itens[0])}
-            return {"tipo": "ok", "msg": "Separado", "item": ev(alvo, "SEPARADO")}
+            r = ev(alvo, "SEPARADO")
+            if alvo["personalizado"]:
+                return {"tipo": "ok", "msg": "SEPARADO  →  vai para a GRAVAÇÃO", "evento": "separado", "item": r}
+            return {"tipo": "ok", "msg": "SEPARADO  →  SEM PERSONALIZAR: direto para a EXPEDIÇÃO", "evento": "separado", "item": r}
 
         if posto == "GRAVACAO":
             pers = [i for i in itens if i["personalizado"]]
             if not pers:
-                return {"tipo": "erro", "msg": "Este pedido NAO tem gravacao."}
+                return {"tipo": "erro", "msg": "SEM PERSONALIZAR: não grava. Leve direto para a EXPEDIÇÃO", "item": dict(itens[0])}
             alvo = next((i for i in pers if ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]), None)
-            if alvo and alvo["falta_material"]:
-                return {"tipo": "erro", "msg": "EM FALTA (NAO TEM): quando o material chegar, bipe primeiro na SEPARACAO.",
-                        "item": dict(alvo)}
             if alvo:
                 alerta = "" if alvo["status"] == "SEPARADO" else "pulou separacao"
                 r = ev(alvo, "GRAVACAO_INICIO", alerta)
-                return {"tipo": "aviso" if alerta else "ok",
-                        "msg": "Gravacao registrada" + (" (atencao: nao foi separado)" if alerta else ""), "item": r}
+                return {"tipo": "aviso" if alerta else "ok", "evento": "gravacao",
+                        "msg": "GRAVAÇÃO registrada  →  depois vai para a EXPEDIÇÃO" + (" (atenção: não foi separado)" if alerta else ""), "item": r}
             return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
-            emfalta = [i for i in itens if i["falta_material"] and i["status"] not in ("EXPEDIDO", "DEVOLVIDO")]
-            if emfalta:
-                return {"tipo": "erro", "msg": "EM FALTA (NAO TEM): quando o material chegar, bipe primeiro na SEPARACAO.",
-                        "item": dict(emfalta[0])}
             falta = [i for i in itens if i["personalizado"] and ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]]
             if falta:
                 return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(falta)} item(ns) ainda nao gravado(s)!",
                         "item": dict(falta[0])}
+            nsep = [i for i in itens if not i["personalizado"] and i["status"] == "AGUARDANDO"]
+            if nsep:
+                return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(nsep)} item(ns) ainda nao separado(s)! Bipe na SEPARACAO primeiro.",
+                        "item": dict(nsep[0])}
             pend = [i for i in itens if i["status"] != "EXPEDIDO"]
             if not pend:
                 return {"tipo": "aviso", "msg": "Ja expedido.", "item": dict(itens[0])}
             r = None
             for i in pend:
                 r = ev(i, "EXPEDIDO")
-            return {"tipo": "ok", "msg": f"Expedido ({len(pend)} item(ns))", "item": r}
+            return {"tipo": "ok", "msg": f"EXPEDIDO ({len(pend)} item(ns))", "evento": "expedido", "item": r}
         if posto == "DEVOLUCAO":
             pend = [i for i in itens if i["status"] != "DEVOLVIDO"]
             if not pend:
@@ -339,7 +352,7 @@ def bipar(posto, codigo, operador, modo):
             sem_sku = any(not i["sku"] for i in pend)
             msg = f"Devolucao registrada ({len(pend)} item(ns))"
             msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
-            return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "item": r}
+            return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "evento": "devolucao", "item": r}
         return {"tipo": "erro", "msg": "Posto invalido."}
 
 
@@ -363,8 +376,7 @@ def recalcular(c, iid):
     for e in c.execute("SELECT etapa FROM eventos WHERE item_id=? AND desfeito=0 ORDER BY id", (iid,)):
         et = e[0]
         if et == "FALTA_MATERIAL":
-            if st not in ("EXPEDIDO", "DEVOLVIDO"):
-                st, falta = "AGUARDANDO", 1  # NAO TEM: volta para o comeco - quando chegar, bipa de novo na SEPARACAO
+            falta = 1
         elif et == "SEPARADO":
             st, falta = "SEPARADO", 0
         elif et == "GRAVACAO_INICIO":
@@ -673,6 +685,17 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
+        if p == "/shopee/retorno" or p.startswith("/shopee/retorno/"):
+            vale = p[len("/shopee/retorno/"):] if p.startswith("/shopee/retorno/") else ""
+            if not (self._admin() or shopee_convite_ok(vale, usar=bool(q.get("code")))):
+                return self._envia(200, "<meta charset=utf-8><h2>Entre no painel da Central neste navegador e autorize de novo.</h2>", "text/html; charset=utf-8")
+            try:
+                r = shopee_retorno(q.get("code", ""), q.get("shop_id", ""), q.get("main_account_id", ""))
+                msg = "✅ Autorizada: " + ", ".join(r.get("lojas") or []) if r.get("ok") else "❌ " + r.get("erro", "")
+            except Exception as e:
+                msg = "❌ Não autorizou: " + str(e)[:150]
+            import html as _h
+            return self._envia(200, f"<meta charset=utf-8><meta name=viewport content='width=device-width'><h2 style='font-family:Arial'>{_h.escape(msg)}</h2><p style='font-family:Arial'><a href='/painel'>Voltar ao painel</a></p>", "text/html; charset=utf-8")
         if p == "/contagem":
             return self._pagina("contagem.html" if self._admin() else "login.html")
         if p in ("/operacao", "/tv"):
@@ -698,6 +721,24 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"status": _email_status, "recebidos": ult})
         if p == "/api/estoque":
             return self._envia(200, estoque())
+        if p == "/admin/reiniciar":
+            with conn() as c:
+                por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
+                pode_voltar = c.execute("SELECT COUNT(DISTINCT item_id) FROM eventos WHERE desfeito=2").fetchone()[0]
+            n = sum(por.get(k, 0) for k in ("SEPARADO", "EM_GRAVACAO", "EXPEDIDO"))
+            h = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reiniciar bipagem</title>
+<body style="font:18px Arial;max-width:640px;margin:20px auto;padding:0 16px">
+<h2>Voltar tudo para AGUARDANDO</h2>
+<p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0)}</b> em gravação · <b>{por.get('EXPEDIDO',0)}</b> expedidos · {por.get('DEVOLVIDO',0)} devolvidos</p>
+<p>Os <b>{n}</b> separados, em gravação e expedidos voltam para <b>AGUARDANDO</b> para bipar tudo de novo. Devoluções e NÃO TEM ficam como estão.
+O estoque não baixa duas vezes. Nada é apagado: dá para desfazer.</p>
+<p><button id=b style="font-size:20px;padding:12px 18px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0)">Voltar os {n} para AGUARDANDO</button></p>
+{'<p><button style="font-size:16px;padding:10px 14px" onclick="go(1)">Desfazer o último reinício (' + str(pode_voltar) + ' itens)</button></p>' if pode_voltar else ''}
+<p id=m></p><p><a href="/painel">Voltar ao painel</a></p>
+<script>async function go(d){{if(!confirm(d?"Desfazer o reinício e voltar como estava?":"Voltar TUDO para AGUARDANDO?"))return;
+const r=await fetch("/api/admin/reiniciar-etapas",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{desfazer:!!d}})}});
+const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+j.itens+" itens. Recarregando...":"Erro";setTimeout(()=>location.reload(),1200)}}</script>"""
+            return self._envia(200, h, "text/html; charset=utf-8")
         if p in ("/estoque/folha", "/estoque/contagem.pdf"):
             b = folha_contagem(q.get("cego") == "1", q.get("filtro", "")).encode()
             self.send_response(200)
@@ -706,6 +747,20 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b)
             return
+        if p == "/api/shopee/lojas":
+            return self._envia(200, shopee_lojas())
+        if p == "/api/shopee/autorizar":
+            return self._envia(200, shopee_link_autorizacao())
+        if p == "/shopee/autorizar":
+            r = shopee_link_autorizacao()
+            if not r["ok"]:
+                return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
+            return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/shopee/testar":
+            try:
+                return self._envia(200, shopee_testar(q.get("shop_id", "0")))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/prateleiras":
             with conn() as c:
                 return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM prateleiras ORDER BY prateleira, sku")])
@@ -800,6 +855,8 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, salvar_prateleiras(d.get("texto", "")))
         if p == "/api/estoque/status":
             return self._envia(200, marcar_sku(d.get("sku", ""), d.get("cor", ""), d.get("status", "")))
+        if p == "/api/admin/reiniciar-etapas":
+            return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
         if p == "/api/estoque/desfazer":
             return self._envia(200, desfazer_contagem(d.get("ref")))
         if p == "/api/estoque/movimento":
@@ -1407,11 +1464,35 @@ def baixar_estoque(c, iid):
                   (agora(), sku, cn, -qtd, "ETIQUETA", f"ETQ|{iid}|{sku}|{cn}", f"pedido {r['pedido']}"))
 
 
+def _ja_baixado(c, iid):
+    """A etiqueta ja deu baixa no estoque (o material ja saiu da prateleira)."""
+    return c.execute("SELECT 1 FROM estoque_mov WHERE ref LIKE ? LIMIT 1", (f"ETQ|{iid}|%",)).fetchone() is not None
+
+
+def reiniciar_etapas(desfazer=False):
+    """Volta TUDO que esta separado / em gravacao / expedido para AGUARDANDO, para refazer a bipagem do zero.
+    Nao apaga nada: os bipes ficam marcados (desfeito=2) e da para desfazer o reinicio.
+    O estoque nao baixa de novo: a etiqueta que ja deu baixa nao baixa outra vez nem conta como reservada.
+    Devolucoes e NAO TEM ficam como estao."""
+    with _lock, conn() as c:
+        if desfazer:
+            ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM eventos WHERE desfeito=2")]
+            c.execute("UPDATE eventos SET desfeito=0 WHERE desfeito=2")
+        else:
+            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','EXPEDIDO')")]
+            for iid in ids:
+                c.execute("UPDATE eventos SET desfeito=2 WHERE item_id=? AND desfeito=0 AND etapa IN ('SEPARADO','GRAVACAO_INICIO','EXPEDIDO')", (iid,))
+        for iid in ids:
+            recalcular(c, iid)
+        por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
+    return {"ok": True, "itens": len(ids), "agora": por}
+
+
 def _reservado(c, sku, cn, nivel, antes_de):
     """Unidades de etiquetas que entraram antes desta e ainda nao foram separadas (vao sair da prateleira)."""
     tot = 0
     for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO'", (antes_de,)):
-        if _ja_no_snapshot(c, dict(i)):
+        if _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
             continue
         for s_, c_, q in _pecas_do_item(dict(i)):
             k = estoque_chave(s_, c_)
@@ -1711,7 +1792,7 @@ def estoque():
         pend = {}
         # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
         for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO'"):
-            if _ja_no_snapshot(c, dict(i)):
+            if _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
                 continue
             for sku, cor, q in _pecas_do_item(dict(i)):
                 k = estoque_chave(sku, cor)
@@ -2030,6 +2111,15 @@ EMAIL_REMETENTES = [x.strip().lower() for x in os.environ.get("EMAIL_REMETENTES"
 EMAIL_INTERVALO = int(os.environ.get("EMAIL_INTERVALO", "60"))
 
 
+def _cor_variacao(it):
+    """Variacao entre parenteses: '(Rosa Claro, Personalizado com Nome)' ou so '(Roxo)'. Kit/Padrao nao e cor."""
+    par = [x for x in re.findall(r"\(([^()]*)\)", it.split(" / ")[0]) if x.strip()]
+    if not par:
+        par = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
+    par = [x for x in par if "," in x or (len(x.strip()) <= 20 and not re.search(r"KIT|PADR|UNID|\bUND\b|\d", x.upper()))]
+    return par
+
+
 def ler_etiqueta_txt(t):
     """Le uma pagina de etiqueta do UpSeller (Shopee com DANFE, TikTok, etiqueta da folha de gravacao)."""
     T = (t or "").upper()
@@ -2066,7 +2156,7 @@ def ler_etiqueta_txt(t):
         for it in re.split(r"(?m)^\s*\d+\.\s*", rod[1])[1:]:
             mm = re.match(r"\s*([A-Za-z0-9]+)", it)
             mq = re.search(r"\*\s*(\d+)\s*\)?\s*$", it.strip())
-            par0 = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
+            par0 = _cor_variacao(it)
             if mm:
                 sku_it = mm.group(1).upper()
                 var = it.split(" / ")[0].upper()  # so a variacao (o titulo do anuncio pode ter numeros)
@@ -2078,11 +2168,11 @@ def ler_etiqueta_txt(t):
                 skus.append(sku_it)
                 pecas.append({"sku": sku_it, "cor": par0[-1].split(",")[0].strip() if par0 else "",
                               "qtd": (int(mq.group(1)) if mq else 1) * kit, **({"kit": kit} if kit > 1 else {})})
-            par = [x for x in re.findall(r"\(([^()]*)\)", it) if "," in x]
+            par = _cor_variacao(it)
             if par:
                 cores.append(par[-1].split(",")[0].strip())
             I = it.upper()
-            pers.append("SEM PERSONALIZ" not in I and bool(re.search(r"PERSONALIZ|PZD|APENAS NOME|COM NOME|NOME\s*\+", I)))
+            pers.append("PERSONALIZ" in I and "SEM PERSONALIZ" not in I)
     if not skus:
         skus = [x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z][A-Za-z0-9._\-/]{1,40})", t, re.I)]
     cli = re.search(r"Customer:\s*(.+)", t)
@@ -2093,9 +2183,7 @@ def ler_etiqueta_txt(t):
         if ml:
             loja = ml.group(1).strip().upper()
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
-    # "DANFE SIMPLIFICADO - ETIQUETA\n1 - Saida" (nota da Shopee) NAO e a etiqueta numerada da gravacao
-    t_etq = re.sub(r"DANFE\s+SIMPLIFICADO\s*-?\s*ETIQUETA", "", t, flags=re.I)
-    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t_etq, re.I)
+    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
     if etq:
         personalizado = True  # etiqueta numerada da folha de gravacao = vai para a gravacao
     elif pers:
@@ -2295,6 +2383,188 @@ _email_status = {"ativo": bool(EMAIL_USUARIO and EMAIL_SENHA), "conta": EMAIL_US
                  "xbz_conta": XBZ_EMAIL_USUARIO, "xbz_ok": None, "xbz_erro": "", "xbz_ultima": ""}
 
 
+
+# ---------------- Shopee Open Platform (somente leitura por enquanto) ----------------
+# Variaveis no Railway (nunca no codigo): SHOPEE_PARTNER_ID, SHOPEE_PARTNER_KEY.
+# Opcional: SHOPEE_HOST (padrao = ao vivo), SHOPEE_RETORNO (padrao = https://operacaodoboni.up.railway.app/shopee/retorno).
+SHOPEE_HOST = os.environ.get("SHOPEE_HOST", "https://partner.shopeemobile.com").rstrip("/")
+SHOPEE_RETORNO = os.environ.get("SHOPEE_RETORNO", "https://operacaodoboni.up.railway.app/shopee/retorno")
+_shopee_status = {"ultimo_erro": "", "ultima_renovacao": ""}
+_shopee_convites = {}
+
+
+def shopee_convite_ok(vale, usar=False):
+    import time
+    ok = _shopee_convites.get(vale or "", 0) > time.time()
+    if ok and usar:
+        _shopee_convites.pop(vale, None)
+    return ok
+
+
+def _shopee_cred():
+    pid, key = os.environ.get("SHOPEE_PARTNER_ID", "").strip(), os.environ.get("SHOPEE_PARTNER_KEY", "").strip()
+    return (int(pid), key) if pid.isdigit() and key else (None, None)
+
+
+def _shopee_assina(key, *partes):
+    return hmac.new(key.encode(), "".join(str(x) for x in partes).encode(), hashlib.sha256).hexdigest()
+
+
+def _shopee_http(metodo, path, params=None, corpo=None, loja=None):
+    """Chamada assinada. Nunca registra URL/assinatura/token em log."""
+    import urllib.request, urllib.parse, time
+    pid, key = _shopee_cred()
+    if not pid:
+        raise RuntimeError("SHOPEE_PARTNER_ID/SHOPEE_PARTNER_KEY nao configurados no Railway")
+    ts = int(time.time())
+    q = {"partner_id": pid, "timestamp": ts}
+    if loja:
+        q.update(access_token=loja["access_token"], shop_id=loja["shop_id"])
+        q["sign"] = _shopee_assina(key, pid, path, ts, loja["access_token"], loja["shop_id"])
+    else:
+        q["sign"] = _shopee_assina(key, pid, path, ts)
+    q.update(params or {})
+    url = SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q, doseq=True)
+    dados = json.dumps(corpo).encode() if corpo is not None else None
+    req = urllib.request.Request(url, data=dados, method=metodo, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            res = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read() or b"{}")
+        except Exception:
+            res = {"error": f"http {e.code}"}
+    if res.get("error"):
+        raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
+    return res
+
+
+def shopee_link_autorizacao():
+    import urllib.parse, time
+    pid, key = _shopee_cred()
+    if not pid:
+        return {"ok": False, "erro": "Coloque SHOPEE_PARTNER_ID e SHOPEE_PARTNER_KEY nas Variables do Railway"}
+    path, ts = "/api/v2/shop/auth_partner", int(time.time())
+    # codigo de uso unico (30 min) no caminho do retorno: a loja pode ser autorizada em outro navegador/perfil
+    # sem login no painel, e ninguem de fora consegue ligar uma loja sem um link gerado pelo painel
+    vale = secrets.token_urlsafe(16)
+    _shopee_convites[vale] = ts + 1800
+    q = {"partner_id": pid, "timestamp": ts, "sign": _shopee_assina(key, pid, path, ts),
+         "redirect": SHOPEE_RETORNO.rstrip("/") + "/" + vale}
+    return {"ok": True, "url": SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q)}
+
+
+def _shopee_salvar_token(c, shop_id, res):
+    from time import time as _t
+    agora_s = int(_t())
+    c.execute("""INSERT INTO shopee_lojas(shop_id, nome, access_token, refresh_token, expira, autorizada_em, atualizado_em)
+                 VALUES(?,?,?,?,?,?,?) ON CONFLICT(shop_id) DO UPDATE SET access_token=excluded.access_token,
+                 refresh_token=excluded.refresh_token, expira=excluded.expira, atualizado_em=excluded.atualizado_em""",
+              (int(shop_id), "", res["access_token"], res["refresh_token"], agora_s + int(res.get("expire_in") or 14400),
+               agora(), agora()))
+
+
+def shopee_retorno(code, shop_id, main_account_id=""):
+    """Shopee volta aqui depois que a loja autoriza. Troca o code pelo token e guarda."""
+    pid, _ = _shopee_cred()
+    if not code or not (shop_id or main_account_id):
+        return {"ok": False, "erro": "retorno sem code/shop_id"}
+    corpo = {"code": code, "partner_id": pid}
+    if shop_id:
+        corpo["shop_id"] = int(shop_id)
+    else:
+        corpo["main_account_id"] = int(main_account_id)
+    res = _shopee_http("POST", "/api/v2/auth/token/get", corpo=corpo)
+    ids = [int(shop_id)] if shop_id else [int(x) for x in (res.get("shop_id_list") or [])]
+    with _lock, conn() as c:
+        for sid in ids:
+            _shopee_salvar_token(c, sid, res)
+    nomes = []
+    for sid in ids:
+        nomes.append(shopee_atualizar_nome(sid))
+    return {"ok": True, "lojas": nomes}
+
+
+def _shopee_loja(shop_id):
+    with conn() as c:
+        r = c.execute("SELECT * FROM shopee_lojas WHERE shop_id=?", (int(shop_id),)).fetchone()
+    return dict(r) if r else None
+
+
+def shopee_atualizar_nome(shop_id):
+    loja = _shopee_loja(shop_id)
+    try:
+        info = _shopee_http("GET", "/api/v2/shop/get_shop_info", loja=loja)
+        nome = info.get("shop_name") or str(shop_id)
+        with _lock, conn() as c:
+            c.execute("UPDATE shopee_lojas SET nome=?, status_loja=?, expira_autorizacao=? WHERE shop_id=?",
+                      (nome, info.get("status", ""), int(info.get("expire_time") or 0), int(shop_id)))
+        return nome
+    except Exception as e:
+        _shopee_status["ultimo_erro"] = f"{shop_id}: {e}"
+        return str(shop_id)
+
+
+def shopee_renovar(shop_id):
+    loja = _shopee_loja(shop_id)
+    pid, _ = _shopee_cred()
+    res = _shopee_http("POST", "/api/v2/auth/access_token/get",
+                       corpo={"refresh_token": loja["refresh_token"], "shop_id": int(shop_id), "partner_id": pid})
+    with _lock, conn() as c:
+        _shopee_salvar_token(c, shop_id, res)
+        c.execute("UPDATE shopee_lojas SET erro='' WHERE shop_id=?", (int(shop_id),))
+
+
+def _shopee_loop():
+    """Renova o token de cada loja antes de vencer (vale 4h; renova a cada ~3h). Assim a autorizacao nao cai."""
+    import time
+    while True:
+        try:
+            with conn() as c:
+                lojas = [dict(r) for r in c.execute("SELECT shop_id, expira FROM shopee_lojas")]
+            for l in lojas:
+                if l["expira"] - time.time() < 3600:
+                    try:
+                        shopee_renovar(l["shop_id"])
+                        _shopee_status["ultima_renovacao"] = agora()
+                    except Exception as e:
+                        with _lock, conn() as c:
+                            c.execute("UPDATE shopee_lojas SET erro=? WHERE shop_id=?", (str(e)[:200], l["shop_id"]))
+        except Exception as e:
+            _shopee_status["ultimo_erro"] = str(e)[:200]
+        time.sleep(600)
+
+
+def shopee_testar(shop_id):
+    """Teste so de leitura: quantos pedidos a loja teve nas ultimas 24h."""
+    import time
+    loja = _shopee_loja(shop_id)
+    if not loja:
+        return {"ok": False, "erro": "loja nao autorizada"}
+    if loja["expira"] - time.time() < 120:
+        shopee_renovar(shop_id)
+        loja = _shopee_loja(shop_id)
+    fim = int(time.time())
+    res = _shopee_http("GET", "/api/v2/order/get_order_list", loja=loja,
+                       params={"time_range_field": "create_time", "time_from": fim - 86400, "time_to": fim, "page_size": 100})
+    r = res.get("response") or {}
+    n = len(r.get("order_list") or [])
+    return {"ok": True, "loja": loja["nome"], "pedidos_24h": f"{n}{'+' if r.get('more') else ''}"}
+
+
+def shopee_lojas():
+    from time import time as _t
+    pid, _ = _shopee_cred()
+    with conn() as c:
+        rows = [dict(r) for r in c.execute("SELECT shop_id, nome, status_loja, expira, expira_autorizacao, autorizada_em, atualizado_em, erro FROM shopee_lojas ORDER BY nome")]
+    for r in rows:
+        r["token_ok"] = r["expira"] > _t()
+        r["autorizacao_ate"] = datetime.fromtimestamp(r["expira_autorizacao"], BR).strftime("%d/%m/%Y") if r.get("expira_autorizacao") else ""
+        del r["expira"]
+    return {"configurado": bool(pid), "lojas": rows, "status": _shopee_status, "retorno": SHOPEE_RETORNO}
+
+
 if __name__ == "__main__":
     iniciar_db()
     try:
@@ -2307,6 +2577,7 @@ if __name__ == "__main__":
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
+    threading.Thread(target=_shopee_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))
     print(f"Central Boni rodando na porta {porta} (banco: {DB})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", porta), H).serve_forever()

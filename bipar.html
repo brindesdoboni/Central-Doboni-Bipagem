@@ -6,8 +6,11 @@
 header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#222;font-size:20px}
 #posto{font-weight:800;font-size:26px;letter-spacing:1px}#op{font-size:22px}
 main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:background .2s}
-#quem{font-size:40px;font-weight:900;margin-bottom:14px;padding:6px 22px;border-radius:10px;background:rgba(0,0,0,.35);display:none}
 #msg{font-size:56px;font-weight:800;max-width:95vw}#det{font-size:28px;margin-top:18px;opacity:.95;line-height:1.4}
+#pilha{position:fixed;left:16px;bottom:56px;width:min(760px,calc(100vw - 32px));display:flex;flex-direction:column;gap:8px;z-index:5;pointer-events:none}
+.card{border-radius:12px;padding:12px 18px;color:#fff;box-shadow:0 6px 24px #0008;animation:entra .2s ease-out;text-align:left}
+.card .q{font-size:20px;font-weight:800;opacity:.95}.card .m{font-size:30px;font-weight:900;line-height:1.15;margin:2px 0}.card .d{font-size:19px;line-height:1.3}
+.card.sai{transition:opacity .4s;opacity:0}@keyframes entra{from{transform:translateY(30px);opacity:0}to{transform:none;opacity:1}}
 #modo{margin-top:16px;font-size:24px;padding:8px 18px;border-radius:8px;background:var(--av);color:#000;display:none}
 input{position:absolute;opacity:0;left:-999px}
 .escolha{display:grid;grid-template-columns:1fr 1fr;gap:16px;width:min(700px,95vw)}
@@ -21,20 +24,33 @@ a{color:#aaa}
 </style></head><body>
 <header><div id="posto">-</div><div id="op">Bipe seu CRACHÁ</div></header>
 <div id="pausa"></div><div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alNomes" style="font-size:48px;margin-top:16px"></div></div>
-<main id="tela"><div id="quem"></div><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO NÃO TEM (contínuo) — bipe as etiquetas; para sair bipe o setor ou NÃO TEM de novo</div></main>
+<main id="tela"><div id="msg">Carregando…</div><div id="det"></div><div id="modo">MODO NÃO TEM (contínuo) — bipe as etiquetas; para sair bipe o setor ou NÃO TEM de novo</div></main>
 <div id="emPausa"></div><footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe) · bipe o código do posto para trocar</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
-<input id="in" autocomplete="off">
+<div id="pilha"></div><input id="in" autocomplete="off">
 <script>
 const POSTOS={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",DEVOLUCAO:"DEVOLUÇÃO"};
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}}, S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
-let posto=L("posto"), chave=L("chave"), op=null, modo=null, tOp=null;
+let posto=L("posto"), chave=L("chave"), op=null, modo=null;
 const $=id=>document.getElementById(id), inp=$("in");
-function beep(ok){try{const a=new AudioContext(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);
- o.frequency.value=ok?880:220;g.gain.value=.3;o.start();o.stop(a.currentTime+(ok?.12:.5))}catch(e){}}
-function tela(tipo,msg,det){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
- $("tela").style.background=cor;$("msg").textContent=msg;
- const q=$("quem");q.style.display=tipo?"inline-block":"none";q.textContent=op?"👤 "+op.nome:"👤 SEM CRACHÁ";$("det").innerHTML=det||"";beep(tipo==="ok"||tipo==="operador");
- clearTimeout(tela.t);tela.t=setTimeout(()=>{$("tela").style.background="var(--bg)";$("quem").style.display="none"},tipo==="erro"?4000:1500)}
+// um som diferente para cada coisa: [frequencia, ms] (0 = silencio)
+const TONS={operador:[[1047,90],[1319,180]],separado:[[660,110],[880,170]],gravacao:[[523,100],[659,100],[784,190]],
+ expedido:[[784,90],[988,90],[1175,90],[1568,240]],devolucao:[[880,140],[660,140],[440,240]],falta:[[330,200],[0,90],[330,200],[0,90],[330,200]],
+ desfazer:[[700,120],[500,200]],repetido:[[600,140],[0,70],[600,140]],aviso:[[600,140],[0,70],[600,140]],ok:[[880,150]],
+ erro:[[180,260],[0,80],[180,260],[0,80],[180,450]]};
+function som(ev){const a=audio();if(!a)return;let t=a.currentTime+.02;for(const [f,ms] of (TONS[ev]||TONS.erro)){const d=ms/1000;
+ if(f){const o=a.createOscillator(),g=a.createGain();o.type=ev==="erro"?"square":"triangle";o.frequency.value=f;o.connect(g);g.connect(a.destination);
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.45,t+.01);g.gain.setValueAtTime(.45,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
+ t+=d}}
+// cartoes grandes empilhados: o novo entra embaixo, os anteriores sobem, cada um some em 5 segundos (ate metade da tela)
+function cartao(tipo,msg,det,quem){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--er)";
+ const el=document.createElement("div");el.className="card";el.style.background=cor;
+ el.innerHTML=`<div class="q">${esc((quem||"SEM OPERADOR").toUpperCase())} · ${esc(POSTOS[posto]||"")} · ${new Date().toLocaleTimeString("pt-BR")}</div><div class="m">${esc(msg)}</div>${det?`<div class="d">${det}</div>`:""}`;
+ const p=$("pilha");p.appendChild(el);const lim=innerHeight*.5,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1)p.removeChild(p.firstChild);
+ setTimeout(()=>{el.classList.add("sai");setTimeout(()=>el.remove(),400)},5000)}
+function tela(tipo,msg,det,ev,quem){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
+ $("tela").style.background=cor;$("msg").textContent=msg;$("det").innerHTML=det||"";som(ev||(tipo==="erro"?"erro":tipo));
+ cartao(tipo,msg,det,quem||(op&&op.nome));
+ clearTimeout(tela.t);tela.t=setTimeout(()=>{$("tela").style.background="var(--bg)"},tipo==="erro"?4000:1500)}
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
 function trocarPosto(){S("posto","");location.reload()}
 function escolherPosto(){ $("msg").textContent="Qual é este posto?";
@@ -56,10 +72,10 @@ async function enviar(codigo){
   if(r.status===403){S("chave","");chave=null;return tela("erro","Chave do posto inválida","Recarregue a página e digite a chave")}
   if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome}
   const i=d.item;let det="";
-  if(i)det=`Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}<br>${esc(i.sku)} ${esc(i.cor)}`+
-    (i.nomes?`<br>Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"");
-  tela(d.tipo,d.msg,det);
-  clearTimeout(tOp);tOp=setTimeout(sairOp,20*60*1000);
+  if(i)det=`SKU <b>${esc(i.sku)}</b>${i.cor?" · "+esc(i.cor):""}`+
+    (i.nomes?`<br>Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"")+
+    `<br>Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}`;
+  tela(d.tipo,d.msg,det,d.evento,d.colaborador);
  }catch(e){tela("erro","Sem conexão","Verifique a internet e bipe de novo")}}
 // ---------- pausas (café) ----------
 let PAUSAS=[],ctx=null,tocadas={};
