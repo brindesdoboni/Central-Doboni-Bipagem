@@ -724,15 +724,16 @@ class H(BaseHTTPRequestHandler):
         if p == "/admin/reiniciar":
             with conn() as c:
                 por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
+                nt = c.execute("SELECT COUNT(*) FROM itens WHERE falta_material=1").fetchone()[0]
                 pode_voltar = c.execute("SELECT COUNT(DISTINCT item_id) FROM eventos WHERE desfeito=2").fetchone()[0]
             n = sum(por.get(k, 0) for k in ("SEPARADO", "EM_GRAVACAO", "EXPEDIDO"))
             h = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reiniciar bipagem</title>
 <body style="font:18px Arial;max-width:640px;margin:20px auto;padding:0 16px">
 <h2>Voltar tudo para AGUARDANDO</h2>
-<p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0)}</b> em gravação · <b>{por.get('EXPEDIDO',0)}</b> expedidos · {por.get('DEVOLVIDO',0)} devolvidos</p>
-<p>Os <b>{n}</b> separados, em gravação e expedidos voltam para <b>AGUARDANDO</b> para bipar tudo de novo. Devoluções e NÃO TEM ficam como estão.
+<p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0)}</b> em gravação · <b>{por.get('EXPEDIDO',0)}</b> expedidos · <b>{nt}</b> NÃO TEM · {por.get('DEVOLVIDO',0)} devolvidos</p>
+<p>Os <b>{n}</b> separados, em gravação e expedidos voltam para <b>AGUARDANDO</b> e os <b>{nt}</b> NÃO TEM são limpos, para bipar tudo de novo. Só as devoluções ficam como estão.
 O estoque não baixa duas vezes. Nada é apagado: dá para desfazer.</p>
-<p><button id=b style="font-size:20px;padding:12px 18px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0)">Voltar os {n} para AGUARDANDO</button></p>
+<p><button id=b style="font-size:20px;padding:12px 18px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0)">Limpar tudo e voltar para AGUARDANDO</button></p>
 {'<p><button style="font-size:16px;padding:10px 14px" onclick="go(1)">Desfazer o último reinício (' + str(pode_voltar) + ' itens)</button></p>' if pode_voltar else ''}
 <p id=m></p><p><a href="/painel">Voltar ao painel</a></p>
 <script>async function go(d){{if(!confirm(d?"Desfazer o reinício e voltar como estava?":"Voltar TUDO para AGUARDANDO?"))return;
@@ -1473,15 +1474,16 @@ def reiniciar_etapas(desfazer=False):
     """Volta TUDO que esta separado / em gravacao / expedido para AGUARDANDO, para refazer a bipagem do zero.
     Nao apaga nada: os bipes ficam marcados (desfeito=2) e da para desfazer o reinicio.
     O estoque nao baixa de novo: a etiqueta que ja deu baixa nao baixa outra vez nem conta como reservada.
-    Devolucoes e NAO TEM ficam como estao."""
+    Devolucoes ficam como estao; NAO TEM tambem e limpo."""
     with _lock, conn() as c:
         if desfazer:
             ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM eventos WHERE desfeito=2")]
             c.execute("UPDATE eventos SET desfeito=0 WHERE desfeito=2")
         else:
-            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','EXPEDIDO')")]
+            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','EXPEDIDO') OR falta_material=1")]
             for iid in ids:
-                c.execute("UPDATE eventos SET desfeito=2 WHERE item_id=? AND desfeito=0 AND etapa IN ('SEPARADO','GRAVACAO_INICIO','EXPEDIDO')", (iid,))
+                c.execute("""UPDATE eventos SET desfeito=2 WHERE item_id=? AND desfeito=0
+                             AND etapa IN ('SEPARADO','GRAVACAO_INICIO','EXPEDIDO','FALTA_MATERIAL')""", (iid,))
         for iid in ids:
             recalcular(c, iid)
         por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
