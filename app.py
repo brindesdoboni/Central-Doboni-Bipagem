@@ -291,7 +291,8 @@ def _bipar(posto, codigo, operador, modo):
                     "msg": f"Ola, {col['nome']}!", "evento": "operador", "colaborador": col["nome"]}
         op = c.execute("SELECT * FROM colaboradores WHERE codigo=? AND ativo=1", (norm(operador),)).fetchone()
         if not op:
-            return {"tipo": "erro", "msg": "Bipe o seu CRACHA primeiro."}
+            return {"tipo": "erro", "msg": "SEM OPERADOR: bipe o seu CRACHÁ primeiro",
+                    "fazer": "Bipe o seu CRACHÁ neste leitor e depois bipe a etiqueta de novo."}
         if cod == "CMDDESFAZER":
             ev = c.execute("""SELECT e.*, i.pedido FROM eventos e JOIN itens i ON i.id=e.item_id
                    WHERE colaborador_id=? AND posto=? AND desfeito=0 ORDER BY e.id DESC LIMIT 1""",
@@ -312,7 +313,8 @@ def _bipar(posto, codigo, operador, modo):
             c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
             itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
         if not itens:
-            return {"tipo": "erro", "msg": f"Codigo {codigo} nao encontrado em nenhum lote."}
+            return {"tipo": "erro", "msg": f"ETIQUETA NÃO ENCONTRADA ({codigo})",
+                    "fazer": "Separe esta etiqueta e leve para o Lucas incluir no painel (+ Incluir etiquetas). Depois bipe de novo."}
 
         def ev(it, etapa, alerta=""):
             c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
@@ -341,24 +343,33 @@ def _bipar(posto, codigo, operador, modo):
         if posto == "GRAVACAO":
             pers = [i for i in itens if i["personalizado"]]
             if not pers:
-                return {"tipo": "erro", "msg": "SEM PERSONALIZAR: não grava. Leve direto para a EXPEDIÇÃO", "item": dict(itens[0])}
+                return {"tipo": "erro", "msg": "NÃO GRAVAR: produto SEM PERSONALIZAR",
+                        "fazer": "Não grave. Leve direto para a EXPEDIÇÃO e bipe lá.", "item": dict(itens[0])}
+            # ordem obrigatoria: separacao -> gravacao -> expedicao
+            nsep = [i for i in pers if i["status"] == "AGUARDANDO"]
+            if nsep:
+                return {"tipo": "erro", "msg": "NÃO GRAVAR: ainda NÃO FOI SEPARADO",
+                        "fazer": "Leve para a SEPARAÇÃO e bipe lá primeiro. Depois volte e bipe aqui na GRAVAÇÃO.",
+                        "item": dict(nsep[0])}
             alvo = next((i for i in pers if ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]), None)
             if alvo:
-                alerta = "" if alvo["status"] == "SEPARADO" else "pulou separacao"
-                r = ev(alvo, "GRAVACAO_INICIO", alerta)
-                return {"tipo": "aviso" if alerta else "ok", "evento": "gravacao",
-                        "msg": "GRAVAÇÃO registrada  →  depois vai para a EXPEDIÇÃO" + (" (atenção: não foi separado)" if alerta else ""), "item": r}
+                r = ev(alvo, "GRAVACAO_INICIO")
+                return {"tipo": "ok", "evento": "gravacao", "msg": "GRAVAÇÃO registrada  →  depois vai para a EXPEDIÇÃO", "item": r}
             return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
+            nsep = [i for i in itens if i["status"] == "AGUARDANDO"]
+            if nsep:
+                pers_ns = any(i["personalizado"] for i in nsep)
+                return {"tipo": "erro", "msg": "NÃO DESPACHAR: ainda NÃO FOI SEPARADO",
+                        "fazer": ("Leve para a SEPARAÇÃO e bipe lá. Depois GRAVAÇÃO. Só depois volte para a EXPEDIÇÃO." if pers_ns else
+                                  "Leve para a SEPARAÇÃO e bipe lá. Depois volte e bipe aqui na EXPEDIÇÃO."),
+                        "item": dict(nsep[0])}
             falta = [i for i in itens if i["personalizado"] and ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]]
             if falta:
-                return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(falta)} item(ns) ainda nao gravado(s)!",
+                return {"tipo": "erro", "msg": "NÃO DESPACHAR: ainda NÃO FOI GRAVADO",
+                        "fazer": "Leve para a GRAVAÇÃO e bipe lá. Depois volte e bipe aqui na EXPEDIÇÃO.",
                         "item": dict(falta[0])}
-            nsep = [i for i in itens if not i["personalizado"] and i["status"] == "AGUARDANDO"]
-            if nsep:
-                return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(nsep)} item(ns) ainda nao separado(s)! Bipe na SEPARACAO primeiro.",
-                        "item": dict(nsep[0])}
             pend = [i for i in itens if i["status"] != "EXPEDIDO"]
             if not pend:
                 return {"tipo": "aviso", "msg": "Ja expedido.", "item": dict(itens[0])}
@@ -378,7 +389,7 @@ def _bipar(posto, codigo, operador, modo):
             msg = f"Devolucao registrada ({len(pend)} item(ns))"
             msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
             return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "evento": "devolucao", "item": r}
-        return {"tipo": "erro", "msg": "Posto invalido."}
+        return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição ou Devolução) e bipe de novo."}
 
 
 def ultimo_op(c, iid):
