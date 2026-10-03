@@ -285,8 +285,11 @@ def bipar(posto, codigo, operador, modo):
             it = itens[0]
             if it["falta_material"]:
                 return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}", "item": dict(it)}
-            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}",
-                    "item": ev(it, "FALTA_MATERIAL", "falta de material")}
+            r = ev(it, "FALTA_MATERIAL", "falta de material")
+            if r["status"] == "AGUARDANDO":
+                c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{it['id']}|%",))
+            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']} (quando chegar: bipar na SEPARACAO)",
+                    "item": r}
 
         if posto == "SEPARACAO":
             alvo = next((i for i in itens if ORDEM[i["status"]] < ORDEM["SEPARADO"]), None)
@@ -299,6 +302,9 @@ def bipar(posto, codigo, operador, modo):
             if not pers:
                 return {"tipo": "erro", "msg": "Este pedido NAO tem gravacao."}
             alvo = next((i for i in pers if ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]), None)
+            if alvo and alvo["falta_material"]:
+                return {"tipo": "erro", "msg": "EM FALTA (NAO TEM): quando o material chegar, bipe primeiro na SEPARACAO.",
+                        "item": dict(alvo)}
             if alvo:
                 alerta = "" if alvo["status"] == "SEPARADO" else "pulou separacao"
                 r = ev(alvo, "GRAVACAO_INICIO", alerta)
@@ -307,6 +313,10 @@ def bipar(posto, codigo, operador, modo):
             return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
+            emfalta = [i for i in itens if i["falta_material"] and i["status"] not in ("EXPEDIDO", "DEVOLVIDO")]
+            if emfalta:
+                return {"tipo": "erro", "msg": "EM FALTA (NAO TEM): quando o material chegar, bipe primeiro na SEPARACAO.",
+                        "item": dict(emfalta[0])}
             falta = [i for i in itens if i["personalizado"] and ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]]
             if falta:
                 return {"tipo": "erro", "msg": f"NAO DESPACHAR: {len(falta)} item(ns) ainda nao gravado(s)!",
@@ -353,7 +363,8 @@ def recalcular(c, iid):
     for e in c.execute("SELECT etapa FROM eventos WHERE item_id=? AND desfeito=0 ORDER BY id", (iid,)):
         et = e[0]
         if et == "FALTA_MATERIAL":
-            falta = 1
+            if st not in ("EXPEDIDO", "DEVOLVIDO"):
+                st, falta = "AGUARDANDO", 1  # NAO TEM: volta para o comeco - quando chegar, bipa de novo na SEPARACAO
         elif et == "SEPARADO":
             st, falta = "SEPARADO", 0
         elif et == "GRAVACAO_INICIO":
@@ -2071,7 +2082,7 @@ def ler_etiqueta_txt(t):
             if par:
                 cores.append(par[-1].split(",")[0].strip())
             I = it.upper()
-            pers.append("PERSONALIZ" in I and "SEM PERSONALIZ" not in I)
+            pers.append("SEM PERSONALIZ" not in I and bool(re.search(r"PERSONALIZ|PZD|APENAS NOME|COM NOME|NOME\s*\+", I)))
     if not skus:
         skus = [x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z][A-Za-z0-9._\-/]{1,40})", t, re.I)]
     cli = re.search(r"Customer:\s*(.+)", t)
@@ -2082,7 +2093,9 @@ def ler_etiqueta_txt(t):
         if ml:
             loja = ml.group(1).strip().upper()
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
-    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
+    # "DANFE SIMPLIFICADO - ETIQUETA\n1 - Saida" (nota da Shopee) NAO e a etiqueta numerada da gravacao
+    t_etq = re.sub(r"DANFE\s+SIMPLIFICADO\s*-?\s*ETIQUETA", "", t, flags=re.I)
+    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t_etq, re.I)
     if etq:
         personalizado = True  # etiqueta numerada da folha de gravacao = vai para a gravacao
     elif pers:
