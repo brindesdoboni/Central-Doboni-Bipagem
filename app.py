@@ -92,6 +92,13 @@ def iniciar_db():
             c.execute("ALTER TABLE pausas ADD COLUMN duracao INTEGER DEFAULT 15")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
         c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
+        # so 3 modos de envio: etiqueta manual com "Pedido 9998..." e TikTok; "OUTROS" vira o canal pelo numero
+        c.execute("""UPDATE itens SET canal='TIKTOK', envio='' WHERE lote='MANUAL' AND canal<>'TIKTOK'
+                     AND length(pedido)=15 AND pedido GLOB '9998[0-9]*'""")
+        for r in c.execute("SELECT id, pedido, rastreio FROM itens WHERE canal='OUTROS' OR canal=''").fetchall():
+            cn, en = canal_por_codigo(r[1], r[2])
+            if cn:
+                c.execute("UPDATE itens SET canal=?, envio=? WHERE id=?", (cn, en, r[0]))
         padrao = [("Cafe da manha", "09:15", "Rafael, Guilherme"), ("Cafe da manha", "09:30", "Yuri, Juninho"),
                   ("Cafe da tarde", "15:30", "Yuri, Juninho"), ("Cafe da tarde", "15:45", "Rafael, Guilherme")]
         if not c.execute("SELECT 1 FROM meta WHERE chave='pausas_v2'").fetchone():
@@ -112,11 +119,25 @@ def _envio_obs(obs):
     return m[-1].strip() if m else ""
 
 
-GRUPOS = ["SHOPEE ENTREGA RÁPIDA", "TIKTOK", "SHOPEE EXPRESS", "OUTROS"]
+GRUPOS = ["SHOPEE ENTREGA RÁPIDA", "TIKTOK", "SHOPEE EXPRESS"]  # so existem estes 3 modos de envio
+
+
+def canal_por_codigo(*cods):
+    """Descobre o canal pelo numero: TikTok = 18 digitos comecando com 5 ou 'Pedido: 9998...' (15 digitos);
+    Shopee = pedido 26xxxx + letras ou rastreio BR... (Express, a menos que a etiqueta diga Entrega Rapida)."""
+    for cod in cods:
+        c = norm(cod or "")
+        if re.fullmatch(r"5\d{17}", c) or re.fullmatch(r"9998\d{11}", c):
+            return "TIKTOK", ""
+    for cod in cods:
+        c = norm(cod or "")
+        if re.fullmatch(r"2\d{5}[0-9A-Z]{8}", c) or c.startswith("BR"):
+            return "SHOPEE", "SHOPEE XPRESS"
+    return "", ""
 
 
 def grupo_envio(i):
-    """Plataforma/forma de envio para a contagem do dia (lojas juntas)."""
+    """Plataforma/forma de envio para a contagem do dia (lojas juntas). Nunca 'OUTROS'."""
     t = " ".join([i.get("canal") or "", i.get("envio") or "", _envio_obs(i.get("obs"))]).upper()
     if "DIRETA" in t or "RAPIDA" in t or "RÁPIDA" in t:
         return "SHOPEE ENTREGA RÁPIDA"
@@ -124,7 +145,8 @@ def grupo_envio(i):
         return "TIKTOK"
     if "SHOPEE" in t or "SPX" in t or "XPRESS" in t:
         return "SHOPEE EXPRESS"  # Shopee que nao e entrega direta = Express
-    return "OUTROS"
+    c, _ = canal_por_codigo(i.get("pedido"), i.get("rastreio"))
+    return "TIKTOK" if c == "TIKTOK" else "SHOPEE EXPRESS"
 
 
 def por_grupo_status(itens, etapas):
@@ -148,16 +170,19 @@ def por_plataforma(itens):
             continue
         k = norm(i["pedido"]) or f"id{i['id']}"
         g = grupo_envio(i)
-        p = pedidos.setdefault(k, {"grupo": g, "pendente": False})
-        if g != "OUTROS":
-            p["grupo"] = g
+        p = pedidos.setdefault(k, {"grupo": g, "pendente": False, "pers": False})
+        p["grupo"] = g
         if i["status"] != "EXPEDIDO":
             p["pendente"] = True
-    res = {g: {"total": 0, "enviados": 0, "faltam": 0} for g in GRUPOS}
+        if i.get("personalizado"):
+            p["pers"] = True
+    res = {g: {"total": 0, "enviados": 0, "faltam": 0, "personalizados": 0, "sem_personalizar": 0} for g in GRUPOS}
     for p in pedidos.values():
         r = res[p["grupo"]]
         r["total"] += 1
         r["faltam" if p["pendente"] else "enviados"] += 1
+        if p["pendente"]:
+            r["personalizados" if p["pers"] else "sem_personalizar"] += 1
     return [dict(grupo=g, **res[g]) for g in GRUPOS if True]
 
 
@@ -856,6 +881,11 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             return self._envia(200, salvar_prateleiras(d.get("texto", "")))
         if p == "/api/estoque/status":
             return self._envia(200, marcar_sku(d.get("sku", ""), d.get("cor", ""), d.get("status", "")))
+        if p == "/api/admin/reprocessar-emails":
+            try:
+                return self._envia(200, reprocessar_emails(int(d.get("dias") or 2)))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/admin/reiniciar-etapas":
             return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
         if p == "/api/estoque/desfazer":
@@ -917,6 +947,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                     if c.execute("SELECT 1 FROM codigos WHERE codigo=?", (cod,)).fetchone():
                         return self._envia(200, {"ok": False, "erro": "ja cadastrada"})
             it = {k: d.get(k, "") for k in ("pedido", "rastreio", "canal", "envio", "loja", "sku", "cor", "fonte", "obs")}
+            if str(it["canal"]).upper() in ("", "OUTROS"):
+                it["canal"], it["envio"] = canal_por_codigo(it["pedido"], it["rastreio"]) or ("", "")
             it["nomes"] = [n.strip() for n in str(d.get("nomes", "")).split("|") if n.strip()]
             it["personalizado"] = bool(d.get("personalizado", True))
             it["seq"] = "M" + agora()
@@ -2143,14 +2175,12 @@ def ler_etiqueta_txt(t):
     if not ped:
         return None
     envio = ""
-    if tid or "TIKTOK" in T or "TIK TOK" in T:
-        canal = "TIKTOK"
+    if tid or erid.startswith("9998") or "TIKTOK" in T or "TIK TOK" in T:
+        canal = "TIKTOK"  # o arquivo "_tiktok" da automacao traz as etiquetas TikTok com "Pedido: 9998..."
     elif erid or re.search(r"ENTREGA\s+(DIRETA|R[AÁ]PIDA)", T):
         canal, envio = "SHOPEE", "ENTREGA DIRETA"
-    elif sn or ras or "DANFE" in T or "SHOPEE" in T or "SPX" in T:
-        canal, envio = "SHOPEE", "SHOPEE XPRESS"
     else:
-        canal = "OUTROS"
+        canal, envio = "SHOPEE", "SHOPEE XPRESS"
     # itens do pedido (rodape do UpSeller): "1. 18726I-Personalizado (Rosa Claro, Personalizado com Nome) / ..."
     rod = re.split(r"#UPPUS\d+[^\n]*\n", t, maxsplit=1)
     skus, cores, pers, pecas = [], [], [], []
@@ -2185,7 +2215,8 @@ def ler_etiqueta_txt(t):
         if ml:
             loja = ml.group(1).strip().upper()
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
-    etq = re.search(r"ETIQUETA\s*N?[ºo°.]?\s*(\d+)", t, re.I)
+    # so a linha "ETIQUETA 12" da folha de gravacao; nao confundir com "DANFE SIMPLIFICADO - ETIQUETA" + "1 - Saida"
+    etq = re.search(r"(?mi)^[ \t]*ETIQUETA[ \t]+N?[ºo°.]?[ \t]*(\d+)[ \t]*$", t)
     if etq:
         personalizado = True  # etiqueta numerada da folha de gravacao = vai para a gravacao
     elif pers:
@@ -2314,6 +2345,54 @@ def checar_email():
             im.logout()
         except Exception:
             pass
+
+
+def reprocessar_emails(dias=2):
+    """Le de novo os PDFs de etiquetas dos ultimos dias e corrige personalizado / numero da etiqueta / cor
+    das etiquetas que ja estao na Central (nao muda etapa, nao cria nada novo, nao mexe em estoque)."""
+    import imaplib, email
+    im = imaplib.IMAP4_SSL(EMAIL_IMAP)
+    corrigidos, lidos = 0, 0
+    try:
+        im.login(EMAIL_USUARIO, EMAIL_SENHA)
+        im.select("INBOX")
+        desde = (datetime.now(BR) - timedelta(days=dias)).strftime("%d-%b-%Y")
+        _, ids = im.uid("SEARCH", None, f'(SINCE "{desde}")')
+        for mid in ids[0].split():
+            _, dd = im.uid("FETCH", mid, "(BODY.PEEK[])")
+            if not dd or not isinstance(dd[0], tuple):
+                continue
+            msg = email.message_from_bytes(dd[0][1])
+            for parte in msg.walk():
+                nome = parte.get_filename() or ""
+                if parte.get_content_type() != "application/pdf" and not nome.lower().endswith(".pdf"):
+                    continue
+                try:
+                    itens, _ = itens_do_pdf(parte.get_payload(decode=True) or b"", nome)
+                except Exception:
+                    continue
+                with _lock, conn() as c:
+                    for it in itens:
+                        lidos += 1
+                        cods = [norm(x) for x in it.get("codigos") or [] if x]
+                        if not cods:
+                            continue
+                        r = c.execute(f"SELECT i.id, i.personalizado, i.etiqueta, i.cor, i.tipo FROM itens i JOIN codigos k ON k.item_id=i.id "
+                                      f"WHERE k.codigo IN ({','.join('?' * len(cods))}) LIMIT 1", cods).fetchone()
+                        if not r or r["tipo"]:  # tipo veio da folha de gravacao (mais confiavel): nao mexe
+                            continue
+                        pers = 1 if it["personalizado"] else 0
+                        cor = r["cor"] or it.get("cor") or ""
+                        if (r["personalizado"], r["etiqueta"], r["cor"]) != (pers, it.get("etiqueta"), cor):
+                            c.execute("UPDATE itens SET personalizado=?, etiqueta=?, cor=?, atualizado_em=? WHERE id=?",
+                                      (pers, it.get("etiqueta"), cor, agora(), r["id"]))
+                            corrigidos += 1
+    finally:
+        try:
+            im.logout()
+        except Exception:
+            pass
+    return {"ok": True, "lidos": lidos, "corrigidos": corrigidos}
 
 
 XBZ_EMAIL_USUARIO = os.environ.get("XBZ_EMAIL_USUARIO", "").strip()

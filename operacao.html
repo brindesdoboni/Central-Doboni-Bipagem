@@ -7,6 +7,8 @@ h1{margin:0;font-size:28px}#relogio{font-size:34px;font-weight:800;font-variant-
 main{flex:1;padding:22px 28px;display:grid;gap:20px;grid-template-rows:auto auto auto 1fr}
 .plats{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
 .pl{background:#1c1c21;border-radius:14px;padding:16px 20px;border-top:10px solid #555}.pl h3{margin:0 0 6px;font-size:24px;letter-spacing:.5px}.pl b{font-size:84px;line-height:1;font-variant-numeric:tabular-nums}.pl span{display:block;font-size:20px;color:#a1a1aa;margin-top:6px}.pl.ok b{color:#4ade80}
+.pl .lin{display:flex;align-items:center;gap:18px}.pl .tipos{display:flex;flex-direction:column;gap:6px;font-size:22px;font-weight:700}
+.pl .tipos i{font-style:normal;padding:4px 12px;border-radius:8px;white-space:nowrap}.pl .tipos .p{background:#3b1d5c;color:#e9d5ff}.pl .tipos .s{background:#1f3a2a;color:#bbf7d0}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
 .k{background:#1c1c21;border-radius:14px;padding:18px 20px}.k b{display:block;font-size:64px;line-height:1;font-variant-numeric:tabular-nums}.k span{font-size:20px;color:#a1a1aa}
 .bar{height:34px;background:#26262c;border-radius:10px;overflow:hidden;display:flex}
@@ -44,7 +46,7 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+`<td class="${v.FALTA?"nt":""}">${v.FALTA||0}</td></tr>`).join("");
 const CP={"SHOPEE ENTREGA RÁPIDA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
- $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><b>${p.total&&!p.faltam?"✓":p.faltam}</b><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
+ $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><div class="lin"><b>${p.total&&!p.faltam?"✓":p.faltam}</b>${p.faltam?`<div class="tipos"><i class="p">✏️ ${p.personalizados||0} personalizados</i><i class="s">📦 ${p.sem_personalizar||0} sem personalizar</i></div>`:""}</div><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
 }catch(e){}}
 // café
