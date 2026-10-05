@@ -182,8 +182,10 @@ function usar(i){$("oqTxt").value=$("oqW"+i).value;$("msg").textContent="Texto t
 let TIRAR=null;
 function tirar(tipo,rotulo){TIRAR={tipo,rotulo};const inp=$(tipo=="video"?"arqVideo":"arqFoto");inp.value="";inp.click()}
 async function reduzir(file){const img=await new Promise((ok,er)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=er;i.src=URL.createObjectURL(file)});
-  const m=1600,e=Math.min(1,m/Math.max(img.width,img.height)),c=document.createElement("canvas");c.width=Math.round(img.width*e);c.height=Math.round(img.height*e);
-  c.getContext("2d").drawImage(img,0,0,c.width,c.height);return await new Promise(ok=>c.toBlob(ok,"image/jpeg",.85))}
+  let blob=null;for(const m of [1280,1024,800,640])for(const q of [.8,.7,.6,.5]){const e=Math.min(1,m/Math.max(img.width,img.height)),c=document.createElement("canvas");
+    c.width=Math.round(img.width*e);c.height=Math.round(img.height*e);c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+    blob=await new Promise(ok=>c.toBlob(ok,"image/jpeg",q));if(blob&&blob.size<=180*1024)return blob}
+  return blob}
 function subir(blob,tipo,rotulo,ext){return new Promise((ok,er)=>{const x=new XMLHttpRequest();
   x.open("POST",`/api/devolucoes/midia?id=${OQ.id}&tipo=${tipo}&ext=${ext}&rotulo=${encodeURIComponent(rotulo)}`);x.setRequestHeader("X-Chave",chave());
   const b=$("barra");if(tipo=="video"&&b){b.style.display="block";x.upload.onprogress=e=>{if(e.lengthComputable)b.firstChild.style.width=(100*e.loaded/e.total)+"%"}}

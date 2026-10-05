@@ -281,8 +281,79 @@ def importar_lote(dados):
                 if norm(cod):
                     c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (norm(cod), iid))
             tocados.append(iid)
+        corr = _corrigir_personalizados(c, list(dict.fromkeys(tocados)))
         sem = sum(checar_falta(c, iid) for iid in dict.fromkeys(tocados))
-    return {"ok": True, "lote": lote, "novos": n_novo, "atualizados": n_atual, "sem_estoque": sem}
+    return {"ok": True, "lote": lote, "novos": n_novo, "atualizados": n_atual, "sem_estoque": sem,
+            "virou_personalizado": len(corr)}
+
+
+# ---- "sem personalizacao" por engano: etiqueta de pedido personalizado sem o nome (ex.: "BUSCAR NOME NO CHAT")
+# vinha marcada como nao personalizada e pulava a gravacao. Aqui so se CORRIGE para personalizado quando ha prova.
+SKUS_SEMPRE_PERS = {"7447"}
+_RX_SEM_PERS = re.compile(r"SEM\s+PERSONALIZ|N[AÃ]O\s+PERSONALIZ|SEM\s+GRAVA", re.I)
+_RX_PEDE_NOME = re.compile(r"BUSCAR\s+NOME|NOME\s+NO\s+CHAT|SEM\s+NOME\s+NA\s+NOTA|CHAT\b.{0,30}N[AÃ]O\s+ABRIU|FALTA\s+(O\s+)?NOME", re.I)
+
+
+def _texto_personalizado(t):
+    t = t or ""
+    return bool(re.search(r"PERSONALIZ", t, re.I)) and not _RX_SEM_PERS.search(t)
+
+
+def _prova_personalizado(c, it):
+    """Motivo (texto) se ha prova de que a etiqueta e de produto personalizado; '' se nao ha."""
+    if _RX_PEDE_NOME.search(it["obs"] or ""):
+        return "etiqueta pede o nome (" + _RX_PEDE_NOME.search(it["obs"]).group(0).lower() + ")"
+    if (it["nomes"] or "").strip():
+        return "tem nome para gravar"
+    skus = re.findall(r"[0-9A-Z]+", (it["sku"] or "").upper())
+    if any(s in SKUS_SEMPRE_PERS for s in skus):
+        return "SKU sempre personalizado"
+    sp = c.execute("SELECT itens FROM shopee_pedidos WHERE order_sn=?", (norm(it["pedido"]),)).fetchone()
+    if sp:
+        for x in json.loads(sp[0] or "[]"):
+            t = f"{x.get('sku', '')} {x.get('var', '')}"   # so SKU/variacao (o titulo do anuncio diz "personalizada" ate no liso)
+            if _texto_personalizado(t):
+                return f"Shopee: variacao '{t.strip()[:60]}'"
+    return ""
+
+
+def _corrigir_personalizados(c, ids=None, dias=30):
+    """Marca como personalizado o que tem prova; guarda a lista do que foi corrigido (para conferir)."""
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    q = "SELECT * FROM itens WHERE personalizado=0 AND COALESCE(criado_em,'')>=?"
+    args = [desde]
+    if ids is not None:
+        if not ids:
+            return []
+        q += f" AND id IN ({','.join('?' * len(ids))})"
+        args += list(ids)
+    feitos = []
+    for it in c.execute(q, args).fetchall():
+        motivo = _prova_personalizado(c, it)
+        if not motivo:
+            continue
+        c.execute("UPDATE itens SET personalizado=1, atualizado_em=? WHERE id=?", (agora(), it["id"]))
+        feitos.append({"id": it["id"], "pedido": it["pedido"], "loja": it["loja"] or it["canal"], "sku": it["sku"],
+                       "cor": it["cor"], "etiqueta": it["etiqueta"], "status": it["status"], "motivo": motivo, "em": agora()})
+    if feitos:
+        r = c.execute("SELECT valor FROM meta WHERE chave='pers_corrigidos'").fetchone()
+        ids_novos = {f["id"] for f in feitos}
+        lst = [x for x in (json.loads(r[0]) if r and r[0] else []) if x.get("id") not in ids_novos] + feitos
+        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('pers_corrigidos', ?)", (json.dumps(lst[-500:], ensure_ascii=False),))
+        print(f"Personalizado corrigido em {len(feitos)} etiqueta(s): " + ", ".join(f["pedido"] for f in feitos[:20]), flush=True)
+    return feitos
+
+
+def corrigir_personalizados_todos(dias=30):
+    with _lock, conn() as c:
+        return _corrigir_personalizados(c, None, dias)
+
+
+def personalizados_corrigidos():
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='pers_corrigidos'").fetchone()
+    lst = json.loads(r[0]) if r and r[0] else []
+    return {"ok": True, "total": len(lst), "itens": lst[::-1]}
 
 
 # ------------------------------------------------------------------ bipe
@@ -1226,7 +1297,9 @@ def _shopee_multipart(path, campos, arquivos, loja=None):
         try:
             res = json.loads(e.read() or b"{}")
         except Exception:
-            res = {"error": f"http {e.code}"}
+            res = {}
+        if not res.get("error"):
+            res = {"error": f"http {e.code}", "message": res.get("message", "")}
     if res.get("error"):
         raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
     return res
@@ -1287,17 +1360,57 @@ def _urls_em(x):
     return []
 
 
+FOTO_ALVO = int(os.environ.get("FOTO_ALVO_KB", "180")) * 1024   # a Shopee recusa (HTTP 413) foto grande
+
+
+def _foto_menor(dados, lado=1280, alvo=FOTO_ALVO):
+    """Recomprime a foto (JPEG) ate ficar abaixo do alvo. Sem Pillow devolve como esta."""
+    try:
+        from PIL import Image, ImageOps
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(dados)))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+    except Exception:
+        return dados
+    melhor = dados
+    for lado_ in (lado, 1024, 900, 800, 700, 600, 500):
+        if lado_ > lado:
+            continue
+        x = im.copy()
+        x.thumbnail((lado_, lado_))
+        for q in (85, 75, 65, 55):
+            b = io.BytesIO()
+            x.save(b, "JPEG", quality=q, optimize=True)
+            if len(b.getvalue()) < len(melhor):
+                melhor = b.getvalue()
+            if len(melhor) <= alvo:
+                return melhor
+    return melhor
+
+
 def _dev_converter_foto(loja, nome, dados):
     """Sobe a foto para a Shopee (returns/convert_image) e devolve a URL. A Shopee nao documenta bem o nome do campo
-    do arquivo: tenta os nomes conhecidos e guarda o que funcionou."""
+    do arquivo: tenta os nomes conhecidos e guarda o que funcionou. Foto grande e diminuida antes (e de novo se der 413)."""
+    if len(dados) > FOTO_ALVO:
+        dados = _foto_menor(dados)
+    nome = re.sub(r"\.[a-z0-9]+$", "", nome, flags=re.I) + ".jpg"
     nomes = [_CAMPO_FOTO["nome"]] if _CAMPO_FOTO["nome"] else ["upload_image", "image", "images", "file", "upload_images"]
-    ult = ""
-    for campo in nomes:
+    ult, lado = "", 1024
+    i = 0
+    while i < len(nomes):
+        campo = nomes[i]
         try:
             res = _shopee_multipart("/api/v2/returns/convert_image", {}, [(campo, nome, dados, "image/jpeg")], loja=loja)
         except Exception as e:
             ult = str(e)
+            if "413" in ult:
+                menor = _foto_menor(dados, lado, alvo=len(dados) * 6 // 10)
+                if lado >= 500 and len(menor) < len(dados):
+                    dados, lado = menor, lado - 200
+                    continue          # mesma tentativa com a foto menor
+                raise RuntimeError(f"foto grande demais para a Shopee ({len(dados) // 1024} KB): apague e tire de novo")
             if "no such file" in ult or "param" in ult.lower():
+                i += 1
                 continue
             raise RuntimeError(f"foto: {ult}")
         us = _urls_em(res.get("response") or res)
@@ -1305,6 +1418,7 @@ def _dev_converter_foto(loja, nome, dados):
             _CAMPO_FOTO["nome"] = campo
             return us[0]
         ult = "resposta sem URL: " + json.dumps(res)[:150]
+        i += 1
     raise RuntimeError(f"foto nao subiu ({ult[:150]})")
 
 
@@ -1583,6 +1697,20 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not r["ok"]:
                 return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
             return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/personalizados/corrigidos":
+            return self._envia(200, personalizados_corrigidos())
+        if p == "/personalizados/corrigidos":
+            from html import escape as _e
+            d = personalizados_corrigidos()
+            linhas = "".join(f"<tr><td>{_e(str(x.get('em',''))[:16].replace('T',' '))}</td><td>{_e(str(x['pedido']))}</td><td>{_e(str(x.get('loja') or ''))}</td>"
+                             f"<td>{_e(str(x.get('sku') or ''))} {_e(str(x.get('cor') or ''))}</td><td>{x.get('etiqueta') or ''}</td>"
+                             f"<td>{_e(str(x.get('status') or ''))}</td><td>{_e(x['motivo'])}</td></tr>" for x in d["itens"])
+            return self._envia(200, "<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                               "<style>body{font:15px Arial;margin:12px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:5px;text-align:left}</style>"
+                               f"<h2>Etiquetas corrigidas para PERSONALIZADO ({d['total']})</h2>"
+                               "<p>Estavam como sem personalização, mas a etiqueta/pedido mostra que são personalizadas. Agora passam pela gravação.</p>"
+                               f"<table><tr><th>Quando</th><th>Pedido</th><th>Loja</th><th>SKU/cor</th><th>Etq</th><th>Etapa (na hora)</th><th>Prova</th></tr>{linhas}</table>",
+                               "text/html; charset=utf-8")
         if p == "/api/shopee/pedidos":
             return self._envia(200, shopee_pedidos_resumo())
         if p == "/shopee/pedidos":
@@ -3149,8 +3277,8 @@ def ler_etiqueta_txt(t):
     fl = next((ln for ln in t.splitlines() if re.match(r"\s*Fonte\s*[:\-]", ln, re.I)), "")
     # so a linha "ETIQUETA 12" da folha de gravacao; nao confundir com "DANFE SIMPLIFICADO - ETIQUETA" + "1 - Saida"
     etq = re.search(r"(?mi)^[ \t]*ETIQUETA[ \t]+N?[ºo°.]?[ \t]*(\d+)[ \t]*$", t)
-    if etq:
-        personalizado = True  # etiqueta numerada da folha de gravacao = vai para a gravacao
+    if etq or _RX_PEDE_NOME.search(t):
+        personalizado = True  # etiqueta numerada da folha de gravacao / "BUSCAR NOME NO CHAT" = vai para a gravacao
     elif pers:
         personalizado = any(pers)
     else:
@@ -3447,7 +3575,9 @@ def _shopee_http(metodo, path, params=None, corpo=None, loja=None):
         try:
             res = json.loads(e.read() or b"{}")
         except Exception:
-            res = {"error": f"http {e.code}"}
+            res = {}
+        if not res.get("error"):
+            res = {"error": f"http {e.code}", "message": res.get("message", "")}
     if res.get("error"):
         raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
     return res
@@ -3691,6 +3821,10 @@ def shopee_sincronizar(shop_id, dias_iniciais=3):
                                    "response_optional_fields": "item_list,shipping_carrier,cancel_reason"})
         det += (res.get("response") or {}).get("order_list") or []
     _shopee_salvar_pedidos(shop_id, loja.get("nome") or str(shop_id), det)
+    try:
+        corrigir_personalizados_todos()
+    except Exception as e:
+        print("corrigir personalizados:", e, flush=True)
     est = _shopee_estoque(det)
     with _lock, conn() as c:
         c.execute("INSERT INTO meta(chave, valor) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
@@ -4089,6 +4223,10 @@ if __name__ == "__main__":
             print(f"Estoque: saldo inicial carregado ({n} produtos/cores)", flush=True)
     except Exception as e:
         print("Estoque: erro no saldo inicial:", e, flush=True)
+    try:
+        corrigir_personalizados_todos()
+    except Exception as e:
+        print("corrigir personalizados:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
