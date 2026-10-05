@@ -76,6 +76,10 @@ def iniciar_db():
                      refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
                      expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
+        c.execute("""CREATE TABLE IF NOT EXISTS shopee_pedidos(order_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
+            status TEXT, criado INTEGER, atualizado INTEGER, prazo INTEGER, envio TEXT, msg TEXT, itens TEXT,
+            motivo TEXT, visto_em TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_sp_status ON shopee_pedidos(status)")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             tipo TEXT, detalhe TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
@@ -315,6 +319,17 @@ def _bipar(posto, codigo, operador, modo):
         if not itens:
             return {"tipo": "erro", "msg": f"ETIQUETA NÃO ENCONTRADA ({codigo})",
                     "fazer": "Separe esta etiqueta e leve para o Lucas incluir no painel (+ Incluir etiquetas). Depois bipe de novo."}
+
+        if posto in ("SEPARACAO", "GRAVACAO", "EXPEDICAO") and modo != "FALTA":
+            canc = _shopee_cancelado(c, [i["id"] for i in itens])
+            if canc:
+                if canc["status"] == "IN_CANCEL":
+                    return {"tipo": "erro", "msg": "PEDIDO EM CANCELAMENTO NA SHOPEE — NÃO ENVIAR",
+                            "fazer": "O cliente pediu para cancelar. Não separe, não grave e não despache. "
+                                     "Separe esta etiqueta e entregue ao Lucas.", "item": dict(itens[0])}
+                return {"tipo": "erro", "msg": "PEDIDO CANCELADO NA SHOPEE — NÃO ENVIAR",
+                        "fazer": "Não separe, não grave e não despache. Separe esta etiqueta e entregue ao Lucas. "
+                                 "O produto volta para a prateleira.", "item": dict(itens[0])}
 
         def ev(it, etapa, alerta=""):
             c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
@@ -793,6 +808,10 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not r["ok"]:
                 return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
             return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/shopee/pedidos":
+            return self._envia(200, shopee_pedidos_resumo())
+        if p == "/shopee/pedidos":
+            return self._pagina("shopee.html")
         if p == "/api/shopee/testar":
             try:
                 return self._envia(200, shopee_testar(q.get("shop_id", "0")))
@@ -897,10 +916,16 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, reprocessar_emails(int(d.get("dias") or 2)))
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/shopee/sincronizar":
+            if not self._admin():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, {"ok": True, "lojas": shopee_sincronizar_todas()})
         if p == "/api/admin/reiniciar-etapas":
             return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
         if p == "/api/estoque/desfazer":
             return self._envia(200, desfazer_contagem(d.get("ref")))
+        if p == "/api/estoque/baixa":
+            return self._envia(200, baixa_manual(d.get("sku"), d.get("cor"), d.get("qtd"), d.get("motivo")))
         if p == "/api/estoque/movimento":
             return self._envia(200, movimento_manual(str(d.get("texto") or "").splitlines()))
         if p == "/api/estoque/distribuir":
@@ -1533,11 +1558,21 @@ def reiniciar_etapas(desfazer=False):
     return {"ok": True, "itens": len(ids), "agora": por}
 
 
+def _ids_cancelados(c):
+    """Etiquetas de pedidos cancelados na Shopee: nao vao sair da prateleira, entao nao ficam reservadas."""
+    try:
+        return {r[0] for r in c.execute("""SELECT k.item_id FROM codigos k JOIN shopee_pedidos s ON s.order_sn=k.codigo
+                                           WHERE s.status='CANCELLED'""")}
+    except Exception:
+        return set()
+
+
 def _reservado(c, sku, cn, nivel, antes_de):
     """Unidades de etiquetas que entraram antes desta e ainda nao foram separadas (vao sair da prateleira)."""
     tot = 0
+    canc = _ids_cancelados(c)
     for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO'", (antes_de,)):
-        if _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
+        if i["id"] in canc or _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
             continue
         for s_, c_, q in _pecas_do_item(dict(i)):
             k = estoque_chave(s_, c_)
@@ -1549,7 +1584,8 @@ def _reservado(c, sku, cn, nivel, antes_de):
 def checar_falta(c, iid):
     """Etiqueta nova: se o que tem na prateleira (menos o que ja esta reservado) nao cobre, marca NAO TEM sozinho."""
     r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
-    if not r or r["lote"] == "DEVOLUCAO" or r["status"] != "AGUARDANDO" or r["falta_material"] or _ja_no_snapshot(c, dict(r)):
+    if not r or r["lote"] == "DEVOLUCAO" or r["status"] != "AGUARDANDO" or r["falta_material"] or _ja_no_snapshot(c, dict(r)) \
+            or iid in _ids_cancelados(c):
         return 0
     falta = False
     for sku, cor, qtd in _pecas_do_item(dict(r)):
@@ -1611,12 +1647,12 @@ def marcar_sku(sku, cor, status):
 
 
 def desfazer_contagem(ref):
-    """Volta uma contagem confirmada: apaga aquele lancamento, o saldo volta a ser o de antes (somando o que mexeu depois)."""
+    """Volta uma contagem ou baixa manual confirmada: apaga aquele lancamento (o saldo soma o que mexeu depois)."""
     with _lock, conn() as c:
-        r = c.execute("SELECT sku, cor FROM estoque_mov WHERE ref=? AND tipo='CONTAGEM'", (ref or "",)).fetchone()
+        r = c.execute("SELECT sku, cor FROM estoque_mov WHERE ref=? AND tipo IN ('CONTAGEM','AJUSTE')", (ref or "",)).fetchone()
         if not r:
             return {"ok": False, "erro": "ja desfeita ou nao encontrada"}
-        c.execute("DELETE FROM estoque_mov WHERE ref=? AND tipo='CONTAGEM'", (ref,))
+        c.execute("DELETE FROM estoque_mov WHERE ref=? AND tipo IN ('CONTAGEM','AJUSTE')", (ref,))
         saldo = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (r[0], r[1])).fetchone()[0]
     return {"ok": True, "sku": r[0], "cor": r[1], "saldo": saldo}
 
@@ -1640,6 +1676,33 @@ def movimento_manual(linhas):
                        "acrescentar" if q > 0 else "baixar"))
             feitos.append({"sku": sku, "cor": cor or "-", "antes": antes, "mov": q, "depois": antes + q})
     return {"ok": True, "feitos": feitos, "erros": erros}
+
+
+def baixa_manual(sku, cor, qtd, motivo=""):
+    """Tira do estoque na mao (brinde, quebra, venda fora da plataforma...). So aceita SKU/cor que o estoque conhece,
+    para um erro de digitacao nao criar produto fantasma. Devolve a ref para o Voltar."""
+    try:
+        q = int(str(qtd).strip())
+    except Exception:
+        return {"ok": False, "erro": "quantidade invalida"}
+    if q <= 0 or q > 100000:
+        return {"ok": False, "erro": "quantidade invalida"}
+    cor = "" if (cor or "").strip().upper() in ("", "PADRAO") else cor
+    sku, cn = estoque_chave(sku, cor)
+    if not sku:
+        return {"ok": False, "erro": "informe o SKU"}
+    motivo = re.sub(r"\s+", " ", str(motivo or "")).strip()[:80] or "sem motivo"
+    with _lock, conn() as c:
+        if not c.execute("SELECT 1 FROM estoque_mov WHERE sku=? AND cor=? LIMIT 1", (sku, cn)).fetchone():
+            cores = [r[0] or "PADRAO" for r in c.execute("SELECT DISTINCT cor FROM estoque_mov WHERE sku=? ORDER BY cor", (sku,))]
+            return {"ok": False, "erro": (f"{sku} nao tem a cor '{cn or 'PADRAO'}'. Cores: " + ", ".join(cores)) if cores
+                    else f"SKU {sku} nao existe no estoque (confira a digitacao)"}
+        antes = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cn)).fetchone()[0]
+        ref = f"AJ|{sku}|{cn}|{agora()}|{secrets.token_hex(3)}"
+        c.execute("INSERT INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                  (agora(), sku, cn, -q, "AJUSTE", ref, "baixa manual: " + motivo))
+    return {"ok": True, "ref": ref, "sku": sku, "cor": cn or "PADRAO", "qtd": q, "antes": antes, "depois": antes - q,
+            "motivo": motivo}
 
 
 def salvar_prateleiras(texto):
@@ -1827,17 +1890,18 @@ def estoque():
     with conn() as c:
         linhas = {}
         for r in c.execute("""SELECT sku, cor, SUM(qtd) saldo,
-                 -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s7,
-                 -SUM(CASE WHEN tipo='ETIQUETA' AND em>=? THEN qtd ELSE 0 END) s15,
+                 -SUM(CASE WHEN tipo IN ('ETIQUETA','CANCELADO') AND em>=? THEN qtd ELSE 0 END) s7,
+                 -SUM(CASE WHEN tipo IN ('ETIQUETA','CANCELADO') AND em>=? THEN qtd ELSE 0 END) s15,
                  MAX(CASE WHEN tipo='CONTAGEM' THEN em END) contado,
                  SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF','AJUSTE') THEN 1 ELSE 0 END) conhecido,
                  SUM(CASE WHEN tipo='ENTRADA_NF' AND em>=? THEN qtd ELSE 0 END) e15
                  FROM estoque_mov GROUP BY sku, cor""", (d7, d15, d15)):
             linhas[(r["sku"], r["cor"])] = dict(r)
         pend = {}
+        canc = _ids_cancelados(c)
         # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
         for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO'"):
-            if _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
+            if i["id"] in canc or _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
                 continue
             for sku, cor, q in _pecas_do_item(dict(i)):
                 k = estoque_chave(sku, cor)
@@ -2625,6 +2689,10 @@ def _shopee_loop():
                             c.execute("UPDATE shopee_lojas SET erro=? WHERE shop_id=?", (str(e)[:200], l["shop_id"]))
         except Exception as e:
             _shopee_status["ultimo_erro"] = str(e)[:200]
+        try:
+            shopee_sincronizar_todas()
+        except Exception as e:
+            _shopee_status["ultimo_erro"] = str(e)[:200]
         time.sleep(600)
 
 
@@ -2643,6 +2711,180 @@ def shopee_testar(shop_id):
     r = res.get("response") or {}
     n = len(r.get("order_list") or [])
     return {"ok": True, "loja": loja["nome"], "pedidos_24h": f"{n}{'+' if r.get('more') else ''}"}
+
+
+# ---------------- pedidos da Shopee (SO LEITURA: nada e alterado na loja)
+SHOPEE_CANCEL = ("CANCELLED", "IN_CANCEL")
+SHOPEE_STATUS_PT = {"UNPAID": "Aguardando pagamento", "READY_TO_SHIP": "A enviar", "PROCESSED": "Etiqueta gerada",
+                    "SHIPPED": "Enviado", "TO_CONFIRM_RECEIVE": "Enviado", "COMPLETED": "Concluído",
+                    "IN_CANCEL": "EM CANCELAMENTO", "CANCELLED": "CANCELADO", "TO_RETURN": "Devolução",
+                    "INVOICE_PENDING": "Aguardando NF"}
+_shopee_sync = {}
+
+
+def _shopee_cancelado(c, item_ids):
+    """Se alguma etiqueta bipada for de pedido cancelado (ou em cancelamento) na Shopee, devolve o pedido."""
+    if not item_ids:
+        return None
+    q = ",".join("?" * len(item_ids))
+    r = c.execute(f"""SELECT order_sn, status FROM shopee_pedidos WHERE status IN ('CANCELLED','IN_CANCEL') AND order_sn IN
+                      (SELECT codigo FROM codigos WHERE item_id IN ({q}) UNION SELECT pedido FROM itens WHERE id IN ({q}))""",
+                  list(item_ids) * 2).fetchone()
+    return dict(r) if r else None
+
+
+def _shopee_token_ok(shop_id):
+    import time
+    loja = _shopee_loja(shop_id)
+    if loja and loja["expira"] - time.time() < 300:
+        shopee_renovar(shop_id)
+        loja = _shopee_loja(shop_id)
+    return loja
+
+
+def _shopee_salvar_pedidos(shop_id, nome, detalhes):
+    with _lock, conn() as c:
+        for o in detalhes:
+            sn = norm(o.get("order_sn"))
+            if not sn:
+                continue
+            itens = [{"sku": (i.get("model_sku") or i.get("item_sku") or "").strip(), "nome": (i.get("item_name") or "")[:80],
+                      "var": (i.get("model_name") or "")[:60], "qtd": int(i.get("model_quantity_purchased") or 1)}
+                     for i in (o.get("item_list") or [])]
+            c.execute("""INSERT INTO shopee_pedidos(order_sn, shop_id, loja, status, criado, atualizado, prazo, envio, msg, itens, motivo, visto_em)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET status=excluded.status,
+                         atualizado=excluded.atualizado, prazo=excluded.prazo, envio=excluded.envio, msg=excluded.msg,
+                         itens=excluded.itens, motivo=excluded.motivo, loja=excluded.loja, visto_em=excluded.visto_em""",
+                      (sn, int(shop_id), nome, o.get("order_status") or "", int(o.get("create_time") or 0),
+                       int(o.get("update_time") or 0), int(o.get("ship_by_date") or 0), o.get("shipping_carrier") or "",
+                       (o.get("message_to_seller") or "").strip()[:500], json.dumps(itens, ensure_ascii=False),
+                       (o.get("cancel_reason") or "")[:120], agora()))
+
+
+SHOPEE_SAIU = ("SHIPPED", "TO_CONFIRM_RECEIVE", "COMPLETED")
+
+
+def _shopee_estoque(detalhes):
+    """Rede de seguranca do estoque com o que a Shopee informa:
+    - pedido ENVIADO cuja etiqueta nunca foi bipada: da baixa (o material saiu e ninguem bipou);
+    - pedido CANCELADO que ja tinha dado baixa e ainda nao foi gravado nem despachado: o produto volta para a prateleira.
+    Gravado (personalizado) nao volta: a peca ja foi gravada. Cada etiqueta so mexe uma vez (ref unica)."""
+    feitos = {"baixa_enviado": 0, "volta_cancelado": 0}
+    with _lock, conn() as c:
+        for o in detalhes:
+            sn, st = norm(o.get("order_sn")), o.get("order_status") or ""
+            if st not in SHOPEE_SAIU and st != "CANCELLED":
+                continue
+            ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM codigos WHERE codigo=?", (sn,))]
+            for iid in ids:
+                it = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
+                if not it or it["lote"] == "DEVOLUCAO":
+                    continue
+                if st in SHOPEE_SAIU:
+                    if not _ja_baixado(c, iid) and it["status"] != "DEVOLVIDO":
+                        baixar_estoque(c, iid)
+                        feitos["baixa_enviado"] += _ja_baixado(c, iid)
+                    continue
+                if it["status"] in ("EXPEDIDO", "DEVOLVIDO", "EM_GRAVACAO"):
+                    continue
+                for m in c.execute("SELECT * FROM estoque_mov WHERE ref LIKE ? AND tipo='ETIQUETA'", (f"ETQ|{iid}|%",)).fetchall():
+                    cur = c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                                    (agora(), m["sku"], m["cor"], -m["qtd"], "CANCELADO", "CANC|" + m["ref"],
+                                     f"pedido {it['pedido']} cancelado na Shopee: volta para a prateleira"))
+                    feitos["volta_cancelado"] += cur.rowcount
+    return feitos
+
+
+def shopee_sincronizar(shop_id, dias_iniciais=3):
+    """Le os pedidos alterados desde a ultima leitura (status, prazo de postagem, envio, mensagem do comprador).
+    So usa get_order_list / get_order_detail: nenhuma alteracao e feita na Shopee."""
+    import time
+    loja = _shopee_token_ok(shop_id)
+    if not loja:
+        return {"ok": False, "erro": "loja nao autorizada"}
+    chave = f"shopee_sync_{int(shop_id)}"
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave=?", (chave,)).fetchone()
+    agora_s = int(time.time())
+    ini = int(r[0]) - 900 if r and str(r[0]).isdigit() else agora_s - dias_iniciais * 86400
+    sns = []
+    t0 = ini
+    while t0 < agora_s:  # a Shopee aceita no maximo 15 dias por consulta
+        t1 = min(t0 + 15 * 86400 - 60, agora_s)
+        cursor = ""
+        for _ in range(100):
+            res = _shopee_http("GET", "/api/v2/order/get_order_list", loja=loja,
+                               params={"time_range_field": "update_time", "time_from": t0, "time_to": t1,
+                                       "page_size": 100, "cursor": cursor})
+            rr = res.get("response") or {}
+            sns += [o["order_sn"] for o in (rr.get("order_list") or []) if o.get("order_sn")]
+            if not rr.get("more"):
+                break
+            cursor = rr.get("next_cursor") or ""
+        t0 = t1
+    sns = list(dict.fromkeys(sns))
+    det = []
+    for k in range(0, len(sns), 50):
+        res = _shopee_http("GET", "/api/v2/order/get_order_detail", loja=loja,
+                           params={"order_sn_list": ",".join(sns[k:k + 50]),
+                                   "response_optional_fields": "item_list,shipping_carrier,cancel_reason"})
+        det += (res.get("response") or {}).get("order_list") or []
+    _shopee_salvar_pedidos(shop_id, loja.get("nome") or str(shop_id), det)
+    est = _shopee_estoque(det)
+    with _lock, conn() as c:
+        c.execute("INSERT INTO meta(chave, valor) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
+                  (chave, str(agora_s)))
+    _shopee_sync[int(shop_id)] = {"em": datetime.now(BR).strftime("%d/%m %H:%M"), "pedidos": len(det), "erro": "", **est}
+    return {"ok": True, "loja": loja.get("nome"), "pedidos": len(det), **est}
+
+
+def shopee_sincronizar_todas():
+    with conn() as c:
+        ids = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas")]
+    out = []
+    for sid in ids:
+        try:
+            out.append(shopee_sincronizar(sid))
+        except Exception as e:
+            _shopee_sync[int(sid)] = {"em": datetime.now(BR).strftime("%d/%m %H:%M"), "pedidos": 0, "erro": str(e)[:200]}
+            out.append({"ok": False, "shop_id": sid, "erro": str(e)[:200]})
+    return out
+
+
+def shopee_pedidos_resumo():
+    """Para a pagina /shopee/pedidos: cancelados que estao na Central, prazos de postagem e mensagens dos compradores."""
+    import time
+    hoje_fim = int(datetime.now(BR).replace(hour=23, minute=59, second=59).timestamp())
+    with conn() as c:
+        peds = [dict(r) for r in c.execute("""SELECT * FROM shopee_pedidos WHERE criado > ? OR status IN
+                 ('READY_TO_SHIP','PROCESSED','IN_CANCEL','UNPAID','INVOICE_PENDING') ORDER BY prazo""",
+                 (int(time.time()) - 15 * 86400,))]
+        cent = {}
+        if peds:
+            for r in c.execute(f"""SELECT k.codigo, i.status, i.etiqueta FROM codigos k JOIN itens i ON i.id=k.item_id
+                                   WHERE k.codigo IN ({",".join("?" * len(peds))})""", [p["order_sn"] for p in peds]):
+                cent.setdefault(r[0], []).append(r[1])
+    out = {"cancelados": [], "prazo": [], "mensagens": [], "sem_etiqueta": 0, "lojas": {}, "sync": _shopee_sync}
+    for p in peds:
+        p["itens"] = json.loads(p["itens"] or "[]")
+        p["status_pt"] = SHOPEE_STATUS_PT.get(p["status"], p["status"])
+        p["central"] = cent.get(p["order_sn"], [])
+        p["prazo_txt"] = datetime.fromtimestamp(p["prazo"], BR).strftime("%d/%m %H:%M") if p["prazo"] else ""
+        p["atrasado"] = bool(p["prazo"]) and p["prazo"] < time.time()
+        p["hoje"] = bool(p["prazo"]) and not p["atrasado"] and p["prazo"] <= hoje_fim
+        l = out["lojas"].setdefault(p["loja"], {"a_enviar": 0, "cancelados": 0, "atrasados": 0})
+        if p["status"] in SHOPEE_CANCEL:
+            l["cancelados"] += 1
+            if p["central"] and not all(s in ("EXPEDIDO", "DEVOLVIDO") for s in p["central"]):
+                out["cancelados"].append(p)
+        elif p["status"] in ("READY_TO_SHIP", "PROCESSED"):
+            l["a_enviar"] += 1
+            l["atrasados"] += p["atrasado"]
+            out["prazo"].append(p)
+            out["sem_etiqueta"] += not p["central"]
+        if p["msg"] and p["status"] not in SHOPEE_CANCEL:
+            out["mensagens"].append(p)
+    return out
 
 
 def shopee_lojas():

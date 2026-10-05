@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pedidos Shopee</title>
+<style>
+  body{font:16px Arial,sans-serif;margin:0;background:#f4f4f6;color:#222}
+  header{background:#ee4d2d;color:#fff;padding:14px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:22px;margin:0;flex:1}
+  button{font-size:16px;padding:9px 14px;border:0;border-radius:8px;background:#fff;color:#ee4d2d;font-weight:bold;cursor:pointer}
+  main{max-width:1100px;margin:0 auto;padding:12px 16px 40px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:8px 0 16px}
+  .card{background:#fff;border-radius:10px;padding:12px 14px;box-shadow:0 1px 3px #0001}
+  .card b{font-size:15px}.card .n{font-size:26px;font-weight:bold}
+  h2{font-size:19px;margin:22px 0 8px}
+  .vazio{color:#777;background:#fff;border-radius:10px;padding:12px}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px #0001}
+  th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top;font-size:15px}
+  th{background:#fafafa;font-size:13px;color:#666}
+  .canc{background:#d7263d;color:#fff;border-radius:10px;padding:12px 14px;margin-bottom:8px}
+  .tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:13px;font-weight:bold}
+  .atr{background:#d7263d;color:#fff}.hj{background:#f5a623;color:#fff}.ok{background:#e8f5e9;color:#2e7d32}
+  .sem{background:#fff3e0;color:#e65100}
+  .msg{background:#fffbe6;border-left:4px solid #f5a623;padding:8px 10px;border-radius:6px;margin:6px 0}
+  .peq{font-size:13px;color:#777}
+  .tbl{overflow-x:auto}
+</style>
+</head>
+<body>
+<header><h1>🛍️ Pedidos Shopee</h1><button id="sync" onclick="sincronizar()">Atualizar agora</button><a href="/painel" style="color:#fff">Painel</a></header>
+<main>
+  <p class="peq" id="info">Carregando...</p>
+  <div class="cards" id="lojas"></div>
+  <h2>🚫 Cancelados que estão na operação</h2>
+  <div id="canc"></div>
+  <h2>💬 Mensagens dos compradores</h2>
+  <div id="msgs"></div>
+  <h2>⏰ A enviar, por prazo de postagem</h2>
+  <div id="prazo"></div>
+</main>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const itens=p=>p.itens.map(i=>`${esc(i.sku||"?")}${i.var?" ("+esc(i.var)+")":""} ×${i.qtd}`).join("<br>");
+const cent=p=>p.central.length?`<span class="tag ok">${esc([...new Set(p.central)].join(", "))}</span>`:`<span class="tag sem">sem etiqueta na Central</span>`;
+async function carregar(){
+  const r=await fetch("/api/shopee/pedidos");
+  if(r.status==401){location.href="/painel";return}
+  const d=await r.json();
+  const sy=Object.values(d.sync||{});
+  const err=sy.filter(s=>s.erro);
+  document.getElementById("info").textContent=(sy.length?"Última leitura: "+sy.map(s=>s.em).sort().pop():"Ainda não leu a Shopee (lê sozinho a cada 10 min).")+
+    (err.length?" · ERRO: "+err.map(e=>e.erro).join(" | "):"")+" · Só leitura: nada é alterado na Shopee.";
+  document.getElementById("lojas").innerHTML=Object.entries(d.lojas).map(([n,l])=>`<div class="card"><b>${esc(n)}</b>
+    <div class="n">${l.a_enviar}</div>a enviar ${l.atrasados?`· <span class="tag atr">${l.atrasados} atrasado(s)</span>`:""}
+    ${l.cancelados?`<div class="peq">${l.cancelados} cancelado(s) nos últimos 15 dias</div>`:""}</div>`).join("")||'<div class="vazio">Nenhum pedido lido ainda.</div>';
+  document.getElementById("canc").innerHTML=d.cancelados.length?d.cancelados.map(p=>`<div class="canc"><b>${esc(p.order_sn)}</b> · ${esc(p.loja)} · ${esc(p.status_pt)}
+    <br>${itens(p)}<br>Na Central: ${esc([...new Set(p.central)].join(", "))} — a bipagem já bloqueia esta etiqueta. Tire da fila e devolva o produto à prateleira.
+    ${p.motivo?`<br><span style="opacity:.85">Motivo: ${esc(p.motivo)}</span>`:""}</div>`).join(""):'<div class="vazio">Nenhum pedido cancelado na operação. ✅</div>';
+  document.getElementById("msgs").innerHTML=d.mensagens.length?d.mensagens.map(p=>`<div class="msg"><b>${esc(p.order_sn)}</b> · ${esc(p.loja)} · ${esc(p.status_pt)}
+    <br>“${esc(p.msg)}”<br><span class="peq">${itens(p)}</span></div>`).join(""):'<div class="vazio">Nenhuma mensagem de comprador nos pedidos abertos.</div>';
+  document.getElementById("prazo").innerHTML=d.prazo.length?`<p class="peq">${d.prazo.length} pedido(s) a enviar · ${d.sem_etiqueta} ainda sem etiqueta na Central</p><div class="tbl"><table><tr><th>Postar até</th><th>Pedido</th><th>Loja</th><th>Envio</th><th>Itens</th><th>Na Central</th></tr>`+
+    d.prazo.map(p=>`<tr><td>${p.atrasado?'<span class="tag atr">ATRASADO</span><br>':p.hoje?'<span class="tag hj">HOJE</span><br>':""}${esc(p.prazo_txt)}</td>
+    <td>${esc(p.order_sn)}<div class="peq">${esc(p.status_pt)}</div></td><td>${esc(p.loja)}</td><td>${esc(p.envio)}</td><td>${itens(p)}</td><td>${cent(p)}</td></tr>`).join("")+"</table></div>"
+    :'<div class="vazio">Nenhum pedido a enviar.</div>';
+}
+async function sincronizar(){
+  const b=document.getElementById("sync");b.disabled=true;b.textContent="Lendo a Shopee...";
+  try{const r=await fetch("/api/shopee/sincronizar",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    const j=await r.json();const e=(j.lojas||[]).filter(x=>!x.ok);if(e.length)alert("Erro: "+e.map(x=>x.erro).join("\n"))}catch(e){}
+  b.disabled=false;b.textContent="Atualizar agora";carregar();
+}
+carregar();setInterval(carregar,60000);
+</script>
+</body>
+</html>

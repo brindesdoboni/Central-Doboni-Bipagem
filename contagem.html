@@ -28,6 +28,8 @@ footer{position:sticky;bottom:0;background:#fff;padding:10px;border-top:1px soli
 details.box{background:#fff;margin:8px;padding:10px;border-radius:10px}details.box summary{font-weight:bold;font-size:16px}
 .add input{width:100%;box-sizing:border-box;font-size:17px;padding:8px;margin-top:6px;border:1px solid #999;border-radius:8px}
 .add button,.oc button{font-size:16px;padding:10px;border:0;border-radius:8px;background:#16a34a;color:#fff;font-weight:bold;width:100%;margin-top:8px}
+.tirar select{width:100%;box-sizing:border-box;font-size:17px;padding:8px;margin-top:6px;border:1px solid #999;border-radius:8px;background:#fff}
+.tirar button{background:#dc2626}.mais button.tb{color:#b91c1c;border-color:#fca5a5}
 .oc div{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee}.oc span{flex:1}.oc button{width:auto;margin:0;padding:6px 12px;font-size:14px;background:#1d4ed8}
 </style></head><body>
 <header><h1>📦 Contagem de estoque <small id="prog"></small></h1>
@@ -38,6 +40,12 @@ details.box{background:#fff;margin:8px;padding:10px;border-radius:10px}details.b
 <input id="aSku" placeholder="SKU (ex.: 18726I)" autocapitalize="characters"><input id="aCor" placeholder="Cor (vazio = sem cor)" autocapitalize="characters">
 <input id="aQtd" inputmode="numeric" pattern="[0-9]*" placeholder="Quantidade que tem aqui"><input id="aPrat" placeholder="Prateleira (opcional, ex.: A3)" autocapitalize="characters">
 <button onclick="acrescentar()">Confirmar</button></details>
+<details class="box add tirar" id="tBox"><summary>➖ Tirar do estoque</summary>
+<p style="font-size:13px;color:#666;margin:6px 0 0">Para brinde, quebra, defeito, venda fora da Shopee/TikTok... As vendas com etiqueta já saem sozinhas: não tire de novo.</p>
+<input id="tSku" placeholder="SKU (ex.: 18726I)" autocapitalize="characters"><input id="tCor" placeholder="Cor (vazio = sem cor)" autocapitalize="characters">
+<input id="tQtd" inputmode="numeric" pattern="[0-9]*" placeholder="Quantas peças tirar">
+<select id="tMot"><option>Quebrou / defeito</option><option>Brinde / amostra</option><option>Venda fora da plataforma</option><option>Uso interno</option><option>Erro de gravação</option><option>Outro</option></select>
+<button onclick="tirar()">Tirar do estoque</button></details>
 <div id="lista"></div>
 <details class="box oc" id="ocBox"><summary>🗄️ Arquivados e excluídos <span id="ocN"></span></summary><p style="font-size:13px;color:#666">Arquivado = sem estoque aqui e no fornecedor; volta sozinho para a lista quando entrar material. Excluído = não trabalha mais. Nada é apagado: dá para reativar.</p><div id="ocLista"></div></details>
 <footer><button id="voltar" onclick="voltar()" disabled>↩ Voltar</button><div id="msg"></div></footer>
@@ -69,10 +77,10 @@ function render(){const vs=false,F=feitos(),L=visiveis();let at=null,h="";
   <div class="s">${esc((i.nome||"").slice(0,45))}${vs?" · sistema: "+i.fisico:""}</div>
   <div class="acao"><input inputmode="numeric" pattern="[0-9]*" ${DR[k]!=null?`class="alt" value="${esc(DR[k])}"`:f!=null?`class="alt" value="${f}"`:(i.fisico>=0?`value="${Math.round(i.fisico)}"`:`placeholder="sistema: ${Math.round(i.fisico)}"`)} data-k="${esc(k)}" oninput="this.classList.add('alt');DR[this.dataset.k]=this.value" onfocus="this.select()" id="q${n}" onkeydown="if(event.key=='Enter'){event.preventDefault();confirmar(${n})}"><button onclick="confirmar(${n})">Confirmar</button></div>
   ${f!=null?`<div class="ok">✅ Contado: ${f}</div>`:""}
-  <div class="mais"><button class="${ARM[n]=="ARQUIVADO"?"arm":""}" onclick="marcar(${n},'ARQUIVADO')">${ARM[n]=="ARQUIVADO"?"Toque de novo p/ arquivar":"🗄️ Arquivar (sem estoque)"}</button><button class="${ARM[n]=="EXCLUIDO"?"arm":""}" onclick="marcar(${n},'EXCLUIDO')">${ARM[n]=="EXCLUIDO"?"Toque de novo p/ excluir":"🗑️ Excluir"}</button></div></div>`});
+  <div class="mais"><button class="tb" onclick="preTirar(${n})">➖ Tirar</button><button class="${ARM[n]=="ARQUIVADO"?"arm":""}" onclick="marcar(${n},'ARQUIVADO')">${ARM[n]=="ARQUIVADO"?"Toque de novo p/ arquivar":"🗄️ Arquivar (sem estoque)"}</button><button class="${ARM[n]=="EXCLUIDO"?"arm":""}" onclick="marcar(${n},'EXCLUIDO')">${ARM[n]=="EXCLUIDO"?"Toque de novo p/ excluir":"🗑️ Excluir"}</button></div></div>`});
  $("lista").innerHTML=h||'<p style="padding:12px">Nada aqui.</p>';
  $("prog").textContent=L.length?L.filter(i=>F[chave(i)]!=null).length+" de "+L.length:"";
- const u=PILHA[PILHA.length-1];$("voltar").disabled=!u;$("voltar").textContent=u?`↩ Voltar (${u.sku} ${u.cor}: ${u.tipo=="status"?(u.novo=="ARQUIVADO"?"arquivado":u.novo=="EXCLUIDO"?"excluído":"reativado"):u.qtd})`:"↩ Voltar";
+ const u=PILHA[PILHA.length-1];$("voltar").disabled=!u;$("voltar").textContent=u?`↩ Voltar (${u.sku} ${u.cor}: ${u.tipo=="status"?(u.novo=="ARQUIVADO"?"arquivado":u.novo=="EXCLUIDO"?"excluído":"reativado"):u.tipo=="baixa"?"tirou "+u.qtd:u.qtd})`:"↩ Voltar";
  $("ocN").textContent=OC.length?"("+OC.length+")":"";
  $("ocLista").innerHTML=OC.map((o,j)=>`<div><span><b>${esc(o.sku)}</b> ${esc(o.cor)} — ${o.status=="EXCLUIDO"?"excluído":"arquivado"}</span><button onclick="reativar(${j})">Reativar</button></div>`).join("")||"<i>Nenhum</i>";}
 async function mudaStatus(sku,cor,status){const r=await fetch("/api/estoque/status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku,cor,status})});
@@ -97,6 +105,17 @@ async function acrescentar(){const sku=$("aSku").value.trim().toUpperCase(),cor=
   const rf=d.refs[0];PILHA.push({k:rf.sku+"|"+(rf.cor||"PADRAO"),sku:rf.sku,cor:rf.cor||"PADRAO",qtd:+q,ref:rf.ref});guarda();
   ["aSku","aCor","aQtd","aPrat"].forEach(x=>$(x).value="");$("msg").textContent=`✅ Acrescentado: ${rf.sku} ${rf.cor||"PADRAO"} = ${q}`;carregar()}
  catch(e){$("msg").textContent="❌ Não salvou — confira e tente de novo"}}
+function preTirar(n){const i=visiveis()[n];$("tSku").value=i.sku;$("tCor").value=i.cor=="PADRAO"?"":i.cor;$("tQtd").value="";
+ $("tBox").open=true;$("tBox").scrollIntoView({block:"start"});$("tQtd").focus()}
+async function tirar(){const sku=$("tSku").value.trim().toUpperCase(),cor=$("tCor").value.trim().toUpperCase(),q=($("tQtd").value||"").replace(/[^\d]/g,""),mot=$("tMot").value;
+ if(!sku||!q||+q<=0){$("msg").textContent="Preencha o SKU e quantas peças tirar";return}
+ $("msg").textContent="Salvando...";
+ try{const r=await fetch("/api/estoque/baixa",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku,cor,qtd:+q,motivo:mot})});
+  if(r.status==401){$("msg").textContent="Login expirou — entre de novo";return}
+  const d=await r.json();if(!d.ok){$("msg").textContent="❌ "+(d.erro||"Não salvou");return}
+  PILHA.push({tipo:"baixa",k:"bx|"+d.ref,sku:d.sku,cor:d.cor,qtd:d.qtd,ref:d.ref});guarda();
+  $("tQtd").value="";$("tBox").open=false;$("msg").textContent=`➖ Tirado: ${d.sku} ${d.cor} −${d.qtd} (${d.antes} → ${d.depois})`;carregar()}
+ catch(e){$("msg").textContent="❌ Não salvou (sem internet?) — tente de novo"}}
 async function confirmar(n){const i=visiveis()[n],el=$("q"+n),v=(el.value||"").replace(/[^\d]/g,"");
  if(v===""){$("msg").textContent="Digite a quantidade antes de confirmar";el.focus();return}
  $("msg").textContent="Salvando...";
