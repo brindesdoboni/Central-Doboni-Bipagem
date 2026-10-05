@@ -11,7 +11,7 @@ main{flex:1;display:flex;flex-direction:column;align-items:center;justify-conten
 .card{border-radius:16px;padding:10px 24px;color:#fff;box-shadow:0 6px 24px #0008;animation:entra .2s ease-out;text-align:left}
 .card .q{display:flex;justify-content:space-between;align-items:baseline;gap:16px}.card .nome{font-size:36px;font-weight:900;letter-spacing:.5px}.card .hr{font-size:22px;font-weight:700;opacity:.9;white-space:nowrap}
 .card .m{font-size:28px;font-weight:900;line-height:1.15;margin:2px 0}.card .d{font-size:22px;line-height:1.3}
-.card.err{border:6px solid #ffeb3b}.card.err .m{font-size:32px}.card .f{font-size:22px;font-weight:900;color:#ffeb3b;background:#7a000f;border-radius:8px;padding:8px 12px;margin:6px 0}
+.card.err{border:6px solid #ffeb3b}.card.err.menor{border-width:3px}.card.err.menor .m{font-size:22px}.card.err.menor .f{font-size:16px;padding:4px 10px;margin:3px 0}.card.err.menor .d{font-size:16px}.card.err .m{font-size:32px}.card .f{font-size:22px;font-weight:900;color:#ffeb3b;background:#7a000f;border-radius:8px;padding:8px 12px;margin:6px 0}
 .card.sai{transition:opacity .4s;opacity:0}@keyframes entra{from{transform:translateY(30px);opacity:0}to{transform:none;opacity:1}}
 #modo{margin-top:16px;font-size:24px;padding:8px 18px;border-radius:8px;background:var(--av);color:#000;display:none}
 input{position:absolute;opacity:0;left:-999px}
@@ -48,7 +48,7 @@ function cartao(tipo,msg,det,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var
  const novo=!el||!el.isConnected;if(novo)el=document.createElement("div");clearTimeout(el._t);el.classList.remove("sai");
  el.className="card"+(tipo==="erro"?" err":"");el.style.background=cor;
  el.innerHTML=`<div class="q"><span class="nome">👤 ${esc((quem||"SEM CRACHÁ").toUpperCase())}</span><span class="hr">${esc(POSTOS[posto]||"")} · ${new Date().toLocaleTimeString("pt-BR")}</span></div><div class="m">${tipo==="erro"?"⛔ ":""}${esc(msg)}</div>${fazer?`<div class="f">O QUE FAZER: ${esc(fazer)}</div>`:""}${det?`<div class="d">${det}</div>`:""}`;
- const p=$("pilha");if(novo)p.appendChild(el);const lim=innerHeight*.62,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1)p.removeChild(p.firstChild);
+ const p=$("pilha");if(novo){p.querySelectorAll(".card.err").forEach(x=>x.classList.add("menor"));p.appendChild(el)}const lim=innerHeight*.62,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1){const x=[...p.children].find(c=>c!==el&&!c.classList.contains("err"))||p.firstChild;p.removeChild(x)}
  el._t=setTimeout(()=>{el.classList.add("sai");setTimeout(()=>el.remove(),400)},tipo==="erro"?8000:tipo==="espera"?10000:5000);return el}
 function tela(tipo,msg,det,ev,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
  $("tela").style.background=cor;som(ev||(tipo==="erro"?"erro":tipo));

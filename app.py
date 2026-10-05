@@ -289,7 +289,7 @@ _repetidos_lock = threading.Lock()
 def _leitura_repetida(posto, codigo, operador, leitor=""):
     import time
     agora_m = time.monotonic()
-    k = ((posto or "").upper(), norm(operador), str(leitor or ""), norm(codigo))
+    k = ((posto or "").upper(), norm(codigo))   # a mesma etiqueta no mesmo setor, venha de qualquer leitor
     with _repetidos_lock:
         ult = _repetidos.get(k)
         _repetidos[k] = agora_m
@@ -304,8 +304,11 @@ _ctx = threading.local()
 
 def _codigo_de_etiqueta(cod):
     """So inclui sozinho o que tem cara de etiqueta de envio (nao codigo de barras de produto, cracha etc.)."""
-    return bool(re.fullmatch(r"5\d{17}", cod) or re.fullmatch(r"9\d{13,15}", cod) or re.fullmatch(r"BR\d{12,14}[0-9A-Z]?", cod)
-                or re.fullmatch(r"2\d{5}[0-9A-Z]{8}", cod) and re.search(r"[A-Z]", cod) or re.fullmatch(r"UPPUS\d{4,}", cod))
+    if len(cod) < 10 or cod.startswith("CMD") or re.fullmatch(r"OP[0-9A-F]{6}", cod):
+        return False
+    if cod.isdigit() and len(cod) in (12, 13) or cod.isdigit() and len(cod) == 14 and not cod.startswith("9"):
+        return False   # codigo de barras de produto (EAN/GTIN)
+    return True
 
 
 def _auto_incluir(c, codigo, posto):
