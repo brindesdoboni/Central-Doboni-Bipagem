@@ -15,7 +15,8 @@ ALERTA_GRAVACAO_MIN = int(os.environ.get("ALERTA_GRAVACAO_MIN", "30"))
 AQUI = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.Lock()
 
-ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "EXPEDIDO", "DEVOLVIDO"]
+ETAPAS = ["AGUARDANDO", "SEPARADO", "EM_GRAVACAO", "GRAVADO", "EXPEDIDO", "DEVOLVIDO"]
+GRAV_MIN_SEG = int(os.environ.get("GRAV_MIN_SEG", "10"))   # 2o bipe antes disso = engano (nao conta como terminado)
 ORDEM = {e: i for i, e in enumerate(ETAPAS)}
 
 
@@ -115,7 +116,6 @@ def iniciar_db():
         if "duracao" not in [r[1] for r in c.execute("PRAGMA table_info(pausas)")]:
             c.execute("ALTER TABLE pausas ADD COLUMN duracao INTEGER DEFAULT 15")
         c.execute("UPDATE colaboradores SET funcao='Devolução' WHERE funcao='Etiquetas'")
-        c.execute("UPDATE itens SET status='EM_GRAVACAO' WHERE status='GRAVADO'")
         # so 3 modos de envio: etiqueta manual com "Pedido 9998..." e TikTok; "OUTROS" vira o canal pelo numero
         c.execute("""UPDATE itens SET canal='TIKTOK', envio='' WHERE lote='MANUAL' AND canal<>'TIKTOK'
                      AND length(pedido)=15 AND pedido GLOB '9998[0-9]*'""")
@@ -552,11 +552,25 @@ def _bipar(posto, codigo, operador, modo):
                 return {"tipo": "erro", "msg": "NÃO GRAVAR: ainda NÃO FOI SEPARADO",
                         "fazer": "Leve para a SEPARAÇÃO e bipe lá primeiro. Depois volte e bipe aqui na GRAVAÇÃO.",
                         "item": dict(nsep[0])}
+            # 1o bipe = comecou a gravar (GRAVANDO); 2o bipe da mesma etiqueta = terminou (GRAVADO)
+            gravando = [i for i in pers if i["status"] == "EM_GRAVACAO"]
+            if gravando:
+                g = gravando[0]
+                ini = c.execute("SELECT em FROM eventos WHERE item_id=? AND etapa='GRAVACAO_INICIO' AND desfeito=0 "
+                                "ORDER BY id DESC LIMIT 1", (g["id"],)).fetchone()
+                seg = int((datetime.now(timezone.utc) - datetime.fromisoformat(ini[0])).total_seconds()) if ini else 9999
+                if seg < GRAV_MIN_SEG:
+                    return {"tipo": "aviso", "msg": f"Já está GRAVANDO (começou há {seg} s). Bipe de novo só quando TERMINAR.",
+                            "item": dict(g)}
+                r = ev(g, "GRAVACAO_FIM")
+                return {"tipo": "ok", "evento": "ok", "item": r,
+                        "msg": f"✅ GRAVADO em {seg // 60} min {seg % 60:02d} s  →  deixe para a EXPEDIÇÃO"}
             alvo = next((i for i in pers if ORDEM[i["status"]] < ORDEM["EM_GRAVACAO"]), None)
             if alvo:
                 r = ev(alvo, "GRAVACAO_INICIO")
-                return {"tipo": "ok", "evento": "gravacao", "msg": "GRAVAÇÃO registrada  →  depois vai para a EXPEDIÇÃO", "item": r}
-            return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
+                return {"tipo": "ok", "evento": "gravacao", "item": r,
+                        "msg": "🔥 GRAVANDO  →  quando TERMINAR, bipe esta etiqueta de novo"}
+            return {"tipo": "aviso", "msg": "Já foi GRAVADO.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
             nsep = [i for i in itens if i["status"] == "AGUARDANDO"]
@@ -576,6 +590,9 @@ def _bipar(posto, codigo, operador, modo):
                 return {"tipo": "aviso", "msg": "Ja expedido.", "item": dict(itens[0])}
             r = None
             for i in pend:
+                if i["status"] == "EM_GRAVACAO":   # gravador esqueceu o 2o bipe: fecha sem contar tempo
+                    c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
+                              (i["id"], "GRAVACAO_FIM", ultimo_op(c, i["id"]), "GRAVACAO", agora(), "fim nao bipado"))
                 r = ev(i, "EXPEDIDO")
             return {"tipo": "ok", "msg": f"EXPEDIDO ({len(pend)} item(ns))", "evento": "expedido", "item": r}
         if posto == "DEVOLUCAO":
@@ -654,6 +671,8 @@ def recalcular(c, iid):
             st, falta = "SEPARADO", 0
         elif et == "GRAVACAO_INICIO":
             st, falta = "EM_GRAVACAO", 0
+        elif et == "GRAVACAO_FIM":
+            st = "GRAVADO"
         elif et == "EXPEDIDO":
             st = "EXPEDIDO"
         elif et == "DEVOLVIDO":
@@ -681,28 +700,29 @@ def painel(data):
         evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
              ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
         equipe = {}
-        ultimo_grav = {}
         for e in evs:
             if e["colaborador_id"] is None:
                 continue  # marcacao automatica (estoque), nao e de ninguem da equipe
             p = equipe.setdefault(e["nome"] or "?", {"separados": 0, "gravados": 0, "expedidos": 0,
-                                                     "min_gravacao": [], "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
+                                                     "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
             p["ultimo"] = e["em"]
             if e["etapa"] == "SEPARADO": p["separados"] += 1
             if e["etapa"] == "EXPEDIDO": p["expedidos"] += 1
             if e["etapa"] == "FALTA_MATERIAL": p["faltas"] += 1
             if e["etapa"] == "GRAVACAO_INICIO":
-                # tempo por peca = intervalo entre bipes seguidos do mesmo gravador (ignora pausas > 30 min)
                 p["gravados"] += 1
-                ant = ultimo_grav.get(e["nome"])
-                if ant:
-                    m = (datetime.fromisoformat(e["em"]) - datetime.fromisoformat(ant)).total_seconds() / 60
-                    if 0 < m <= 30:
-                        p["min_gravacao"].append(m)
-                ultimo_grav[e["nome"]] = e["em"]
-        for p in equipe.values():
-            m = p.pop("min_gravacao")
-            p["media_gravacao_min"] = round(sum(m) / len(m), 1) if m else None
+        tempos = {}
+        for nome, _, m in _gravacoes(c, ini, fim):
+            tempos.setdefault(nome, []).append(m)
+        for n, p in equipe.items():
+            m = sorted(tempos.get(n, []))
+            p["media_gravacao_min"] = round(m[len(m) // 2], 1) if m else None   # mediana: pausa/engano nao puxa o numero
+        for n, q in _parados(c, data, ini, fim).items():
+            if n in equipe:
+                equipe[n].update(q)
+        esp = _espera_expedicao(c, ini, fim)
+        espera = {"pecas": len(esp), "media_min": round(sum(esp) / len(esp), 1) if esp else None,
+                  "max_min": round(max(esp), 1) if esp else None}
         alertas = []
         for i in itens:
             if i["falta_material"]:
@@ -717,7 +737,7 @@ def painel(data):
                 q["devolucoes"] = q.get("devolucoes", 0) + (e["etapa"] == "DEVOLVIDO")
     return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
             "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens,
-            "dia": contadores_dia(data)}
+            "dia": contadores_dia(data), "espera_expedicao": espera}
 
 
 def operacao():
@@ -765,7 +785,18 @@ def operacao():
         prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
     return {"contagem": cont, "total": len(itens), "por_canal": por_canal, "ritmo": ritmo,
             "plataformas": d["plataformas"],
-            "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"]), "dia": d["dia"]}
+            "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"]), "dia": d["dia"],
+            "espera_expedicao": d.get("espera_expedicao"), "gravado_mais_antigo_min": _gravado_mais_antigo()}
+
+
+def _gravado_mais_antigo():
+    """Ha quantos minutos a peca GRAVADA mais antiga esta esperando a expedicao."""
+    with conn() as c:
+        r = c.execute("""SELECT MIN(e.em) FROM eventos e JOIN itens i ON i.id=e.item_id WHERE i.status='GRAVADO'
+                         AND e.etapa='GRAVACAO_FIM' AND e.desfeito=0""").fetchone()
+    if not r or not r[0]:
+        return None
+    return int((datetime.now(timezone.utc) - datetime.fromisoformat(r[0])).total_seconds() // 60)
 
 
 def _num(v):
@@ -803,19 +834,116 @@ def _custo_manual(c, sku):
 
 
 def _gravacoes(c, ini, fim=None):
-    """Lista (colaborador, sku, minutos) - tempo de cada peca = ate o proximo bipe do mesmo gravador (<= 30 min)."""
+    """Lista (colaborador, sku, minutos) - tempo REAL de cada peca = do 1o bipe (GRAVANDO) ao 2o bipe (GRAVADO)
+    na gravacao. A espera ate a expedicao NAO entra. Peca sem o 2o bipe nao conta.
+    Dados antigos (antes do 2o bipe existir): intervalo ate o proximo bipe do mesmo gravador (<= 30 min)."""
+    filtro = " AND a.em<?" if fim else ""
+    args = (ini, fim) if fim else (ini,)
+    out = []
+    for nome, sku, ia, fa in c.execute(f"""SELECT k.nome, UPPER(COALESCE(i.sku,'')), a.em,
+            (SELECT b.em FROM eventos b WHERE b.item_id=a.item_id AND b.etapa='GRAVACAO_FIM' AND b.desfeito=0
+               AND COALESCE(b.alerta,'')='' AND b.id>a.id ORDER BY b.id LIMIT 1)
+            FROM eventos a JOIN itens i ON i.id=a.item_id LEFT JOIN colaboradores k ON k.id=a.colaborador_id
+            WHERE a.etapa='GRAVACAO_INICIO' AND a.desfeito=0 AND a.em>=?{filtro}""", args):
+        if fa:
+            m = (datetime.fromisoformat(fa) - datetime.fromisoformat(ia)).total_seconds() / 60
+            if 0 < m <= 120:
+                out.append((nome or "?", sku or "(sem SKU)", m))
+    # dados de antes do 2o bipe
+    r = c.execute("SELECT MIN(em) FROM eventos WHERE etapa='GRAVACAO_FIM' AND COALESCE(alerta,'')=''").fetchone()
+    corte = r[0] if r and r[0] else "9999"
     q = """SELECT e.colaborador_id, k.nome, e.em, UPPER(COALESCE(i.sku,'')) sku FROM eventos e JOIN itens i ON i.id=e.item_id
            LEFT JOIN colaboradores k ON k.id=e.colaborador_id
-           WHERE e.etapa='GRAVACAO_INICIO' AND e.desfeito=0 AND e.em>=?""" + (" AND e.em<?" if fim else "") + \
+           WHERE e.etapa='GRAVACAO_INICIO' AND e.desfeito=0 AND e.em>=? AND e.em<?""" + (" AND e.em<?" if fim else "") + \
         " ORDER BY e.colaborador_id, e.em"
-    rows = c.execute(q, (ini, fim) if fim else (ini,)).fetchall()
-    out = []
+    rows = c.execute(q, (ini, corte, fim) if fim else (ini, corte)).fetchall()
     for a, b in zip(rows, rows[1:]):
         if a[0] != b[0]:
             continue
         m = (datetime.fromisoformat(b[2]) - datetime.fromisoformat(a[2])).total_seconds() / 60
         if 0 < m <= 30:
             out.append((a[1] or "?", a[3] or "(sem SKU)", m))
+    return out
+
+
+PARADO_FOLGA_MIN = float(os.environ.get("PARADO_FOLGA_MIN", "3"))   # cada bipe = ~3 min de trabalho (pegar, conferir, embalar)
+
+
+def _parados(c, data, ini, fim):
+    """So para o painel do dono: quanto tempo cada pessoa ficou PARADA no dia (sem separar, gravar, expedir...).
+    Ocupado = do 1o ao 2o bipe de cada peca gravando (varias maquinas ao mesmo tempo contam juntas) + uma folga
+    depois de cada bipe. Parado = do 1o ao ultimo bipe do dia, menos o ocupado e menos as pausas cadastradas dela."""
+    evs = c.execute("""SELECT e.colaborador_id, k.nome, e.item_id, e.etapa, e.em, COALESCE(e.alerta,'') alerta FROM eventos e
+                       JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.desfeito=0 AND e.em>=? AND e.em<?
+                       ORDER BY e.em, e.id""", (ini, fim)).fetchall()
+    pausas = c.execute("SELECT hora, pessoas, COALESCE(duracao,15) d FROM pausas").fetchall()
+    d0 = datetime.strptime(data, "%Y-%m-%d").replace(tzinfo=BR)
+    agora_ = datetime.now(timezone.utc)
+    pes = {}
+    for e in evs:
+        pes.setdefault(e["nome"] or "?", []).append(e)
+    out = {}
+    folga = timedelta(minutes=PARADO_FOLGA_MIN)
+    for nome, L in pes.items():
+        t = [datetime.fromisoformat(e["em"]) for e in L]
+        ini_p, fim_p = t[0], t[-1]
+        ocup = []
+        abertos = {}
+        for e, te in zip(L, t):
+            ocup.append((te, te + folga))
+            if e["etapa"] == "GRAVACAO_INICIO":
+                abertos[e["item_id"]] = te
+            elif e["etapa"] == "GRAVACAO_FIM" and e["item_id"] in abertos:
+                a = abertos.pop(e["item_id"])
+                if not e["alerta"] and te - a <= timedelta(hours=2):
+                    ocup.append((a, te))
+        for a in abertos.values():             # ainda gravando agora (sem o 2o bipe): ocupado ate agora (max 2 h)
+            if data == datetime.now(BR).strftime("%Y-%m-%d"):
+                ocup.append((a, min(agora_, a + timedelta(hours=2))))
+        for p in pausas:                        # pausa cadastrada (cafe) nao e "parado"
+            quem = (p["pessoas"] or "").lower()
+            if quem and nome.lower() not in quem:
+                continue
+            try:
+                h, m = [int(x) for x in str(p["hora"]).split(":")[:2]]
+            except Exception:
+                continue
+            a = (d0 + timedelta(hours=h, minutes=m)).astimezone(timezone.utc)
+            ocup.append((a, a + timedelta(minutes=int(p["d"] or 15))))
+        # junta os intervalos ocupados e mede os buracos entre o 1o e o ultimo bipe
+        ocup = sorted((max(a, ini_p), min(b, fim_p)) for a, b in ocup if b > ini_p and a < fim_p)
+        cur, parado, maior = ini_p, 0.0, None
+        for a, b in ocup:
+            if a > cur:
+                gap = (a - cur).total_seconds() / 60
+                parado += gap
+                if not maior or gap > maior[0]:
+                    maior = (gap, cur, a)
+            cur = max(cur, b)
+        if fim_p > cur:
+            gap = (fim_p - cur).total_seconds() / 60
+            parado += gap
+            if not maior or gap > maior[0]:
+                maior = (gap, cur, fim_p)
+        span = (fim_p - ini_p).total_seconds() / 60
+        out[nome] = {"parado_min": round(parado), "trabalhando_min": round(span - parado),
+                     "pct_parado": round(100 * parado / span) if span > 0 else 0,
+                     "maior_parada": ({"min": round(maior[0]), "de": maior[1].astimezone(BR).strftime("%H:%M"),
+                                       "ate": maior[2].astimezone(BR).strftime("%H:%M")} if maior and maior[0] >= 1 else None),
+                     "ultimo_bipe_ha_min": (int((agora_ - fim_p).total_seconds() // 60)
+                                            if data == datetime.now(BR).strftime("%Y-%m-%d") else None)}
+    return out
+
+
+def _espera_expedicao(c, ini, fim):
+    """Minutos que cada peca ficou GRAVADA esperando a expedicao (do 2o bipe da gravacao ao bipe da expedicao)."""
+    out = []
+    for fa, ea in c.execute("""SELECT f.em, (SELECT x.em FROM eventos x WHERE x.item_id=f.item_id AND x.etapa='EXPEDIDO'
+                                  AND x.desfeito=0 AND x.id>f.id ORDER BY x.id LIMIT 1)
+                               FROM eventos f WHERE f.etapa='GRAVACAO_FIM' AND f.desfeito=0 AND COALESCE(f.alerta,'')=''
+                               AND f.em>=? AND f.em<?""", (ini, fim)):
+        if ea:
+            out.append((datetime.fromisoformat(ea) - datetime.fromisoformat(fa)).total_seconds() / 60)
     return out
 
 
@@ -1831,11 +1959,11 @@ class H(BaseHTTPRequestHandler):
                 por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
                 nt = c.execute("SELECT COUNT(*) FROM itens WHERE falta_material=1").fetchone()[0]
                 pode_voltar = c.execute("SELECT COUNT(DISTINCT item_id) FROM eventos WHERE desfeito=2").fetchone()[0]
-            n = sum(por.get(k, 0) for k in ("SEPARADO", "EM_GRAVACAO", "EXPEDIDO"))
+            n = sum(por.get(k, 0) for k in ("SEPARADO", "EM_GRAVACAO", "GRAVADO", "EXPEDIDO"))
             h = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reiniciar bipagem</title>
 <body style="font:18px Arial;max-width:640px;margin:20px auto;padding:0 16px">
 <h2>Voltar tudo para AGUARDANDO</h2>
-<p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0)}</b> em gravação · <b>{por.get('EXPEDIDO',0)}</b> expedidos · <b>{nt}</b> NÃO TEM · {por.get('DEVOLVIDO',0)} devolvidos</p>
+<p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0) + por.get('GRAVADO',0)}</b> em gravação/gravados · <b>{por.get('EXPEDIDO',0)}</b> expedidos · <b>{nt}</b> NÃO TEM · {por.get('DEVOLVIDO',0)} devolvidos</p>
 <p>Os <b>{n}</b> separados, em gravação e expedidos voltam para <b>AGUARDANDO</b> e os <b>{nt}</b> NÃO TEM são limpos, para bipar tudo de novo. Só as devoluções ficam como estão.
 O estoque não baixa duas vezes. Nada é apagado: dá para desfazer.</p>
 <p><button id=b style="font-size:20px;padding:12px 18px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0)">Limpar tudo e voltar para AGUARDANDO</button></p>
@@ -2699,10 +2827,10 @@ def reiniciar_etapas(desfazer=False):
             ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM eventos WHERE desfeito=2")]
             c.execute("UPDATE eventos SET desfeito=0 WHERE desfeito=2")
         else:
-            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','EXPEDIDO') OR falta_material=1")]
+            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','GRAVADO','EXPEDIDO') OR falta_material=1")]
             for iid in ids:
                 c.execute("""UPDATE eventos SET desfeito=2 WHERE item_id=? AND desfeito=0
-                             AND etapa IN ('SEPARADO','GRAVACAO_INICIO','EXPEDIDO','FALTA_MATERIAL')""", (iid,))
+                             AND etapa IN ('SEPARADO','GRAVACAO_INICIO','GRAVACAO_FIM','EXPEDIDO','FALTA_MATERIAL')""", (iid,))
         for iid in ids:
             recalcular(c, iid)
         por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
@@ -3952,7 +4080,7 @@ def _shopee_estoque(detalhes):
                         baixar_estoque(c, iid)
                         feitos["baixa_enviado"] += _ja_baixado(c, iid)
                     continue
-                if it["status"] in ("EXPEDIDO", "DEVOLVIDO", "EM_GRAVACAO"):
+                if it["status"] in ("EXPEDIDO", "DEVOLVIDO", "EM_GRAVACAO", "GRAVADO"):
                     continue
                 for m in c.execute("SELECT * FROM estoque_mov WHERE ref LIKE ? AND tipo='ETIQUETA'", (f"ETQ|{iid}|%",)).fetchall():
                     cur = c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
