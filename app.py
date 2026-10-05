@@ -1497,9 +1497,14 @@ def _motivos_shopee(res):
     rr = res.get("response") or {}
     out = []
     for x in rr.get("dispute_reason_list") or []:
-        try:
-            rid = int(str(x.get("dispute_reason")).strip())
-        except Exception:
+        rid = None
+        for k in ("dispute_reason", "dispute_reason_id", "reason_id", "id"):
+            try:
+                rid = int(str(x.get(k)).strip())
+                break
+            except Exception:
+                pass
+        if rid is None:
             continue
         out.append({"id": rid, "requisito": (x.get("dispute_requirement") or "")[:300],
                     "modulos": [{"module_index": int(m.get("module_index") or 0), "requirement": m.get("requirement") or "",
@@ -1508,6 +1513,22 @@ def _motivos_shopee(res):
 
 
 def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
+    """Envia e, se der qualquer erro, devolve junto o que a Shopee respondeu em cada etapa (Detalhes tecnicos)."""
+    diag = {}
+    try:
+        r = _dev_enviar_core(dev_id, texto, email, motivo_id, diag)
+    except Exception as e:
+        r = {"ok": False, "erro": "A Shopee recusou: " + str(e)[:220]}
+    if not r.get("ok") and diag and not r.get("escolher"):
+        r["bruto"] = {**diag, **(r.get("bruto") or {})}
+        with _lock, conn() as c:
+            c.execute("UPDATE devolucoes SET envio_resp=? WHERE id=?",
+                      (json.dumps({"erro": r.get("erro"), "bruto": r["bruto"], "em": agora(), "falhou": True},
+                                  ensure_ascii=False, default=str)[:20000], int(dev_id)))
+    return r
+
+
+def _dev_enviar_core(dev_id, texto, email, motivo_id, diag):
     """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar).
     So diz 'enviado' depois de conferir na propria Shopee que a contestacao entrou."""
     import time
@@ -1539,9 +1560,19 @@ def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
         return {"ok": False, "erro": "Tire pelo menos as fotos da lista antes de enviar."}
     loja = _shopee_token_ok(sr["shop_id"])
     passos, urls, avisos = [], [], []
+    diag["return_sn"] = sn
+    try:   # situacao atual da devolucao na Shopee (so leitura, para o diagnostico)
+        det0 = _shopee_http("GET", "/api/v2/returns/get_return_detail", loja=loja, params={"return_sn": sn}).get("response") or {}
+        diag["situacao_antes"] = {k: det0.get(k) for k in ("status", "return_seller_due_date", "due_date", "validation_type",
+                                                          "negotiation", "seller_proof", "dispute_reason", "return_solution")
+                                  if k in det0}
+    except Exception as e:
+        diag["situacao_antes"] = "erro: " + str(e)[:150]
     # 1) motivos que a Shopee aceita para ESTA devolucao (cada um com os tipos de prova que pede)
-    lista = _motivos_shopee(_tenta("motivos da contestação", lambda: _shopee_http(
-        "GET", "/api/v2/returns/get_return_dispute_reason", loja=loja, params={"return_sn": sn})))
+    res_m = _tenta("motivos da contestação", lambda: _shopee_http(
+        "GET", "/api/v2/returns/get_return_dispute_reason", loja=loja, params={"return_sn": sn}))
+    diag["motivos_resposta"] = json.dumps(res_m.get("response") or res_m, default=str, ensure_ascii=False)[:4000]
+    lista = _motivos_shopee(res_m)
     if not lista:
         return {"ok": False, "erro": "A Shopee não ofereceu nenhum motivo de contestação para esta devolução pelo sistema "
                                      "(nesta fase talvez só pelo Seller Center). Conteste pelo Seller Center, botão Disputar."}
@@ -1568,6 +1599,7 @@ def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
     if image_list:
         corpo["image_list"] = image_list
     rid, rtxt, vids = motivo["id"], "", []
+    diag["pedido_enviado"] = {**corpo, "dispute_text_reason": corpo["dispute_text_reason"][:80] + "..."}
     bruto = {"motivos_oferecidos": lista[:20], "motivo_escolhido": rid,
              "blocos_de_prova": [x["requirement"][:80] for x in mods]}
     def _ja_contestou():
@@ -1576,20 +1608,32 @@ def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
                                                params={"return_sn": sn}).get("response") or {})
         except Exception:
             return False
-    res_d, erro_d = {}, ""
-    for n in range(3):
+    # variacoes do mesmo pedido (a Shopee nao documenta bem o bloco de fotos): completo; sem o texto do requisito;
+    # fotos em todos os blocos de prova. Antes de cada nova tentativa confere se ja entrou (nunca duplica).
+    variacoes = [corpo]
+    if corpo.get("image_list"):
+        variacoes.append({**corpo, "image_list": [{"module_index": x["module_index"], "image_url": x["image_url"]}
+                                                  for x in corpo["image_list"]]})
+        todos = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:9]}
+                 for x in motivo["modulos"]]
+        if len(todos) > len(corpo["image_list"]):
+            variacoes.append({**corpo, "image_list": todos})
+    res_d, erro_d, tent = {}, "", []
+    for n, cp in enumerate(variacoes + [corpo]):   # a ultima repete o completo depois de uma pausa
         try:
-            res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
+            res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=cp)
             erro_d = ""
             break
         except Exception as e:
             erro_d = str(e)
-            time.sleep(3 * (n + 1))
+            tent.append(erro_d[:120])
+            time.sleep(3 if n < len(variacoes) - 1 else 6)
             if _ja_contestou():          # deu erro, mas entrou: nao manda de novo
                 erro_d = ""
                 break
             if not _RX_TEMPORARIO.search(erro_d):
                 break
+    bruto["tentativas"] = tent
     if erro_d:
         bruto["erro_disputa"] = erro_d[:300]
         with _lock, conn() as c:
@@ -1598,7 +1642,7 @@ def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
                                   ensure_ascii=False, default=str), int(dev_id)))
         return {"ok": False, "bruto": bruto,
                 "erro": f"Fotos subiram, mas a Shopee recusou ABRIR a contestação ({erro_d[:150]}). "
-                        "Tentei 3 vezes. Conteste agora pelo Seller Center (botão Disputar) usando o texto (Copiar) e as fotos."}
+                        "Tentei de novo automaticamente. Conteste agora pelo Seller Center (botão Disputar) usando o texto (Copiar) e as fotos."}
     bruto["resposta_disputa"] = {k: v for k, v in res_d.items() if k != "request_id"}
     if vids or urls:
         try:
