@@ -1274,6 +1274,40 @@ def _motivo_disputa(lista, cat):
     return (opc[0] if opc else (None, ""))
 
 
+_CAMPO_FOTO = {"nome": None}
+
+
+def _urls_em(x):
+    if isinstance(x, str):
+        return [x] if x.startswith("http") else []
+    if isinstance(x, dict):
+        return [u for v in x.values() for u in _urls_em(v)]
+    if isinstance(x, list):
+        return [u for v in x for u in _urls_em(v)]
+    return []
+
+
+def _dev_converter_foto(loja, nome, dados):
+    """Sobe a foto para a Shopee (returns/convert_image) e devolve a URL. A Shopee nao documenta bem o nome do campo
+    do arquivo: tenta os nomes conhecidos e guarda o que funcionou."""
+    nomes = [_CAMPO_FOTO["nome"]] if _CAMPO_FOTO["nome"] else ["upload_image", "image", "images", "file", "upload_images"]
+    ult = ""
+    for campo in nomes:
+        try:
+            res = _shopee_multipart("/api/v2/returns/convert_image", {}, [(campo, nome, dados, "image/jpeg")], loja=loja)
+        except Exception as e:
+            ult = str(e)
+            if "no such file" in ult or "param" in ult.lower():
+                continue
+            raise RuntimeError(f"foto: {ult}")
+        us = _urls_em(res.get("response") or res)
+        if us:
+            _CAMPO_FOTO["nome"] = campo
+            return us[0]
+        ult = "resposta sem URL: " + json.dumps(res)[:150]
+    raise RuntimeError(f"foto nao subiu ({ult[:150]})")
+
+
 def dev_enviar_shopee(dev_id, texto, email=""):
     """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar).
     So diz 'enviado' depois de conferir na propria Shopee que a contestacao entrou."""
@@ -1308,11 +1342,7 @@ def dev_enviar_shopee(dev_id, texto, email=""):
     passos, urls, avisos = [], [], []
     for m in fotos[:9]:
         with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
-            res = _shopee_multipart("/api/v2/returns/convert_image", {}, [("image", m["arquivo"], f.read(), "image/jpeg")], loja=loja)
-        rr = res.get("response") or {}
-        u = rr.get("url") or ((rr.get("images") or [{}])[0].get("url")) or ""
-        if u:
-            urls.append(u)
+            urls.append(_dev_converter_foto(loja, m["arquivo"], f.read()))
     passos.append(f"{len(urls)} foto(s) enviada(s)")
     vids = []
     for m in videos[:1]:
