@@ -37,21 +37,52 @@
   .mini{font-size:13px;color:#666}
   .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
   .cols .box{background:#fff;border-radius:12px;padding:10px}.cols .box div{display:flex;justify-content:space-between;border-bottom:1px solid #f0f0f0;padding:4px 0;font-size:14px}
+  #oq{display:none;background:#fff;border:4px solid #7c3aed;border-radius:14px;padding:14px;margin:10px 0}
+  #oq h3{margin:0 0 6px;font-size:20px}.rec{display:inline-block;font-size:20px;font-weight:900;padding:6px 14px;border-radius:10px;color:#fff;background:#16a34a}
+  .rec.CONFERIR{background:#f59e0b}.rec.v{background:#2563eb}
+  #oq .bloco{margin-top:10px;background:#f8f7ff;border-radius:10px;padding:10px}
+  #oq .bloco b{display:block;margin-bottom:4px}
+  #oq label{display:flex;gap:8px;align-items:flex-start;padding:4px 0;font-size:16px}
+  #oq textarea{width:100%;box-sizing:border-box;min-height:150px;font-size:15px;padding:8px;border-radius:8px;border:1px solid #bbb}
+  #oq .cp{background:#7c3aed;color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:16px;font-weight:bold;margin-top:6px}
+  #oq .fechar{float:right;background:#eee;border:0;border-radius:8px;padding:6px 10px}
+  .oqb{background:#ede9fe;color:#5b21b6;border:0;border-radius:8px;padding:8px 12px;font-weight:bold;margin-top:8px;width:100%}
+  #camBox{display:none;position:fixed;inset:0;background:#000;z-index:50;flex-direction:column;align-items:center;justify-content:center}
+  #camBox video{width:100%;max-height:75vh;object-fit:cover}
+  #camBox .mira{position:absolute;left:10%;right:10%;top:40%;height:20%;border:4px solid #22c55e;border-radius:12px;pointer-events:none}
+  #camBox p{color:#fff;font-size:18px;margin:12px}#camBox button{font-size:18px;padding:12px 24px;border:0;border-radius:10px}
+  .foto{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;flex-wrap:wrap}
+  .foto span{flex:1;min-width:160px}.foto .tb{background:#7c3aed;color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:15px;font-weight:bold}
+  .foto.ok .tb{background:#16a34a}.th{display:flex;gap:6px;flex-wrap:wrap;width:100%}
+  .th div{position:relative}.th img{width:72px;height:72px;object-fit:cover;border-radius:8px;border:2px solid #16a34a}
+  .th button{position:absolute;top:-6px;right:-6px;background:#dc2626;color:#fff;border:0;border-radius:50%;width:22px;height:22px;font-size:12px}
+  .vid{color:#15803d;font-weight:bold}
+  .env{width:100%;font-size:19px;padding:14px;border:0;border-radius:12px;background:#ee4d2d;color:#fff;font-weight:900;margin-top:8px}
+  .env:disabled{background:#d1d5db;color:#555}
+  .barra{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin-top:4px}.barra i{display:block;height:100%;background:#7c3aed;width:0}
 </style>
 </head>
 <body>
 <header>
-  <h1>↩️ Devoluções <a href="/painel">Painel</a></h1>
-  <div class="reg"><input id="cod" placeholder="Bipe ou digite a etiqueta / nº do pedido" autocomplete="off" onkeydown="if(event.key=='Enter')registrar()"><button onclick="registrar()">Registrar</button></div>
+  <h1>↩️ Devoluções <a href="#" onclick="pedirChave();return false">trocar senha</a></h1>
+  <div class="reg"><input id="cod" placeholder="Bipe ou digite a etiqueta / nº do pedido" autocomplete="off" onkeydown="if(event.key=='Enter')registrar()"><button onclick="registrar()">Registrar</button><button onclick="abrirCamera()" title="Ler com a câmera do celular">📷</button></div>
   <div id="msg"></div>
 </header>
+<div id="camBox"><video id="camV" playsinline muted></video><div class="mira"></div><p id="camMsg">Aponte para o código de barras da etiqueta</p><button onclick="fecharCamera()">Fechar</button></div>
+<input type="file" id="arqFoto" accept="image/*" capture="environment" style="display:none">
+<input type="file" id="arqVideo" accept="video/*" capture="environment" style="display:none">
 <main>
+  <div id="oq"></div>
   <h2>📦 Chegou: conferir agora <span id="nPend"></span></h2>
   <div id="pend"></div>
 
   <h2>🚚 Pedidas na Shopee (a caminho) <button onclick="syncShopee()" style="font-size:13px">Atualizar</button></h2>
   <div class="mini" id="shInfo"></div>
   <div id="cam"></div>
+
+  <h2>🏆 O que funciona na Shopee (histórico das lojas)</h2>
+  <div class="tbl"><table id="apr"></table></div>
+  <div class="mini">Ganhou = a Shopee negou o reembolso ou compensou a loja. A conta melhora sozinha a cada devolução decidida.</div>
 
   <h2>📊 Resumo</h2>
   <div class="per">De <input type="date" id="de"> até <input type="date" id="ate"> <button onclick="carregar()">Ver</button></div>
@@ -66,20 +97,24 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const brl=v=>"R$ "+(v||0).toFixed(2).replace(".",",");
 let D=null;
+function chave(){try{return localStorage.getItem("chave")||""}catch(e){return ""}}
+function pedirChave(){const k=prompt("Senha da operação (a mesma chave do posto de bipagem):");if(k){try{localStorage.setItem("chave",k.trim())}catch(e){}location.reload()}}
+async function api(url,body){const h={"X-Chave":chave()};if(body!==undefined)h["Content-Type"]="application/json";
+  const r=await fetch(url,body===undefined?{headers:h}:{method:"POST",headers:h,body:JSON.stringify(body)});
+  if(r.status==401){pedirChave();throw "login"}return r.json()}
 const hoje=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
 $("de").value=new Date(Date.now()-3*3600e3-29*864e5).toISOString().slice(0,10);$("ate").value=hoje;
 async function carregar(){
-  const r=await fetch(`/api/devolucoes/tela?de=${$("de").value}&ate=${$("ate").value}`);
-  if(r.status==401){location.href="/painel";return}
-  D=await r.json();const mot=D.motivos;
+  D=await api(`/api/devolucoes/tela?de=${$("de").value}&ate=${$("ate").value}`);const mot=D.motivos;
   $("nPend").textContent=D.pendentes.length?`(${D.pendentes.length})`:"";
   $("pend").innerHTML=D.pendentes.map(p=>`<div class="card ${p.sugestao=="PERDA"?"perda":""}" id="d${p.id}">
     <div class="t">${esc(p.sku||"SKU desconhecido")} ${esc(p.cor||"")}</div>
     <div class="s">Pedido ${esc(p.pedido)} · ${p.loja||p.canal?esc(p.loja||p.canal)+" · ":""}${p.personalizado?(p.gravado?"personalizado <b>GRAVADO</b>":"personalizado (não gravado)"):"sem personalizar"}${p.quem?" · bipado por "+esc(p.quem):""}</div>
     <span class="sug ${p.sugestao}">Sugestão: ${p.sugestao=="PERDA"?"PERDA (já foi gravado)":"VOLTA PARA O ESTOQUE"}</span>
     ${p.sku?"":`<div class="linha3"><input id="s${p.id}" placeholder="SKU" autocapitalize="characters"><input id="c${p.id}" placeholder="Cor" autocapitalize="characters"><input id="q${p.id}" placeholder="Qtd" inputmode="numeric" value="1"></div>`}
-    <select id="m${p.id}"><option value="">Motivo…</option>${mot.map(m=>`<option ${m==p.motivo?"selected":""}>${esc(m)}</option>`).join("")}</select>
+    <select id="m${p.id}"><option value="">Motivo…</option>${[...new Set([...mot,...(p.motivo&&!mot.includes(p.motivo)?[p.motivo]:[])])].map(m=>`<option ${m==p.motivo?"selected":""}>${esc(m)}</option>`).join("")}</select>
     <input id="o${p.id}" placeholder="Observação (opcional)">
+    <button class="oqb" onclick="oque(${p.id})">📋 O que fazer na Shopee (fotos, vídeo e texto)</button>
     <div class="bts"><button class="b-est" onclick="decidir(${p.id},'ESTOQUE')">✅ Volta pro estoque</button><button class="b-per" onclick="decidir(${p.id},'PERDA')">🗑️ Perda</button></div></div>`).join("")
     ||'<div class="vazio">Nada para conferir. ✅</div>';
   $("shInfo").textContent=(D.shopee.em?"Última leitura: "+D.shopee.em:"Lê sozinho a cada 10 min.")+(D.shopee.erro?" · ERRO: "+D.shopee.erro:"");
@@ -96,10 +131,10 @@ async function carregar(){
     <td>${esc(h.loja||h.canal)}</td><td>${esc(h.motivo)}</td><td><span class="tag t-${h.situacao}">${h.situacao=="ESTOQUE"?"voltou ao estoque":h.situacao=="PERDA"?"perda":"a conferir"}</span></td>
     <td>${h.custo!=null?brl(h.custo):"—"}</td><td>${h.situacao!="CONFERIR"?`<button onclick="refazer(${h.id})" style="font-size:12px">Refazer</button>`:""}</td></tr>`).join("");
 }
-async function post(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(r.status==401){location.href="/painel";throw "login"}return r.json()}
+async function post(url,body){return api(url,body||{})}
 async function registrar(){const c=$("cod").value.trim();if(!c)return;$("msg").textContent="Registrando...";
-  try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada (${d.registradas})`:"Já estava registrada"):"❌ "+d.erro;$("cod").value="";carregar()}
+  try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada (${d.registradas})`:"Já estava registrada"):"❌ "+d.erro;$("cod").value="";carregar();
+    if(d.ok&&d.ids&&d.ids.length)oque(d.ids[0])}
   catch(e){$("msg").textContent="❌ Não salvou — tente de novo"}$("cod").focus()}
 async function decidir(id,destino){const m=$("m"+id).value;
   if(!m){$("msg").textContent="Escolha o MOTIVO antes";$("m"+id).focus();return}
@@ -110,8 +145,89 @@ async function decidir(id,destino){const m=$("m"+id).value;
   $("msg").textContent=d.ok?(destino=="ESTOQUE"?(d.entrou_no_estoque.length?"✅ Voltou ao estoque: "+d.entrou_no_estoque.map(x=>`${x.sku} ${x.cor} +${x.qtd}`).join(", "):"✅ Registrado ("+d.aviso+")"):"🗑️ Registrado como perda"):"❌ "+d.erro;
   carregar()}
 async function refazer(id){const d=await post("/api/devolucoes/decidir",{id,destino:"CONFERIR"});$("msg").textContent=d.ok?"↩ Voltou para conferir (estoque desfeito)":"❌ "+d.erro;carregar()}
+let OQ=null;
+async function oque(id){const o=await api("/api/devolucoes/orientacao?id="+id);OQ=o;desenharOq()}
+function desenharOq(){const o=OQ,el=$("oq");
+  if(!o.ok){el.style.display="block";el.innerHTML=`<p>❌ ${esc(o.erro)}</p>`;return}
+  const cls=o.recomendacao=="CONFERIR"?"CONFERIR":o.recomendacao=="CONTESTAR"?"":"v";
+  const daFoto=r=>o.midias.filter(m=>m.tipo=="foto"&&m.rotulo==r);
+  const vids=o.midias.filter(m=>m.tipo=="video");const k=encodeURIComponent(chave());
+  const thumb=m=>`<div><img src="/api/devolucoes/arquivo/${o.id}/${m.arquivo}?k=${k}"><button onclick="apagar('${m.arquivo}')">✕</button></div>`;
+  const nFotos=o.midias.filter(m=>m.tipo=="foto").length;
+  el.style.display="block";
+  el.innerHTML=`<button class="fechar" onclick="$('oq').style.display='none'">✕ fechar</button>
+   <h3>Pedido ${esc(o.pedido)} ${o.loja?"· "+esc(o.loja):""}</h3>
+   <span class="rec ${cls}">${esc(o.recomendacao)}</span>
+   <p><b>Motivo:</b> ${esc(o.motivo)}${o.motivo_comprador?` — “${esc(o.motivo_comprador)}”`:""}${o.prazo?`<br><b>⏰ Responder na Shopee até: ${esc(o.prazo)}</b>`:""}
+   ${o.shopee?`<br>Shopee: ${esc(o.shopee.situacao)}`:"<br><span class='mini'>Ainda não achei essa devolução na Shopee (ela aparece quando o comprador abre o pedido de devolução).</span>"}</p>
+   <p>${esc(o.porque)}</p>
+   <div class="bloco"><b>🎥 1. Grave o vídeo ANTES de abrir</b>${esc(o.video)}
+     <div class="foto ${vids.length?"ok":""}"><span>${vids.length?`<span class="vid">✅ Vídeo gravado (${(vids[0].bytes/1048576).toFixed(1)} MB)</span>`:"Vídeo da abertura"}</span>
+     <button class="tb" onclick="tirar('video','Vídeo da abertura')">${vids.length?"Gravar de novo":"🎥 Gravar vídeo"}</button>
+     ${vids.length?`<button class="tb" style="background:#dc2626" onclick="apagar('${vids[0].arquivo}')">✕</button>`:""}</div>
+     <div class="barra" id="barra" style="display:none"><i></i></div></div>
+   <div class="bloco"><b>📸 2. Tire estas fotos</b>${o.fotos.map((f,i)=>{const t=daFoto(f);return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}${esc(f)}</span><button class="tb" onclick="tirar('foto',OQ.fotos[${i}])">📸 ${t.length?"Mais uma":"Tirar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`}).join("")}
+     <div class="foto"><span>Outra foto (opcional)</span><button class="tb" onclick="tirar('foto','Outra foto')">📸 Tirar</button><div class="th">${daFoto("Outra foto").map(thumb).join("")}</div></div></div>
+   <div class="bloco"><b>✍️ 3. Texto para a Shopee</b><textarea id="oqTxt">${esc(o.texto)}</textarea>
+     <button class="cp" onclick="copiar('oqTxt')">📋 Copiar texto</button>
+     ${o.textos_que_ganharam.length?`<details style="margin-top:8px"><summary><b>Textos que já GANHARAM nesse motivo</b></summary>${o.textos_que_ganharam.map((t,i)=>`<textarea id="oqW${i}" style="min-height:90px">${esc(t)}</textarea><button class="cp" onclick="usar(${i})">Usar este</button>`).join("")}</details>`:""}</div>
+   <div class="bloco"><b>📤 4. Enviar para a Shopee</b>
+     ${o.enviado_em?`<p class="vid">✅ Enviado em ${esc(new Date(o.enviado_em).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}))}<br>${esc((o.envio.passos||[]).join(" · "))}</p>${(o.envio.avisos||[]).length?`<p style="color:#b45309">⚠️ ${esc(o.envio.avisos.join(" · "))}</p>`:""}`:
+      `<input id="oqMail" placeholder="E-mail da loja para a Shopee responder" value="${esc(o.email)}" style="width:100%;box-sizing:border-box;font-size:16px;padding:8px;border:1px solid #bbb;border-radius:8px">
+       <button class="env" onclick="enviar()" ${o.shopee&&nFotos?"":"disabled"}>🚀 Enviar para a Shopee</button>
+       <div class="mini">${!o.shopee?"Só dá para enviar quando a devolução aparecer na Shopee.":!nFotos?"Tire as fotos antes de enviar.":"Confira o texto: ele vai exatamente como está acima, com as fotos e o vídeo. Envie SÓ o que é verdade."}</div>
+       <details style="margin-top:6px"><summary>Prefere enviar pelo Seller Center?</summary>${o.como_enviar.map((x,i)=>`<div>${i+1}. ${esc(x)}</div>`).join("")}</details>`}</div>`;
+}
+function usar(i){$("oqTxt").value=$("oqW"+i).value;$("msg").textContent="Texto trocado — confira antes de enviar"}
+let TIRAR=null;
+function tirar(tipo,rotulo){TIRAR={tipo,rotulo};const inp=$(tipo=="video"?"arqVideo":"arqFoto");inp.value="";inp.click()}
+async function reduzir(file){const img=await new Promise((ok,er)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=er;i.src=URL.createObjectURL(file)});
+  const m=1600,e=Math.min(1,m/Math.max(img.width,img.height)),c=document.createElement("canvas");c.width=Math.round(img.width*e);c.height=Math.round(img.height*e);
+  c.getContext("2d").drawImage(img,0,0,c.width,c.height);return await new Promise(ok=>c.toBlob(ok,"image/jpeg",.85))}
+function subir(blob,tipo,rotulo,ext){return new Promise((ok,er)=>{const x=new XMLHttpRequest();
+  x.open("POST",`/api/devolucoes/midia?id=${OQ.id}&tipo=${tipo}&ext=${ext}&rotulo=${encodeURIComponent(rotulo)}`);x.setRequestHeader("X-Chave",chave());
+  const b=$("barra");if(tipo=="video"&&b){b.style.display="block";x.upload.onprogress=e=>{if(e.lengthComputable)b.firstChild.style.width=(100*e.loaded/e.total)+"%"}}
+  x.onload=()=>{try{ok(JSON.parse(x.responseText))}catch(e){er(e)}};x.onerror=()=>er("rede");x.send(blob)})}
+async function arquivoEscolhido(ev){const f=ev.target.files[0];if(!f||!TIRAR)return;$("msg").textContent=TIRAR.tipo=="video"?"Enviando o vídeo...":"Salvando a foto...";
+  try{let blob=f,ext=(f.name.split(".").pop()||"").toLowerCase();
+    if(TIRAR.tipo=="foto"){blob=await reduzir(f);ext="jpg"}
+    if(TIRAR.tipo=="video"){for(const m of OQ.midias.filter(m=>m.tipo=="video"))await post("/api/devolucoes/apagar-midia",{id:OQ.id,arquivo:m.arquivo})}
+    const r=await subir(blob,TIRAR.tipo,TIRAR.rotulo,ext);if(!r.ok)throw r.erro;OQ.midias=r.midias;desenharOq();$("msg").textContent=TIRAR.tipo=="video"?"✅ Vídeo salvo":"✅ Foto salva"}
+  catch(e){$("msg").textContent="❌ Não salvou: "+e}}
+$("arqFoto").onchange=arquivoEscolhido;$("arqVideo").onchange=arquivoEscolhido;
+async function apagar(a){const r=await post("/api/devolucoes/apagar-midia",{id:OQ.id,arquivo:a});if(r.ok){OQ.midias=r.midias;desenharOq()}}
+async function enviar(){const t=$("oqTxt").value,em=$("oqMail").value.trim();
+  if(/\[.*\]/.test(t))return alert("Ajuste o que está entre [colchetes] no texto antes de enviar.");
+  const nf=OQ.midias.filter(m=>m.tipo=="foto").length,nv=OQ.midias.filter(m=>m.tipo=="video").length;
+  if(!confirm(`Enviar a contestação do pedido ${OQ.pedido} para a Shopee?\n\n${nf} foto(s) + ${nv} vídeo + o texto.\n\nSó envie se tudo for verdade.`))return;
+  if(em)await post("/api/devolucoes/email",{email:em});
+  $("msg").textContent="Enviando para a Shopee... (pode levar 1 minuto)";
+  const r=await post("/api/devolucoes/enviar",{id:OQ.id,texto:t,email:em});
+  $("msg").textContent=r.ok?"✅ Enviado para a Shopee":"❌ "+r.erro;if(r.ok)oque(OQ.id);else alert(r.erro)}
+// ---- leitura pela camera do celular
+let CAM=null,ZX=null;
+async function abrirCamera(){const box=$("camBox");box.style.display="flex";$("camMsg").textContent="Aponte para o código de barras da etiqueta";
+  try{const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false});const v=$("camV");v.srcObject=st;await v.play();CAM={st,v,on:true};
+    if("BarcodeDetector" in window){const det=new BarcodeDetector({formats:["code_128","code_39","ean_13","qr_code","itf","codabar","data_matrix"]});
+      const loop=async()=>{if(!CAM||!CAM.on)return;try{const r=await det.detect(v);const c=r.find(x=>(x.rawValue||"").length>=8);if(c)return lido(c.rawValue)}catch(e){}requestAnimationFrame(loop)};loop()}
+    else{await carregarZXing();
+      const h=new Map();h.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.CODE_128,ZXing.BarcodeFormat.CODE_39,ZXing.BarcodeFormat.ITF,ZXing.BarcodeFormat.EAN_13,ZXing.BarcodeFormat.CODABAR,ZXing.BarcodeFormat.QR_CODE,ZXing.BarcodeFormat.DATA_MATRIX]);h.set(ZXing.DecodeHintType.TRY_HARDER,true);
+      const rd=new ZXing.MultiFormatReader();rd.setHints(h);const cv=document.createElement("canvas"),cx=cv.getContext("2d",{willReadFrequently:true});
+      const passo=()=>{if(!CAM||!CAM.on)return;if(v.videoWidth){const e=Math.min(1,1280/v.videoWidth);cv.width=Math.round(v.videoWidth*e);cv.height=Math.round(v.videoHeight*e);cx.drawImage(v,0,0,cv.width,cv.height);
+          try{const bm=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(cv)));const r=rd.decode(bm);const t=r&&r.getText();if(t&&t.length>=8)return lido(t)}catch(e){}}
+        setTimeout(passo,120)};passo()}}
+  catch(e){$("camMsg").textContent="Não consegui abrir a câmera: "+e+" — permita a câmera para este site."}}
+function carregarZXing(){return new Promise((ok,er)=>{if(window.ZXing)return ok();const s=document.createElement("script");s.src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js";s.onload=ok;s.onerror=()=>er("sem leitor de código");document.head.appendChild(s)})}
+function fecharCamera(){if(CAM){CAM.on=false;CAM.st.getTracks().forEach(t=>t.stop())}CAM=null;$("camBox").style.display="none"}
+function lido(txt){fecharCamera();try{navigator.vibrate&&navigator.vibrate(150)}catch(e){}$("cod").value=txt;registrar()}
+function copiar(id){const t=$(id);t.select();const ok=()=>$("msg").textContent="📋 Texto copiado — cole na Shopee";
+  const vel=()=>{try{document.execCommand("copy");ok()}catch(e){$("msg").textContent="Selecione o texto e copie (Ctrl+C)"}};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t.value).then(ok,vel);else vel()}
+async function carregarApr(){try{const a=await api("/api/devolucoes/aprendizado");
+  $("apr").innerHTML="<tr><th>Motivo</th><th>Devoluções</th><th>Contestadas</th><th>Ganhamos</th><th>Perdemos</th><th>Taxa</th></tr>"+
+   (a.motivos.map(m=>`<tr><td>${esc(m.nome)}</td><td>${m.casos}</td><td>${m.contestadas}</td><td>${m.ganhou}</td><td>${m.perdeu}</td><td><b>${m.taxa==null?"—":m.taxa+"%"}</b></td></tr>`).join("")||'<tr><td colspan="6">Ainda sem histórico — a Central lê a Shopee a cada 10 min.</td></tr>')}catch(e){}}
 async function syncShopee(){$("shInfo").textContent="Lendo a Shopee...";await post("/api/devolucoes/shopee",{});carregar()}
-carregar();setInterval(carregar,60000);$("cod").focus();
+carregar().catch(()=>{});carregarApr();setInterval(carregar,60000);setInterval(carregarApr,300000);$("cod").focus();
 </script>
 </body>
 </html>

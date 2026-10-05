@@ -82,6 +82,14 @@ def iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS shopee_devolucoes(return_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
             order_sn TEXT, status TEXT, motivo TEXT, texto TEXT, prazo INTEGER, rastreio TEXT, valor REAL, itens TEXT,
             criado INTEGER, atualizado INTEGER)""")
+        cols_dv = [r[1] for r in c.execute("PRAGMA table_info(devolucoes)")]
+        for col in ("midias", "enviado_em", "envio_resp"):
+            if col not in cols_dv:
+                c.execute(f"ALTER TABLE devolucoes ADD COLUMN {col} TEXT")
+        cols_sd = [r[1] for r in c.execute("PRAGMA table_info(shopee_devolucoes)")]
+        for col, tipo in (("detalhe", "TEXT"), ("resultado", "TEXT"), ("contestou", "INTEGER DEFAULT 0")):
+            if col not in cols_sd:
+                c.execute(f"ALTER TABLE shopee_devolucoes ADD COLUMN {col} {tipo}")
         c.execute("""CREATE TABLE IF NOT EXISTS shopee_pedidos(order_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
             status TEXT, criado INTEGER, atualizado INTEGER, prazo INTEGER, envio TEXT, msg TEXT, itens TEXT,
             motivo TEXT, visto_em TEXT)""")
@@ -396,6 +404,8 @@ def _bipar(posto, codigo, operador, modo):
             return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}", "evento": "desfazer"}
         itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
                           "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
+        if not itens and posto == "DEVOLUCAO":
+            itens = _itens_devolucao(c, cod)
         if not itens and posto == "DEVOLUCAO":
             iid = c.execute("""INSERT INTO itens(chave,lote,pedido,sku,personalizado,status,criado_em,atualizado_em)
                                VALUES(?,?,?,?,0,'AGUARDANDO',?,?)""",
@@ -780,7 +790,7 @@ def _dev_criar(c, item, colaborador_id=None):
     c.execute("""INSERT INTO devolucoes(item_id, pedido, canal, loja, sku, cor, personalizado, gravado, sugestao, situacao,
                  motivo, obs, custo, colaborador_id, em, return_sn) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (item["id"], item["pedido"], item["canal"], item["loja"], item["sku"], item["cor"], item["personalizado"],
-               1 if gravado else 0, sug, "CONFERIR", (ret[1] if ret else ""), "", custo_de(c, item["sku"]),
+               1 if gravado else 0, sug, "CONFERIR", (DEV_CAT_PT[_dev_categoria(ret[1])] if ret and ret[1] else ""), "", custo_de(c, item["sku"]),
                colaborador_id, agora(), ret[0] if ret else ""))
 
 
@@ -830,7 +840,7 @@ def dev_registrar(codigo):
     if not cod:
         return {"ok": False, "erro": "informe o codigo da etiqueta ou o numero do pedido"}
     with _lock, conn() as c:
-        itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? ORDER BY i.id", (cod,)).fetchall()
+        itens = _itens_devolucao(c, cod)
         if not itens:
             iid = c.execute("""INSERT INTO itens(chave,lote,pedido,sku,personalizado,status,criado_em,atualizado_em)
                                VALUES(?,?,?,?,0,'AGUARDANDO',?,?)""",
@@ -845,7 +855,9 @@ def dev_registrar(codigo):
                 recalcular(c, i["id"])
                 n += 1
             _dev_criar(c, dict(c.execute("SELECT * FROM itens WHERE id=?", (i["id"],)).fetchone()))
-    return {"ok": True, "registradas": n, "ja_estavam": len(itens) - n}
+        ids = [r[0] for r in c.execute(f"SELECT id FROM devolucoes WHERE item_id IN ({','.join('?' * len(itens))})",
+                                        [i["id"] for i in itens])]
+    return {"ok": True, "registradas": n, "ja_estavam": len(itens) - n, "ids": ids}
 
 
 def devolucoes_tela(de, ate):
@@ -862,6 +874,7 @@ def devolucoes_tela(de, ate):
         x["itens"] = json.loads(x["itens"] or "[]")
         x["chegou"] = x["order_sn"] in {norm(p) for p in chegou}
         x["status_pt"] = SHOPEE_DEV_PT.get(x["status"], x["status"])
+        x["motivo"] = DEV_CAT_PT[_dev_categoria(x["motivo"] or "", x["texto"] or "")]
         x["prazo_txt"] = datetime.fromtimestamp(x["prazo"], BR).strftime("%d/%m %H:%M") if x["prazo"] else ""
     res = {"total": len(hist), "estoque": 0, "perda": 0, "conferir": 0, "custo_perda": 0.0, "por_motivo": {}, "por_produto": {},
            "por_loja": {}}
@@ -875,7 +888,7 @@ def devolucoes_tela(de, ate):
             res[chave][v] = res[chave].get(v, 0) + 1
     for chave in ("por_motivo", "por_produto", "por_loja"):
         res[chave] = sorted(res[chave].items(), key=lambda x: -x[1])
-    return {"pendentes": pend, "historico": hist, "resumo": res, "a_caminho": cam, "motivos": DEV_MOTIVOS,
+    return {"pendentes": pend, "historico": hist, "resumo": res, "a_caminho": cam, "motivos": list(DEV_CAT_PT.values()),
             "shopee": _shopee_dev_status}
 
 
@@ -887,38 +900,463 @@ _shopee_dev_status = {"em": "", "erro": ""}
 
 
 def shopee_devolucoes_sincronizar(dias=15):
+    """Le as devolucoes das lojas (SO LEITURA). Na 1a vez puxa ~6 meses de historico para aprender o que ganha.
+    Para cada devolucao guarda o detalhe (motivo, provas, contestacao, resultado) sem dados pessoais do comprador."""
     import time
     with conn() as c:
         lojas = [dict(r) for r in c.execute("SELECT shop_id, nome FROM shopee_lojas")]
+        hist_ok = c.execute("SELECT 1 FROM meta WHERE chave='shopee_dev_historico'").fetchone()
     fim = int(time.time())
-    n, erros = 0, []
+    total_dias = dias if hist_ok else 180
+    n, erros, detalhes = 0, [], 0
     for l in lojas:
         try:
             loja = _shopee_token_ok(l["shop_id"])
-            for pg in range(50):
-                res = _shopee_http("GET", "/api/v2/returns/get_return_list", loja=loja,
-                                   params={"page_no": pg, "page_size": 100, "create_time_from": fim - dias * 86400,
-                                           "create_time_to": fim})
-                rr = res.get("response") or {}
-                lst = rr.get("return") or rr.get("return_list") or []
+            sns = []
+            ate = fim
+            while ate > fim - total_dias * 86400:   # a Shopee aceita no maximo 15 dias por consulta
+                de = max(fim - total_dias * 86400, ate - 15 * 86400 + 60)
+                for pg in range(50):
+                    res = _shopee_http("GET", "/api/v2/returns/get_return_list", loja=loja,
+                                       params={"page_no": pg, "page_size": 100, "create_time_from": de, "create_time_to": ate})
+                    rr = res.get("response") or {}
+                    lst = rr.get("return") or rr.get("return_list") or []
+                    with _lock, conn() as c:
+                        for x in lst:
+                            sn = str(x.get("return_sn"))
+                            ant = c.execute("SELECT atualizado, detalhe FROM shopee_devolucoes WHERE return_sn=?", (sn,)).fetchone()
+                            itens = [{"sku": i.get("variation_sku") or i.get("item_sku") or "", "nome": (i.get("name") or "")[:60],
+                                      "qtd": int(i.get("amount") or 1)} for i in (x.get("item") or [])]
+                            c.execute("""INSERT INTO shopee_devolucoes(return_sn, shop_id, loja, order_sn, status, motivo, texto, prazo,
+                                         rastreio, valor, itens, criado, atualizado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                         ON CONFLICT(return_sn) DO UPDATE SET status=excluded.status, motivo=excluded.motivo,
+                                         texto=excluded.texto, prazo=excluded.prazo, rastreio=excluded.rastreio, valor=excluded.valor,
+                                         itens=excluded.itens, atualizado=excluded.atualizado""",
+                                      (sn, l["shop_id"], loja.get("nome") or l["nome"], norm(x.get("order_sn")),
+                                       x.get("status") or "", x.get("reason") or "", (x.get("text_reason") or "")[:300],
+                                       int(x.get("due_date") or 0), norm(x.get("tracking_number") or ""),
+                                       float(x.get("refund_amount") or 0), json.dumps(itens, ensure_ascii=False),
+                                       int(x.get("create_time") or 0), int(x.get("update_time") or 0)))
+                            if not ant or not ant[1] or int(ant[0] or 0) != int(x.get("update_time") or 0):
+                                sns.append(sn)
+                            n += 1
+                    if not rr.get("more"):
+                        break
+                ate = de - 1
+            for sn in dict.fromkeys(sns):   # detalhe so do que mudou (uma vez cada)
+                try:
+                    det = (_shopee_http("GET", "/api/v2/returns/get_return_detail", loja=loja,
+                                        params={"return_sn": sn}).get("response") or {})
+                except Exception as e:
+                    erros.append(f"detalhe {sn}: {e}"[:150])
+                    continue
+                for k in ("user", "return_address", "return_pickup_address", "virtual_contact_number", "package_number"):
+                    det.pop(k, None)   # nada de dado pessoal do comprador
                 with _lock, conn() as c:
-                    for x in lst:
-                        itens = [{"sku": i.get("variation_sku") or i.get("item_sku") or "", "nome": (i.get("name") or "")[:60],
-                                  "qtd": int(i.get("amount") or 1)} for i in (x.get("item") or [])]
-                        c.execute("""INSERT OR REPLACE INTO shopee_devolucoes(return_sn, shop_id, loja, order_sn, status, motivo,
-                                     texto, prazo, rastreio, valor, itens, criado, atualizado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                  (str(x.get("return_sn")), l["shop_id"], loja.get("nome") or l["nome"], norm(x.get("order_sn")),
-                                   x.get("status") or "", x.get("reason") or "", (x.get("text_reason") or "")[:300],
-                                   int(x.get("due_date") or 0), x.get("tracking_number") or "",
-                                   float(x.get("refund_amount") or 0), json.dumps(itens, ensure_ascii=False),
-                                   int(x.get("create_time") or 0), int(x.get("update_time") or 0)))
-                        n += 1
-                if not rr.get("more"):
-                    break
+                    c.execute("UPDATE shopee_devolucoes SET detalhe=?, resultado=?, contestou=?, rastreio=COALESCE(NULLIF(?,''),rastreio) WHERE return_sn=?",
+                              (json.dumps(det, ensure_ascii=False)[:60000], _dev_resultado(det), 1 if _dev_contestou(det) else 0,
+                               norm(det.get("tracking_number") or ""), sn))
+                detalhes += 1
+                time.sleep(0.1)
         except Exception as e:
             erros.append(f"{l['nome'] or l['shop_id']}: {e}"[:200])
-    _shopee_dev_status.update(em=datetime.now(BR).strftime("%d/%m %H:%M"), erro=" | ".join(erros))
-    return {"ok": not erros, "devolucoes": n, "erros": erros}
+    if not erros and lojas:
+        with _lock, conn() as c:
+            c.execute("INSERT OR IGNORE INTO meta VALUES('shopee_dev_historico', ?)", (agora(),))
+    _shopee_dev_status.update(em=datetime.now(BR).strftime("%d/%m %H:%M"), erro=" | ".join(erros[:5]))
+    return {"ok": not erros, "devolucoes": n, "detalhes": detalhes, "erros": erros[:10]}
+
+
+# ---- inteligencia de devolucao: o que fazer em cada caso, aprendendo com o historico das lojas
+def _dev_contestou(det):
+    sp = det.get("seller_proof") or {}
+    return bool(det.get("dispute_reason") or det.get("dispute_text_reason") or
+                (sp.get("seller_proof_status") not in (None, "", "NOT_NEEDED", "NOT_REQUIRED")) or
+                det.get("status") in ("JUDGING", "SELLER_DISPUTE"))
+
+
+def _dev_resultado(det):
+    """GANHOU (comprador nao recebeu reembolso / compensacao aprovada), PERDEU (reembolsado), ANDAMENTO.
+    Regra provisoria: ajustar quando virmos os dados reais de cada loja."""
+    st = (det.get("status") or "").upper()
+    comp = ((det.get("seller_compensation") or {}).get("seller_compensation_status") or "").upper()
+    if "APPROVED" in comp:
+        return "GANHOU"
+    if st in ("REQUESTED", "PROCESSING", "JUDGING", "SELLER_DISPUTE"):
+        return "ANDAMENTO"
+    if st == "CANCELLED":
+        return "GANHOU"
+    if st in ("ACCEPTED", "CLOSED", "REFUND_PAID", "COMPLETED"):
+        return "PERDEU" if float(det.get("refund_amount") or 0) > 0 else "GANHOU"
+    return "ANDAMENTO"
+
+
+def _dev_categoria(motivo, texto=""):
+    m = f"{motivo} {texto}".upper()
+    if "NOME ERRADO" in m or "GRAVA" in m:
+        return "nome"
+    if "RECEIPT" in m or "NOT_RECEIV" in m or "NAO RECEB" in m or "NÃO RECEB" in m or "EXTRAV" in m:
+        return "nao_recebido"
+    if "MISSING" in m or "EMPTY" in m or "INCOMPLE" in m or "FALT" in m:
+        return "faltando"
+    if "DMG" in m or "DAMAG" in m or "BROKEN" in m or "DEFECT" in m or "FUNCTION" in m or "QUEBR" in m or "AVARIA" in m or "DEFEITO" in m:
+        return "danificado"
+    if "WRONG" in m or "DIFF" in m or "FAKE" in m or "ERRAD" in m or "DIFEREN" in m:
+        return "diferente"
+    if "CHANGE" in m or "MIND" in m or "EXPECT" in m or "DESIST" in m or "ARREPEND" in m or "NO_LONGER" in m:
+        return "arrependimento"
+    return "outro"
+
+
+DEV_CAT_PT = {"arrependimento": "Arrependimento / não quer mais", "danificado": "Chegou quebrado / com defeito",
+              "diferente": "Produto, cor ou modelo diferente", "faltando": "Faltou item / pacote vazio",
+              "nao_recebido": "Não recebeu", "nome": "Nome/gravação errada", "outro": "Outro motivo"}
+
+# provas que contam em cada caso (sempre verdadeiras: so o que de fato aconteceu)
+DEV_VIDEO = ("VÍDEO SEM CORTE, celular na horizontal, boa luz: comece mostrando a ETIQUETA da devolução com o nº do pedido legível, "
+             "gire o pacote mostrando os 6 lados FECHADO, abra na frente da câmera e mostre tudo que tem dentro, peça por peça.")
+DEV_PLAY = {
+    "arrependimento": {
+        "fotos": ["Etiqueta da devolução com o nº do pedido legível", "Produto mostrando o NOME GRAVADO bem de perto",
+                  "Print do pedido/chat em que o comprador mandou esse nome (Seller Center > pedido > mensagem do comprador)",
+                  "Produto inteiro: estado em que voltou (riscos, uso, peças faltando)"],
+        "texto": ("Solicito a análise desta devolução. O produto do pedido {pedido} foi PERSONALIZADO sob encomenda com o nome "
+                  "\"{nome}\", exatamente como informado pelo comprador na compra (print anexo). Por ser gravado a laser com o nome "
+                  "escolhido pelo cliente, o item não pode ser revendido. O produto foi entregue conforme o anúncio e sem defeito "
+                  "(fotos e vídeo anexos). Peço que a devolução por desistência não seja aceita ou, se for, que o vendedor seja compensado."),
+        "sem_pers": ("Solicito a análise desta devolução do pedido {pedido}. O produto foi enviado conforme o anúncio, sem defeito, "
+                     "e retornou {estado}. Seguem fotos e vídeo do recebimento. Peço a compensação pelo valor do item devolvido.")},
+    "danificado": {
+        "fotos": ["Etiqueta da devolução com o nº do pedido legível", "Embalagem por fora (os 6 lados), mostrando se veio amassada ou violada",
+                  "O dano de perto, com uma régua ou moeda para dar escala", "Peso do pacote na balança (comparar com o peso do envio)",
+                  "Se tiver: vídeo/foto da EMBALAGEM NO DIA DO ENVIO (proteção usada)"],
+        "texto": ("Solicito a análise da devolução do pedido {pedido}. O produto foi enviado em perfeito estado e bem protegido "
+                  "({protecao}). Ao receber a devolução, constatamos: {estado}. Seguem vídeo da abertura do pacote sem cortes, fotos "
+                  "da embalagem e do produto. {extra}Peço a análise e a compensação ao vendedor caso o dano tenha ocorrido no transporte ou após a entrega.")},
+    "diferente": {
+        "fotos": ["Etiqueta da devolução com o nº do pedido legível", "Produto devolvido ao lado da etiqueta, mostrando SKU/cor",
+                  "Print da variação comprada no pedido (cor/modelo) no Seller Center", "Foto do anúncio mostrando que o produto é o mesmo"],
+        "texto": ("Solicito a análise da devolução do pedido {pedido}. O comprador escolheu a variação \"{variacao}\" e recebeu exatamente "
+                  "esse produto ({sku} {cor}), como mostram as fotos do item devolvido ao lado da etiqueta e o print do pedido. "
+                  "O produto corresponde ao anúncio. Peço que a devolução não seja aceita / que o vendedor seja compensado.")},
+    "faltando": {
+        "fotos": ["Etiqueta da devolução com o nº do pedido legível", "Peso do pacote na balança",
+                  "Etiqueta de ENVIO original mostrando o peso declarado (se tiver)", "Tudo que veio dentro, espalhado na mesa"],
+        "texto": ("Solicito a análise da devolução do pedido {pedido}. O pedido foi enviado completo ({qtd} unidade(s) de {sku}). "
+                  "Seguem vídeo da abertura da devolução sem cortes e o peso do pacote. {extra}Peço a análise junto à transportadora e a compensação ao vendedor se confirmado o envio completo.")},
+    "nao_recebido": {
+        "fotos": ["Print do rastreio mostrando ENTREGUE (data e hora)", "Se houver: foto/assinatura do recebedor no rastreio"],
+        "texto": ("Solicito a análise do pedido {pedido}. O rastreio da transportadora mostra o pacote ENTREGUE (print anexo). "
+                  "Peço que a Shopee confirme a entrega com a transportadora antes de reembolsar o comprador.")},
+    "nome": {
+        "fotos": ["Produto mostrando o NOME GRAVADO bem de perto", "Print do pedido/chat com o nome que o comprador escreveu"],
+        "texto": ("Solicito a análise da devolução do pedido {pedido}. O nome gravado (\"{nome}\") é exatamente o nome informado pelo "
+                  "comprador na compra, como mostra o print anexo, letra por letra. A gravação foi feita conforme o pedido do cliente. "
+                  "Peço que a devolução não seja aceita.")},
+    "outro": {
+        "fotos": ["Etiqueta da devolução com o nº do pedido legível", "Produto inteiro e de perto", "Embalagem por fora"],
+        "texto": ("Solicito a análise da devolução do pedido {pedido}. O produto foi enviado conforme o anúncio. Seguem fotos e vídeo "
+                  "do recebimento da devolução. Peço a análise e a compensação ao vendedor, se cabível.")},
+}
+
+
+def dev_aprendizado(c=None):
+    """Por motivo: quantas contestamos, quantas ganhamos, e o que as ganhas tinham (prova enviada, texto usado)."""
+    fechar = c is None
+    c = c or conn()
+    try:
+        est = {}
+        for r in c.execute("SELECT motivo, texto, resultado, contestou, detalhe FROM shopee_devolucoes"):
+            cat = _dev_categoria(r["motivo"], r["texto"])
+            e = est.setdefault(cat, {"categoria": cat, "nome": DEV_CAT_PT[cat], "casos": 0, "contestadas": 0, "ganhou": 0,
+                                     "perdeu": 0, "andamento": 0, "ganhou_com_prova": 0, "perdeu_sem_prova": 0, "textos_que_ganharam": []})
+            e["casos"] += 1
+            if r["contestou"]:
+                e["contestadas"] += 1
+            res = (r["resultado"] or "ANDAMENTO").lower()
+            e[res if res in ("ganhou", "perdeu", "andamento") else "andamento"] += 1
+            try:
+                det = json.loads(r["detalhe"] or "{}")
+            except Exception:
+                det = {}
+            prova = (det.get("seller_proof") or {}).get("seller_proof_status") not in (None, "", "NOT_NEEDED", "NOT_REQUIRED")
+            if res == "ganhou" and prova:
+                e["ganhou_com_prova"] += 1
+            if res == "perdeu" and not prova:
+                e["perdeu_sem_prova"] += 1
+            if res == "ganhou":
+                for t in det.get("dispute_text_reason") or []:
+                    if t and t not in e["textos_que_ganharam"]:
+                        e["textos_que_ganharam"].append(str(t)[:600])
+        for e in est.values():
+            dec = e["ganhou"] + e["perdeu"]
+            e["taxa"] = round(100 * e["ganhou"] / dec) if dec else None
+            e["textos_que_ganharam"] = e["textos_que_ganharam"][-3:]
+        return sorted(est.values(), key=lambda x: -x["casos"])
+    finally:
+        if fechar:
+            c.close()
+
+
+def dev_orientacao(dev_id):
+    """O que fazer com esta devolucao: contestar ou nao, prazo, fotos/video e o texto pronto para a Shopee."""
+    with conn() as c:
+        d = c.execute("SELECT * FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        if not d:
+            return {"ok": False, "erro": "devolucao nao encontrada"}
+        it = c.execute("SELECT * FROM itens WHERE id=?", (d["item_id"],)).fetchone()
+        sr = c.execute("""SELECT * FROM shopee_devolucoes WHERE return_sn=? OR order_sn=? OR (rastreio<>'' AND rastreio=?)
+                          ORDER BY criado DESC LIMIT 1""", (d["return_sn"] or "-", norm(d["pedido"]), norm(d["pedido"]))).fetchone()
+        apr = {e["categoria"]: e for e in dev_aprendizado(c)}
+    it = dict(it) if it else {}
+    sr = dict(sr) if sr else None
+    cat = _dev_categoria((sr or {}).get("motivo") or d["motivo"] or "", (sr or {}).get("texto") or "")
+    play = DEV_PLAY[cat]
+    pers = bool(d["personalizado"])
+    nome = (it.get("nomes") or "").strip()
+    e = apr.get(cat)
+    textos_ok = (e or {}).get("textos_que_ganharam") or []
+    campos = {"pedido": (sr or {}).get("order_sn") or d["pedido"], "nome": nome or "(nome gravado)", "sku": d["sku"] or "(SKU)",
+              "cor": d["cor"] or "", "variacao": f"{d['sku'] or ''} {d['cor'] or ''}".strip() or "(variação)",
+              "qtd": it.get("qtd") or 1, "estado": "[descreva como voltou: lacrado / usado / riscado / sem caixa]",
+              "protecao": "plástico bolha + caixa", "extra": "Também anexamos a foto/vídeo da embalagem no dia do envio. " if cat in ("danificado", "faltando") else ""}
+    base = play["texto"] if (cat != "arrependimento" or pers) else play["sem_pers"]
+    texto = base.format(**campos)
+    fotos = list(play["fotos"])
+    if pers and cat not in ("arrependimento", "nome"):
+        fotos.append("Produto mostrando o NOME GRAVADO (prova de que é personalizado e não pode ser revendido)")
+    # chance: historico das lojas para esse motivo + forca da prova
+    if cat == "nome" and not nome:
+        rec, porque = "CONFERIR", "Confira se o nome gravado é igual ao que o cliente escreveu. Se for igual: CONTESTE. Se nós erramos: aceite a devolução."
+    elif cat == "arrependimento" and pers:
+        rec, porque = "CONTESTAR", "Produto personalizado com o nome do cliente: é o caso mais forte para contestar."
+    elif e and e["taxa"] is not None and (e["ganhou"] + e["perdeu"]) >= 5:
+        rec = "CONTESTAR" if e["taxa"] >= 20 else "CONTESTAR COM VÍDEO"
+        porque = f"Histórico das lojas nesse motivo: ganhamos {e['ganhou']} de {e['ganhou'] + e['perdeu']} ({e['taxa']}%)."
+        if e["perdeu_sem_prova"]:
+            porque += f" {e['perdeu_sem_prova']} das perdidas foram SEM prova enviada: mande sempre o vídeo e as fotos."
+    else:
+        rec, porque = "CONTESTAR COM VÍDEO", "Ainda há pouco histórico nesse motivo: a chance sobe muito com o vídeo sem corte e as fotos abaixo."
+    prazo = ""
+    if sr and sr.get("prazo"):
+        prazo = datetime.fromtimestamp(sr["prazo"], BR).strftime("%d/%m %H:%M")
+    with conn() as c2:
+        em = c2.execute("SELECT valor FROM meta WHERE chave='dev_email'").fetchone()
+    return {"ok": True, "midias": json.loads(d["midias"] or "[]"), "enviado_em": d["enviado_em"] or "",
+            "envio": json.loads(d["envio_resp"] or "{}"), "email": em[0] if em else "",
+            "id": d["id"], "pedido": campos["pedido"], "loja": d["loja"] or (sr or {}).get("loja") or "",
+            "categoria": cat, "motivo": DEV_CAT_PT[cat], "motivo_comprador": (sr or {}).get("texto") or "",
+            "shopee": {"return_sn": sr["return_sn"], "situacao": SHOPEE_DEV_PT.get(sr["status"], sr["status"])} if sr else None,
+            "prazo": prazo, "recomendacao": rec, "porque": porque, "video": DEV_VIDEO, "fotos": fotos, "texto": texto,
+            "textos_que_ganharam": textos_ok, "personalizado": pers, "nome_gravado": nome,
+            "como_enviar": ["Seller Center > Devolução/Reembolso > abra a devolução deste pedido",
+                            "Toque em Contestar (ou Enviar provas) dentro do prazo",
+                            "Anexe o vídeo e as fotos e cole o texto (ajuste o que estiver entre [colchetes])",
+                            "Envie SÓ o que é verdade: prova falsa pode bloquear a loja"]}
+
+
+# ---- fotos/video da devolucao (tirados pelo celular) e envio da contestacao para a Shopee
+DEV_MIDIA = os.path.join(os.path.dirname(os.path.abspath(DB)), "midia_devolucoes")
+DEV_MIDIA_MAX = 200 * 1024 * 1024   # video de ate ~200 MB
+
+
+def _dev_pasta(dev_id):
+    p = os.path.join(DEV_MIDIA, str(int(dev_id)))
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def dev_midia_salvar(dev_id, tipo, rotulo, dados, ext):
+    """Guarda a foto/video na Central (fica de prova mesmo se a Shopee pedir de novo)."""
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone():
+            return {"ok": False, "erro": "devolucao nao encontrada"}
+    if not dados:
+        return {"ok": False, "erro": "arquivo vazio"}
+    tipo = "video" if tipo == "video" else "foto"
+    ext = re.sub(r"[^a-z0-9]", "", (ext or "").lower())[:5] or ("mp4" if tipo == "video" else "jpg")
+    nome = f"{tipo}_{datetime.now(BR).strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}.{ext}"
+    with open(os.path.join(_dev_pasta(dev_id), nome), "wb") as f:
+        f.write(dados)
+    with _lock, conn() as c:
+        r = c.execute("SELECT midias FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        lst = json.loads(r[0] or "[]") if r else []
+        lst.append({"arquivo": nome, "tipo": tipo, "rotulo": str(rotulo or "")[:120], "bytes": len(dados), "em": agora()})
+        c.execute("UPDATE devolucoes SET midias=? WHERE id=?", (json.dumps(lst, ensure_ascii=False), int(dev_id)))
+    return {"ok": True, "arquivo": nome, "midias": lst}
+
+
+def dev_midia_apagar(dev_id, arquivo):
+    with _lock, conn() as c:
+        r = c.execute("SELECT midias FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        lst = [m for m in json.loads((r[0] if r else None) or "[]") if m["arquivo"] != arquivo]
+        c.execute("UPDATE devolucoes SET midias=? WHERE id=?", (json.dumps(lst, ensure_ascii=False), int(dev_id)))
+    try:
+        os.remove(os.path.join(_dev_pasta(dev_id), os.path.basename(arquivo)))
+    except Exception:
+        pass
+    return {"ok": True, "midias": lst}
+
+
+def _shopee_multipart(path, campos, arquivos, loja=None):
+    """POST multipart assinado (imagem/parte de video). arquivos = [(campo, nome, bytes, tipo)]."""
+    import urllib.request, urllib.parse, time
+    pid, key = _shopee_cred()
+    ts = int(time.time())
+    q = {"partner_id": pid, "timestamp": ts}
+    if loja:
+        q.update(access_token=loja["access_token"], shop_id=loja["shop_id"])
+        q["sign"] = _shopee_assina(key, pid, path, ts, loja["access_token"], loja["shop_id"])
+    else:
+        q["sign"] = _shopee_assina(key, pid, path, ts)
+    lim = "----boni" + secrets.token_hex(8)
+    corpo = b""
+    for k, v in (campos or {}).items():
+        corpo += f"--{lim}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+    for campo, nome, dados, tipo in arquivos:
+        corpo += (f"--{lim}\r\nContent-Disposition: form-data; name=\"{campo}\"; filename=\"{nome}\"\r\n"
+                  f"Content-Type: {tipo}\r\n\r\n").encode() + dados + b"\r\n"
+    corpo += f"--{lim}--\r\n".encode()
+    req = urllib.request.Request(SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q), data=corpo, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={lim}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            res = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read() or b"{}")
+        except Exception:
+            res = {"error": f"http {e.code}"}
+    if res.get("error"):
+        raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
+    return res
+
+
+def _shopee_video(loja, dados):
+    """Sobe o video pelo media_space (em partes de 4 MB) e devolve o video_upload_id."""
+    import time
+    md5 = hashlib.md5(dados).hexdigest()
+    ini = _shopee_http("POST", "/api/v2/media_space/init_video_upload", corpo={"file_md5": md5, "file_size": len(dados)})
+    vid = (ini.get("response") or {}).get("video_upload_id")
+    if not vid:
+        raise RuntimeError("video: sem video_upload_id")
+    parte, partes, t0 = 4 * 1024 * 1024, [], time.time()
+    for seq, k in enumerate(range(0, len(dados), parte)):
+        pedaco = dados[k:k + parte]
+        _shopee_multipart("/api/v2/media_space/upload_video_part",
+                          {"video_upload_id": vid, "part_seq": seq, "content_md5": hashlib.md5(pedaco).hexdigest()},
+                          [("part_content", f"parte{seq}", pedaco, "application/octet-stream")])
+        partes.append(seq)
+    _shopee_http("POST", "/api/v2/media_space/complete_video_upload",
+                 corpo={"video_upload_id": vid, "part_seq_list": partes,
+                        "report_data": {"upload_cost": int((time.time() - t0) * 1000)}})
+    return vid
+
+
+def _motivo_disputa(lista, cat):
+    """Escolhe, na lista de motivos de contestacao que a Shopee oferece, o que combina com o caso."""
+    chaves = {"arrependimento": ["PERSONALI", "CUSTOM", "NÃO PODE", "NAO PODE", "CONDI", "USAD", "USED", "CHANGE"],
+              "danificado": ["DANIF", "DAMAG", "INTACT", "PERFEIT", "GOOD CONDITION", "TRANSPORT"],
+              "diferente": ["CORRET", "CORRECT", "SAME", "MESMO", "DESCRI", "CONFORME"],
+              "faltando": ["COMPLET", "PESO", "WEIGHT", "MISSING", "FALT"],
+              "nao_recebido": ["ENTREG", "DELIVER", "RECEB", "RECEIV"],
+              "nome": ["PERSONALI", "CUSTOM", "SOLICIT", "REQUEST"], "outro": []}.get(cat, [])
+    opc = []
+    for x in lista or []:
+        rid = x.get("reason_id", x.get("dispute_reason_id", x.get("id")))
+        txt = str(x.get("reason_text") or x.get("text") or x.get("reason") or "")
+        if rid is not None:
+            opc.append((rid, txt))
+    for ch in chaves:
+        for rid, txt in opc:
+            if ch in txt.upper():
+                return rid, txt
+    return (opc[0] if opc else (None, ""))
+
+
+def dev_enviar_shopee(dev_id, texto, email=""):
+    """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar)."""
+    o = dev_orientacao(dev_id)
+    if not o.get("ok"):
+        return o
+    if not o.get("shopee"):
+        return {"ok": False, "erro": "Esta devolucao ainda nao existe na Shopee (o comprador ainda nao abriu o pedido de devolucao)."}
+    texto = (texto or "").strip()
+    if len(texto) < 20:
+        return {"ok": False, "erro": "texto muito curto"}
+    if "[" in texto and "]" in texto:
+        return {"ok": False, "erro": "Ajuste o que esta entre [colchetes] no texto antes de enviar."}
+    sn = o["shopee"]["return_sn"]
+    with conn() as c:
+        sr = c.execute("SELECT shop_id FROM shopee_devolucoes WHERE return_sn=?", (sn,)).fetchone()
+        d = c.execute("SELECT midias, enviado_em FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        if not email:
+            r = c.execute("SELECT valor FROM meta WHERE chave='dev_email'").fetchone()
+            email = r[0] if r else ""
+    if d["enviado_em"]:
+        return {"ok": False, "erro": f"Ja foi enviada em {d['enviado_em'][:16].replace('T', ' ')}."}
+    midias = json.loads(d["midias"] or "[]")
+    fotos = [m for m in midias if m["tipo"] == "foto"]
+    videos = [m for m in midias if m["tipo"] == "video"]
+    if not fotos:
+        return {"ok": False, "erro": "Tire pelo menos as fotos da lista antes de enviar."}
+    loja = _shopee_token_ok(sr["shop_id"])
+    passos, urls, avisos = [], [], []
+    for m in fotos[:9]:
+        with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
+            res = _shopee_multipart("/api/v2/returns/convert_image", {}, [("image", m["arquivo"], f.read(), "image/jpeg")], loja=loja)
+        rr = res.get("response") or {}
+        u = rr.get("url") or ((rr.get("images") or [{}])[0].get("url")) or ""
+        if u:
+            urls.append(u)
+    passos.append(f"{len(urls)} foto(s) enviada(s)")
+    vids = []
+    for m in videos[:1]:
+        try:
+            with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
+                vids.append(_shopee_video(loja, f.read()))
+            passos.append("vídeo enviado")
+        except Exception as e:
+            avisos.append(f"o vídeo não subiu pela API ({str(e)[:80]}): anexe o vídeo pelo Seller Center")
+    motivos = (_shopee_http("GET", "/api/v2/returns/get_return_dispute_reason", loja=loja, params={"return_sn": sn}).get("response") or {})
+    lista = motivos.get("dispute_reason_list") or motivos.get("reason_list") or motivos.get("dispute_reason") or []
+    rid, rtxt = _motivo_disputa(lista, o["categoria"])
+    corpo = {"return_sn": sn, "dispute_text_reason": texto[:1000], "images": urls}
+    if rid is not None:
+        corpo["dispute_reason"] = rid
+    if email:
+        corpo["email"] = email
+    _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
+    passos.append("contestação aberta" + (f" (motivo: {rtxt})" if rtxt else ""))
+    if vids or urls:
+        try:
+            prova = {"return_sn": sn, "photo": [{"url": u} for u in urls], "description": texto[:500]}
+            if vids:
+                prova["video"] = [{"video_upload_id": v} for v in vids]
+            _shopee_http("POST", "/api/v2/returns/upload_proof", loja=loja, corpo=prova)
+            passos.append("provas anexadas")
+        except Exception as e:
+            avisos.append(f"provas extras não anexadas ({str(e)[:80]})")
+    resp = {"passos": passos, "avisos": avisos, "em": agora()}
+    with _lock, conn() as c:
+        if email:
+            c.execute("INSERT OR REPLACE INTO meta VALUES('dev_email', ?)", (email[:120],))
+        c.execute("UPDATE devolucoes SET enviado_em=?, envio_resp=? WHERE id=?",
+                  (agora(), json.dumps(resp, ensure_ascii=False), int(dev_id)))
+    return {"ok": True, **resp}
+
+
+def _itens_devolucao(c, cod):
+    """Etiqueta da devolucao (rastreio reverso) ou nº do pedido: acha a etiqueta de envio original."""
+    itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? ORDER BY i.id", (cod,)).fetchall()
+    if itens:
+        return itens
+    sr = c.execute("SELECT order_sn FROM shopee_devolucoes WHERE rastreio=? OR order_sn=? LIMIT 1", (cod, cod)).fetchone()
+    if sr:
+        itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? ORDER BY i.id", (sr[0],)).fetchall()
+        for i in itens:
+            c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, i["id"]))
+    return itens
 
 
 def historico(iid):
@@ -1015,6 +1453,29 @@ class H(BaseHTTPRequestHandler):
         if p == "/sair":
             return self._envia(302, "", extra={"Location": "/painel",
                                "Set-Cookie": "cb_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})
+        if p == "/devolucoes":
+            return self._pagina("devolucoes.html")
+        if p.startswith("/api/devolucoes/"):
+            # pagina de devolucoes: entra com a senha do painel OU com a chave da operacao (posto)
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", "") or q.get("k", ""), STATION_KEY)):
+                return self._envia(401, {"erro": "chave da operacao necessaria"})
+            if p.startswith("/api/devolucoes/arquivo/"):
+                partes = p.split("/")
+                if len(partes) == 6 and partes[4].isdigit():
+                    cam = os.path.join(DEV_MIDIA, partes[4], os.path.basename(partes[5]))
+                    if os.path.isfile(cam):
+                        with open(cam, "rb") as f:
+                            dados = f.read()
+                        tipo = "video/mp4" if cam.lower().endswith((".mp4", ".mov", ".webm")) else "image/jpeg"
+                        return self._envia(200, dados, tipo)
+                return self._envia(404, {"erro": "arquivo nao encontrado"})
+            hj = datetime.now(BR).strftime("%Y-%m-%d")
+            if p == "/api/devolucoes/tela":
+                return self._envia(200, devolucoes_tela(q.get("de") or hj, q.get("ate") or hj))
+            if p == "/api/devolucoes/orientacao":
+                return self._envia(200, dev_orientacao(q.get("id") or 0))
+            if p == "/api/devolucoes/aprendizado":
+                return self._envia(200, {"ok": True, "motivos": dev_aprendizado()})
         if p == "/api/pausas":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -1119,10 +1580,6 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ultimo": ev[-1]["id"] if ev else desde, "eventos": ev})
         if p == "/api/produtividade":
             return self._envia(200, produtividade(q.get("de") or hoje, q.get("ate") or hoje))
-        if p == "/devolucoes":
-            return self._pagina("devolucoes.html")
-        if p == "/api/devolucoes/tela":
-            return self._envia(200, devolucoes_tela(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/devolucoes":
             return self._envia(200, devolucoes(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/custos":
@@ -1153,6 +1610,15 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
 
     def do_POST(self):
         p = urlparse(self.path).path
+        if p == "/api/devolucoes/midia":   # foto/video do celular (binario, nao JSON)
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
+                return self._envia(401, {"erro": "chave da operacao necessaria"})
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > DEV_MIDIA_MAX:
+                return self._envia(413, {"ok": False, "erro": "arquivo vazio ou grande demais (max 200 MB)"})
+            dados = self.rfile.read(n)
+            return self._envia(200, dev_midia_salvar(q.get("id") or 0, q.get("tipo"), q.get("rotulo"), dados, q.get("ext")))
         try:
             d = self._json()
         except Exception:
@@ -1166,6 +1632,34 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
             return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo"), d.get("leitor") or ""))
+        if p.startswith("/api/devolucoes/"):
+            # pagina de devolucoes: senha do painel OU chave da operacao (posto)
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
+                return self._envia(401, {"erro": "chave da operacao necessaria"})
+            if p == "/api/devolucoes/decidir":
+                return self._envia(200, dev_decidir(d.get("id"), d.get("destino"), d.get("motivo") or "", d.get("obs") or "",
+                                                    str(d.get("sku") or "").strip().upper(), str(d.get("cor") or "").strip().upper(),
+                                                    d.get("qtd")))
+            if p == "/api/devolucoes/registrar":
+                return self._envia(200, dev_registrar(str(d.get("codigo") or "")))
+            if p == "/api/devolucoes/apagar-midia":
+                return self._envia(200, dev_midia_apagar(d.get("id") or 0, str(d.get("arquivo") or "")))
+            if p == "/api/devolucoes/email":
+                em = str(d.get("email") or "").strip()[:120]
+                with _lock, conn() as c:
+                    c.execute("INSERT OR REPLACE INTO meta VALUES('dev_email', ?)", (em,))
+                return self._envia(200, {"ok": True, "email": em})
+            if p == "/api/devolucoes/enviar":
+                try:
+                    return self._envia(200, dev_enviar_shopee(d.get("id") or 0, d.get("texto") or "", str(d.get("email") or "").strip()))
+                except Exception as e:
+                    return self._envia(200, {"ok": False, "erro": "A Shopee recusou: " + str(e)[:200]})
+            if p == "/api/devolucoes/shopee":
+                try:
+                    return self._envia(200, shopee_devolucoes_sincronizar())
+                except Exception as e:
+                    return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+            return self._envia(404, {"erro": "nao encontrado"})
         if p == "/api/importar-pdf":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"ok": False, "erro": "token invalido"})
@@ -1199,17 +1693,6 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not self._admin():
                 return self._envia(401, {"erro": "login necessario"})
             return self._envia(200, {"ok": True, "lojas": shopee_sincronizar_todas()})
-        if p == "/api/devolucoes/decidir":
-            return self._envia(200, dev_decidir(d.get("id"), d.get("destino"), d.get("motivo") or "", d.get("obs") or "",
-                                                str(d.get("sku") or "").strip().upper(), str(d.get("cor") or "").strip().upper(),
-                                                d.get("qtd")))
-        if p == "/api/devolucoes/registrar":
-            return self._envia(200, dev_registrar(str(d.get("codigo") or "")))
-        if p == "/api/devolucoes/shopee":
-            try:
-                return self._envia(200, shopee_devolucoes_sincronizar())
-            except Exception as e:
-                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/anuncios/aplicar":
             if _anuncios_status.get("rodando"):
                 return self._envia(200, {"ok": False, "erro": "ja esta atualizando, aguarde"})
