@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Devoluções - Central Boni</title>
+<style>
+  body{font:16px Arial,sans-serif;margin:0;background:#f4f4f6;color:#222}
+  header{background:#7c3aed;color:#fff;padding:12px 16px;position:sticky;top:0;z-index:2}
+  header h1{font-size:20px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
+  header a{color:#fff;font-size:14px}
+  .reg{display:flex;gap:8px}
+  .reg input{flex:1;min-width:0;font-size:18px;padding:10px;border-radius:8px;border:0}
+  .reg button{font-size:16px;padding:0 16px;border:0;border-radius:8px;background:#fde047;font-weight:bold}
+  #msg{font-size:14px;margin-top:6px;min-height:18px}
+  main{max-width:1000px;margin:0 auto;padding:8px 12px 40px}
+  h2{font-size:18px;margin:20px 4px 8px}
+  .card{background:#fff;border-radius:12px;padding:12px;margin:8px 0;box-shadow:0 1px 3px #0001;border-left:6px solid #a78bfa}
+  .card.perda{border-left-color:#dc2626}.card.est{border-left-color:#16a34a}
+  .card .t{font-weight:bold;font-size:17px}.card .s{font-size:13px;color:#666;margin-top:2px}
+  .sug{display:inline-block;margin-top:6px;padding:3px 10px;border-radius:12px;font-size:13px;font-weight:bold}
+  .sug.PERDA{background:#fee2e2;color:#b91c1c}.sug.ESTOQUE{background:#dcfce7;color:#15803d}
+  .card select,.card input{font-size:16px;padding:8px;border:1px solid #bbb;border-radius:8px;margin-top:8px;width:100%;box-sizing:border-box}
+  .linha3{display:flex;gap:6px}.linha3 input{margin-top:8px}
+  .bts{display:flex;gap:8px;margin-top:10px}
+  .bts button{flex:1;font-size:16px;padding:12px 6px;border:0;border-radius:10px;font-weight:bold;color:#fff}
+  .b-est{background:#16a34a}.b-per{background:#dc2626}
+  .vazio{background:#fff;border-radius:12px;padding:12px;color:#777}
+  .res{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+  .res div{background:#fff;border-radius:12px;padding:10px;text-align:center}.res b{display:block;font-size:24px}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;font-size:14px}
+  th,td{padding:7px 8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{background:#fafafa;color:#666;font-size:12px}
+  .tbl{overflow-x:auto}
+  .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:bold}
+  .t-ESTOQUE{background:#dcfce7;color:#15803d}.t-PERDA{background:#fee2e2;color:#b91c1c}.t-CONFERIR{background:#ede9fe;color:#6d28d9}
+  .per{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 4px}.per input{font-size:15px;padding:6px}
+  .mini{font-size:13px;color:#666}
+  .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+  .cols .box{background:#fff;border-radius:12px;padding:10px}.cols .box div{display:flex;justify-content:space-between;border-bottom:1px solid #f0f0f0;padding:4px 0;font-size:14px}
+</style>
+</head>
+<body>
+<header>
+  <h1>↩️ Devoluções <a href="/painel">Painel</a></h1>
+  <div class="reg"><input id="cod" placeholder="Bipe ou digite a etiqueta / nº do pedido" autocomplete="off" onkeydown="if(event.key=='Enter')registrar()"><button onclick="registrar()">Registrar</button></div>
+  <div id="msg"></div>
+</header>
+<main>
+  <h2>📦 Chegou: conferir agora <span id="nPend"></span></h2>
+  <div id="pend"></div>
+
+  <h2>🚚 Pedidas na Shopee (a caminho) <button onclick="syncShopee()" style="font-size:13px">Atualizar</button></h2>
+  <div class="mini" id="shInfo"></div>
+  <div id="cam"></div>
+
+  <h2>📊 Resumo</h2>
+  <div class="per">De <input type="date" id="de"> até <input type="date" id="ate"> <button onclick="carregar()">Ver</button></div>
+  <div class="res" id="res"></div>
+  <div class="cols" id="cols" style="margin-top:10px"></div>
+
+  <h2>🗂️ Histórico do período</h2>
+  <div class="tbl"><table id="hist"></table></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const brl=v=>"R$ "+(v||0).toFixed(2).replace(".",",");
+let D=null;
+const hoje=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
+$("de").value=new Date(Date.now()-3*3600e3-29*864e5).toISOString().slice(0,10);$("ate").value=hoje;
+async function carregar(){
+  const r=await fetch(`/api/devolucoes/tela?de=${$("de").value}&ate=${$("ate").value}`);
+  if(r.status==401){location.href="/painel";return}
+  D=await r.json();const mot=D.motivos;
+  $("nPend").textContent=D.pendentes.length?`(${D.pendentes.length})`:"";
+  $("pend").innerHTML=D.pendentes.map(p=>`<div class="card ${p.sugestao=="PERDA"?"perda":""}" id="d${p.id}">
+    <div class="t">${esc(p.sku||"SKU desconhecido")} ${esc(p.cor||"")}</div>
+    <div class="s">Pedido ${esc(p.pedido)} · ${p.loja||p.canal?esc(p.loja||p.canal)+" · ":""}${p.personalizado?(p.gravado?"personalizado <b>GRAVADO</b>":"personalizado (não gravado)"):"sem personalizar"}${p.quem?" · bipado por "+esc(p.quem):""}</div>
+    <span class="sug ${p.sugestao}">Sugestão: ${p.sugestao=="PERDA"?"PERDA (já foi gravado)":"VOLTA PARA O ESTOQUE"}</span>
+    ${p.sku?"":`<div class="linha3"><input id="s${p.id}" placeholder="SKU" autocapitalize="characters"><input id="c${p.id}" placeholder="Cor" autocapitalize="characters"><input id="q${p.id}" placeholder="Qtd" inputmode="numeric" value="1"></div>`}
+    <select id="m${p.id}"><option value="">Motivo…</option>${mot.map(m=>`<option ${m==p.motivo?"selected":""}>${esc(m)}</option>`).join("")}</select>
+    <input id="o${p.id}" placeholder="Observação (opcional)">
+    <div class="bts"><button class="b-est" onclick="decidir(${p.id},'ESTOQUE')">✅ Volta pro estoque</button><button class="b-per" onclick="decidir(${p.id},'PERDA')">🗑️ Perda</button></div></div>`).join("")
+    ||'<div class="vazio">Nada para conferir. ✅</div>';
+  $("shInfo").textContent=(D.shopee.em?"Última leitura: "+D.shopee.em:"Lê sozinho a cada 10 min.")+(D.shopee.erro?" · ERRO: "+D.shopee.erro:"");
+  $("cam").innerHTML=D.a_caminho.length?`<div class="tbl"><table><tr><th>Prazo</th><th>Pedido</th><th>Loja</th><th>Situação</th><th>Motivo</th><th>Itens</th><th>Chegou?</th></tr>`+
+    D.a_caminho.map(x=>`<tr><td>${esc(x.prazo_txt)}</td><td>${esc(x.order_sn)}</td><td>${esc(x.loja)}</td><td>${esc(x.status_pt)}</td><td>${esc(x.motivo)}${x.texto?`<div class="mini">${esc(x.texto)}</div>`:""}</td>
+    <td>${x.itens.map(i=>esc(i.sku||i.nome)+" ×"+i.qtd).join("<br>")}</td><td>${x.chegou?'<span class="tag t-ESTOQUE">chegou</span>':"—"}</td></tr>`).join("")+"</table></div>"
+    :'<div class="vazio">Nenhuma devolução aberta na Shopee.</div>';
+  const R=D.resumo;
+  $("res").innerHTML=`<div><b>${R.total}</b>devoluções</div><div><b>${R.estoque}</b>voltaram ao estoque</div><div><b>${R.perda}</b>perdas</div><div><b>${brl(R.custo_perda)}</b>custo das perdas</div><div><b>${R.conferir}</b>a conferir</div>`;
+  const bx=(t,a)=>`<div class="box"><b>${t}</b>${a.map(([k,v])=>`<div><span>${esc(k)}</span><b>${v}</b></div>`).join("")||'<div class="mini">—</div>'}</div>`;
+  $("cols").innerHTML=bx("Por motivo",R.por_motivo)+bx("Por produto",R.por_produto.slice(0,12))+bx("Por loja",R.por_loja);
+  $("hist").innerHTML="<tr><th>Data</th><th>Pedido</th><th>Produto</th><th>Loja</th><th>Motivo</th><th>Situação</th><th>Custo</th><th></th></tr>"+
+    D.historico.map(h=>`<tr><td>${new Date(h.em).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</td><td>${esc(h.pedido)}</td><td>${esc(h.sku)} ${esc(h.cor||"")}</td>
+    <td>${esc(h.loja||h.canal)}</td><td>${esc(h.motivo)}</td><td><span class="tag t-${h.situacao}">${h.situacao=="ESTOQUE"?"voltou ao estoque":h.situacao=="PERDA"?"perda":"a conferir"}</span></td>
+    <td>${h.custo!=null?brl(h.custo):"—"}</td><td>${h.situacao!="CONFERIR"?`<button onclick="refazer(${h.id})" style="font-size:12px">Refazer</button>`:""}</td></tr>`).join("");
+}
+async function post(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.status==401){location.href="/painel";throw "login"}return r.json()}
+async function registrar(){const c=$("cod").value.trim();if(!c)return;$("msg").textContent="Registrando...";
+  try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada (${d.registradas})`:"Já estava registrada"):"❌ "+d.erro;$("cod").value="";carregar()}
+  catch(e){$("msg").textContent="❌ Não salvou — tente de novo"}$("cod").focus()}
+async function decidir(id,destino){const m=$("m"+id).value;
+  if(!m){$("msg").textContent="Escolha o MOTIVO antes";$("m"+id).focus();return}
+  const b={id,destino,motivo:m,obs:$("o"+id).value};
+  if($("s"+id)){b.sku=$("s"+id).value;b.cor=$("c"+id).value;b.qtd=+($("q"+id).value||1);
+    if(destino=="ESTOQUE"&&!b.sku){$("msg").textContent="Informe o SKU para voltar ao estoque";$("s"+id).focus();return}}
+  const d=await post("/api/devolucoes/decidir",b);
+  $("msg").textContent=d.ok?(destino=="ESTOQUE"?(d.entrou_no_estoque.length?"✅ Voltou ao estoque: "+d.entrou_no_estoque.map(x=>`${x.sku} ${x.cor} +${x.qtd}`).join(", "):"✅ Registrado ("+d.aviso+")"):"🗑️ Registrado como perda"):"❌ "+d.erro;
+  carregar()}
+async function refazer(id){const d=await post("/api/devolucoes/decidir",{id,destino:"CONFERIR"});$("msg").textContent=d.ok?"↩ Voltou para conferir (estoque desfeito)":"❌ "+d.erro;carregar()}
+async function syncShopee(){$("shInfo").textContent="Lendo a Shopee...";await post("/api/devolucoes/shopee",{});carregar()}
+carregar();setInterval(carregar,60000);$("cod").focus();
+</script>
+</body>
+</html>

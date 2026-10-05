@@ -76,6 +76,12 @@ def iniciar_db():
                      refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
                      expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
+        c.execute("""CREATE TABLE IF NOT EXISTS devolucoes(id INTEGER PRIMARY KEY, item_id INTEGER UNIQUE, pedido TEXT, canal TEXT,
+            loja TEXT, sku TEXT, cor TEXT, personalizado INTEGER, gravado INTEGER, sugestao TEXT, situacao TEXT, motivo TEXT,
+            obs TEXT, custo REAL, colaborador_id INTEGER, em TEXT, decidido_em TEXT, return_sn TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS shopee_devolucoes(return_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
+            order_sn TEXT, status TEXT, motivo TEXT, texto TEXT, prazo INTEGER, rastreio TEXT, valor REAL, itens TEXT,
+            criado INTEGER, atualizado INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS shopee_pedidos(order_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
             status TEXT, criado INTEGER, atualizado INTEGER, prazo INTEGER, envio TEXT, msg TEXT, itens TEXT,
             motivo TEXT, visto_em TEXT)""")
@@ -305,6 +311,11 @@ def _bipar(posto, codigo, operador, modo):
                 return {"tipo": "aviso", "msg": "Nada para desfazer."}
             c.execute("UPDATE eventos SET desfeito=1 WHERE id=?", (ev["id"],))
             recalcular(c, ev["item_id"])
+            if ev["etapa"] == "DEVOLVIDO":  # desfez a devolucao: some a ficha e o que tinha voltado ao estoque
+                dv = c.execute("SELECT id FROM devolucoes WHERE item_id=?", (ev["item_id"],)).fetchone()
+                if dv:
+                    _dev_estornar(c, dv[0])
+                    c.execute("DELETE FROM devolucoes WHERE id=?", (dv[0],))
             if c.execute("SELECT status FROM itens WHERE id=?", (ev["item_id"],)).fetchone()[0] == "AGUARDANDO":
                 c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{ev['item_id']}|%",))  # volta para o estoque
             return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}", "evento": "desfazer"}
@@ -343,11 +354,8 @@ def _bipar(posto, codigo, operador, modo):
             it = itens[0]
             if it["falta_material"]:
                 return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}", "item": dict(it)}
-            r = ev(it, "FALTA_MATERIAL", "falta de material")
-            if r["status"] == "AGUARDANDO":  # material nao saiu da prateleira: devolve a baixa do estoque
-                c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"ETQ|{it['id']}|%",))
-            return {"tipo": "aviso", "msg": f"NÃO TEM registrado - {it['sku']}", "evento": "falta",
-                    "fazer": "Guarde a etiqueta. Quando o material chegar, bipe primeiro na SEPARAÇÃO.", "item": r}
+            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}", "evento": "falta",
+                    "item": ev(it, "FALTA_MATERIAL", "falta de material")}
 
         if posto == "SEPARACAO":
             alvo = next((i for i in itens if ORDEM[i["status"]] < ORDEM["SEPARADO"]), None)
@@ -364,11 +372,6 @@ def _bipar(posto, codigo, operador, modo):
                 return {"tipo": "erro", "msg": "NÃO GRAVAR: produto SEM PERSONALIZAR",
                         "fazer": "Não grave. Leve direto para a EXPEDIÇÃO e bipe lá.", "item": dict(itens[0])}
             # ordem obrigatoria: separacao -> gravacao -> expedicao
-            emfalta = [i for i in itens if i["falta_material"] and i["status"] not in ("EXPEDIDO", "DEVOLVIDO")]
-            if emfalta:
-                return {"tipo": "erro", "msg": "EM FALTA (NÃO TEM) — ainda não chegou o material",
-                        "fazer": "Quando o material chegar, bipe primeiro na SEPARAÇÃO. Depois siga o caminho normal.",
-                        "item": dict(emfalta[0])}
             nsep = [i for i in pers if i["status"] == "AGUARDANDO"]
             if nsep:
                 return {"tipo": "erro", "msg": "NÃO GRAVAR: ainda NÃO FOI SEPARADO",
@@ -381,11 +384,6 @@ def _bipar(posto, codigo, operador, modo):
             return {"tipo": "aviso", "msg": "Ja foi para gravacao.", "item": dict(pers[0])}
 
         if posto == "EXPEDICAO":
-            emfalta = [i for i in itens if i["falta_material"] and i["status"] not in ("EXPEDIDO", "DEVOLVIDO")]
-            if emfalta:
-                return {"tipo": "erro", "msg": "EM FALTA (NÃO TEM) — ainda não chegou o material",
-                        "fazer": "Quando o material chegar, bipe primeiro na SEPARAÇÃO. Depois siga o caminho normal.",
-                        "item": dict(emfalta[0])}
             nsep = [i for i in itens if i["status"] == "AGUARDANDO"]
             if nsep:
                 pers_ns = any(i["personalizado"] for i in nsep)
@@ -410,11 +408,14 @@ def _bipar(posto, codigo, operador, modo):
             if not pend:
                 return {"tipo": "aviso", "msg": "Devolucao ja registrada.", "item": dict(itens[0])}
             r, total = None, 0.0
+            perda = False
             for i in pend:
                 r = ev(i, "DEVOLVIDO")
                 total += custo_de(c, i["sku"]) or 0
+                _dev_criar(c, r, op["id"])
+                perda = perda or c.execute("SELECT sugestao FROM devolucoes WHERE item_id=?", (i["id"],)).fetchone()[0] == "PERDA"
             sem_sku = any(not i["sku"] for i in pend)
-            msg = f"Devolucao registrada ({len(pend)} item(ns))"
+            msg = f"DEVOLUÇÃO registrada ({len(pend)} item(ns))  →  " + ("GRAVADO: separe como PERDA" if perda else "confira e guarde na prateleira")
             msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
             return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "evento": "devolucao", "item": r}
         return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição ou Devolução) e bipe de novo."}
@@ -440,8 +441,7 @@ def recalcular(c, iid):
     for e in c.execute("SELECT etapa FROM eventos WHERE item_id=? AND desfeito=0 ORDER BY id", (iid,)):
         et = e[0]
         if et == "FALTA_MATERIAL":
-            if st not in ("EXPEDIDO", "DEVOLVIDO"):
-                st, falta = "AGUARDANDO", 1  # NAO TEM: volta para o comeco; quando chegar, bipa de novo na SEPARACAO
+            falta = 1
         elif et == "SEPARADO":
             st, falta = "SEPARADO", 0
         elif et == "GRAVACAO_INICIO":
@@ -678,6 +678,163 @@ def devolucoes(de, ate):
                 "sem_custo": sum(1 for l in linhas if l["custo"] is None)}
 
 
+# ------------------------------------------------------------------ devolucoes (conferencia, estoque, motivos, Shopee a caminho)
+DEV_MOTIVOS = ["Cliente desistiu / arrependimento", "Defeito / avaria", "Produto ou cor errada", "Nome errado na gravação",
+               "Não entregue / não retirado", "Extravio / pacote violado", "Outro"]
+
+
+def _dev_criar(c, item, colaborador_id=None):
+    """Toda devolucao bipada vira uma ficha 'A CONFERIR' (uma por etiqueta)."""
+    if c.execute("SELECT 1 FROM devolucoes WHERE item_id=?", (item["id"],)).fetchone():
+        return
+    gravado = c.execute("SELECT 1 FROM eventos WHERE item_id=? AND etapa='GRAVACAO_INICIO' AND desfeito=0", (item["id"],)).fetchone()
+    sug = "PERDA" if (item["personalizado"] and gravado) else "ESTOQUE"
+    ret = c.execute("SELECT return_sn, motivo FROM shopee_devolucoes WHERE order_sn=? ORDER BY criado DESC LIMIT 1",
+                    (norm(item["pedido"]),)).fetchone()
+    c.execute("""INSERT INTO devolucoes(item_id, pedido, canal, loja, sku, cor, personalizado, gravado, sugestao, situacao,
+                 motivo, obs, custo, colaborador_id, em, return_sn) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (item["id"], item["pedido"], item["canal"], item["loja"], item["sku"], item["cor"], item["personalizado"],
+               1 if gravado else 0, sug, "CONFERIR", (ret[1] if ret else ""), "", custo_de(c, item["sku"]),
+               colaborador_id, agora(), ret[0] if ret else ""))
+
+
+def _dev_estornar(c, dev_id):
+    c.execute("DELETE FROM estoque_mov WHERE ref LIKE ?", (f"DEV|{dev_id}|%",))
+
+
+def dev_decidir(dev_id, destino, motivo="", obs="", sku="", cor="", qtd=None):
+    """ESTOQUE: a peca volta para a prateleira (entra no estoque). PERDA: nao volta (gravada, quebrada...).
+    Pode mudar de ideia: refazer a decisao desfaz o estoque anterior."""
+    destino = (destino or "").upper()
+    if destino not in ("ESTOQUE", "PERDA", "CONFERIR"):
+        return {"ok": False, "erro": "destino invalido"}
+    with _lock, conn() as c:
+        d = c.execute("SELECT * FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        if not d:
+            return {"ok": False, "erro": "devolucao nao encontrada"}
+        it = c.execute("SELECT * FROM itens WHERE id=?", (d["item_id"],)).fetchone()
+        _dev_estornar(c, d["id"])
+        entrou = []
+        if destino == "ESTOQUE":
+            if sku:
+                pecas = [(sku, cor or "", int(qtd or 1))]
+            else:
+                pecas = _pecas_do_item(dict(it)) if it else []
+            pecas = [(s, co, q) for s, co, q in pecas if s and not s.startswith("(")]
+            if not pecas:
+                return {"ok": False, "erro": "SKU desconhecido: informe SKU, cor e quantidade para voltar ao estoque"}
+            # so devolve ao estoque o que tinha saido dele (etiqueta que deu baixa, ou ja descontada no saldo inicial)
+            saiu = sku or (it and (_ja_baixado(c, it["id"]) or _ja_no_snapshot(c, dict(it))))
+            if saiu:
+                for s, co, q in pecas:
+                    s, cn = estoque_chave(s, co)
+                    c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                              (agora(), s, cn, q, "DEVOLUCAO", f"DEV|{d['id']}|{s}|{cn}", f"devolucao pedido {d['pedido']}"))
+                    entrou.append({"sku": s, "cor": cn or "PADRAO", "qtd": q})
+        c.execute("""UPDATE devolucoes SET situacao=?, motivo=COALESCE(NULLIF(?,''),motivo), obs=COALESCE(NULLIF(?,''),obs),
+                     decidido_em=?, sku=CASE WHEN ?<>'' THEN ? ELSE sku END WHERE id=?""",
+                  (destino, motivo, obs, agora(), sku, sku, d["id"]))
+    return {"ok": True, "id": int(dev_id), "situacao": destino, "entrou_no_estoque": entrou,
+            "aviso": "" if entrou or destino != "ESTOQUE" else "essa etiqueta nunca tinha saido do estoque: nada a somar"}
+
+
+def dev_registrar(codigo):
+    """Registrar devolucao pelo celular/painel (sem cracha), igual ao bipe do posto DEVOLUCAO."""
+    cod = norm(codigo)
+    if not cod:
+        return {"ok": False, "erro": "informe o codigo da etiqueta ou o numero do pedido"}
+    with _lock, conn() as c:
+        itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? ORDER BY i.id", (cod,)).fetchall()
+        if not itens:
+            iid = c.execute("""INSERT INTO itens(chave,lote,pedido,sku,personalizado,status,criado_em,atualizado_em)
+                               VALUES(?,?,?,?,0,'AGUARDANDO',?,?)""",
+                            (f"DEV|{cod}|{agora()}", "DEVOLUCAO", codigo.strip(), "", agora(), agora())).lastrowid
+            c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
+            itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
+        n = 0
+        for i in itens:
+            if i["status"] != "DEVOLVIDO":
+                c.execute("INSERT INTO eventos(item_id,etapa,colaborador_id,posto,em,alerta) VALUES(?,?,?,?,?,?)",
+                          (i["id"], "DEVOLVIDO", None, "DEVOLUCAO", agora(), ""))
+                recalcular(c, i["id"])
+                n += 1
+            _dev_criar(c, dict(c.execute("SELECT * FROM itens WHERE id=?", (i["id"],)).fetchone()))
+    return {"ok": True, "registradas": n, "ja_estavam": len(itens) - n}
+
+
+def devolucoes_tela(de, ate):
+    ini, _ = dia_utc(de)
+    _, fim = dia_utc(ate)
+    with conn() as c:
+        q = """SELECT d.*, k.nome quem FROM devolucoes d LEFT JOIN colaboradores k ON k.id=d.colaborador_id"""
+        pend = [dict(r) for r in c.execute(q + " WHERE d.situacao='CONFERIR' ORDER BY d.id")]
+        hist = [dict(r) for r in c.execute(q + " WHERE d.em>=? AND d.em<? ORDER BY d.id DESC", (ini, fim))]
+        cam = [dict(r) for r in c.execute("""SELECT * FROM shopee_devolucoes WHERE status NOT IN ('CANCELLED','CLOSED')
+                                              ORDER BY prazo""")]
+        chegou = {r[0] for r in c.execute("SELECT DISTINCT pedido FROM devolucoes")}
+    for x in cam:
+        x["itens"] = json.loads(x["itens"] or "[]")
+        x["chegou"] = x["order_sn"] in {norm(p) for p in chegou}
+        x["status_pt"] = SHOPEE_DEV_PT.get(x["status"], x["status"])
+        x["prazo_txt"] = datetime.fromtimestamp(x["prazo"], BR).strftime("%d/%m %H:%M") if x["prazo"] else ""
+    res = {"total": len(hist), "estoque": 0, "perda": 0, "conferir": 0, "custo_perda": 0.0, "por_motivo": {}, "por_produto": {},
+           "por_loja": {}}
+    for h in hist:
+        s = h["situacao"]
+        res["estoque" if s == "ESTOQUE" else "perda" if s == "PERDA" else "conferir"] += 1
+        if s == "PERDA":
+            res["custo_perda"] = round(res["custo_perda"] + (h["custo"] or 0), 2)
+        for chave, v in (("por_motivo", h["motivo"] or "(sem motivo)"), ("por_produto", h["sku"] or "(sem SKU)"),
+                         ("por_loja", h["loja"] or h["canal"] or "(sem loja)")):
+            res[chave][v] = res[chave].get(v, 0) + 1
+    for chave in ("por_motivo", "por_produto", "por_loja"):
+        res[chave] = sorted(res[chave].items(), key=lambda x: -x[1])
+    return {"pendentes": pend, "historico": hist, "resumo": res, "a_caminho": cam, "motivos": DEV_MOTIVOS,
+            "shopee": _shopee_dev_status}
+
+
+# ---- Shopee: devolucoes pedidas pelos compradores (SO LEITURA)
+SHOPEE_DEV_PT = {"REQUESTED": "Pedida (responder)", "ACCEPTED": "Aceita - a caminho", "PROCESSING": "Em processamento",
+                 "JUDGING": "Em análise da Shopee", "SELLER_DISPUTE": "Em disputa", "CLOSED": "Encerrada",
+                 "CANCELLED": "Cancelada"}
+_shopee_dev_status = {"em": "", "erro": ""}
+
+
+def shopee_devolucoes_sincronizar(dias=15):
+    import time
+    with conn() as c:
+        lojas = [dict(r) for r in c.execute("SELECT shop_id, nome FROM shopee_lojas")]
+    fim = int(time.time())
+    n, erros = 0, []
+    for l in lojas:
+        try:
+            loja = _shopee_token_ok(l["shop_id"])
+            for pg in range(50):
+                res = _shopee_http("GET", "/api/v2/returns/get_return_list", loja=loja,
+                                   params={"page_no": pg, "page_size": 100, "create_time_from": fim - dias * 86400,
+                                           "create_time_to": fim})
+                rr = res.get("response") or {}
+                lst = rr.get("return") or rr.get("return_list") or []
+                with _lock, conn() as c:
+                    for x in lst:
+                        itens = [{"sku": i.get("variation_sku") or i.get("item_sku") or "", "nome": (i.get("name") or "")[:60],
+                                  "qtd": int(i.get("amount") or 1)} for i in (x.get("item") or [])]
+                        c.execute("""INSERT OR REPLACE INTO shopee_devolucoes(return_sn, shop_id, loja, order_sn, status, motivo,
+                                     texto, prazo, rastreio, valor, itens, criado, atualizado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  (str(x.get("return_sn")), l["shop_id"], loja.get("nome") or l["nome"], norm(x.get("order_sn")),
+                                   x.get("status") or "", x.get("reason") or "", (x.get("text_reason") or "")[:300],
+                                   int(x.get("due_date") or 0), x.get("tracking_number") or "",
+                                   float(x.get("refund_amount") or 0), json.dumps(itens, ensure_ascii=False),
+                                   int(x.get("create_time") or 0), int(x.get("update_time") or 0)))
+                        n += 1
+                if not rr.get("more"):
+                    break
+        except Exception as e:
+            erros.append(f"{l['nome'] or l['shop_id']}: {e}"[:200])
+    _shopee_dev_status.update(em=datetime.now(BR).strftime("%d/%m %H:%M"), erro=" | ".join(erros))
+    return {"ok": not erros, "devolucoes": n, "erros": erros}
+
+
 def historico(iid):
     with conn() as c:
         return [dict(r) for r in c.execute("""SELECT e.etapa, e.em, e.posto, e.alerta, e.desfeito, k.nome
@@ -858,6 +1015,10 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ultimo": ev[-1]["id"] if ev else desde, "eventos": ev})
         if p == "/api/produtividade":
             return self._envia(200, produtividade(q.get("de") or hoje, q.get("ate") or hoje))
+        if p == "/devolucoes":
+            return self._pagina("devolucoes.html")
+        if p == "/api/devolucoes/tela":
+            return self._envia(200, devolucoes_tela(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/devolucoes":
             return self._envia(200, devolucoes(q.get("de") or hoje, q.get("ate") or hoje))
         if p == "/api/custos":
@@ -934,6 +1095,17 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not self._admin():
                 return self._envia(401, {"erro": "login necessario"})
             return self._envia(200, {"ok": True, "lojas": shopee_sincronizar_todas()})
+        if p == "/api/devolucoes/decidir":
+            return self._envia(200, dev_decidir(d.get("id"), d.get("destino"), d.get("motivo") or "", d.get("obs") or "",
+                                                str(d.get("sku") or "").strip().upper(), str(d.get("cor") or "").strip().upper(),
+                                                d.get("qtd")))
+        if p == "/api/devolucoes/registrar":
+            return self._envia(200, dev_registrar(str(d.get("codigo") or "")))
+        if p == "/api/devolucoes/shopee":
+            try:
+                return self._envia(200, shopee_devolucoes_sincronizar())
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/admin/reiniciar-etapas":
             return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
         if p == "/api/estoque/desfazer":
@@ -2293,7 +2465,7 @@ def ler_etiqueta_txt(t):
             if par:
                 cores.append(par[-1].split(",")[0].strip())
             I = it.upper()
-            pers.append("SEM PERSONALIZ" not in I and bool(re.search(r"PERSONALIZ|PZD|APENAS NOME|COM NOME|NOME\s*\+", I)))
+            pers.append("PERSONALIZ" in I and "SEM PERSONALIZ" not in I)
     if not skus:
         skus = [x.upper() for x in re.findall(r"SKU\s*[:#-]?\s*([A-Za-z][A-Za-z0-9._\-/]{1,40})", t, re.I)]
     cli = re.search(r"Customer:\s*(.+)", t)
@@ -2707,6 +2879,10 @@ def _shopee_loop():
             shopee_sincronizar_todas()
         except Exception as e:
             _shopee_status["ultimo_erro"] = str(e)[:200]
+        try:
+            shopee_devolucoes_sincronizar()
+        except Exception as e:
+            _shopee_dev_status["erro"] = str(e)[:200]
         time.sleep(600)
 
 
