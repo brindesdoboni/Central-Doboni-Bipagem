@@ -5,12 +5,13 @@
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,Arial,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
 header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#222;font-size:20px}
 #posto{font-weight:800;font-size:26px;letter-spacing:1px}#op{font-size:22px}
-main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:background .2s}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:6vh!important;text-align:center;padding:20px;transition:background .2s}
 #msg{font-size:56px;font-weight:800;max-width:95vw}#det{font-size:28px;margin-top:18px;opacity:.95;line-height:1.4}
-#pilha{position:fixed;left:16px;bottom:56px;width:min(760px,calc(100vw - 32px));display:flex;flex-direction:column;gap:8px;z-index:5;pointer-events:none}
-.card{border-radius:12px;padding:12px 18px;color:#fff;box-shadow:0 6px 24px #0008;animation:entra .2s ease-out;text-align:left}
-.card .q{font-size:17px;font-weight:800;opacity:.95}.card .m{font-size:25px;font-weight:900;line-height:1.15;margin:2px 0}.card .d{font-size:17px;line-height:1.3}
-.card.err{border:6px solid #ffeb3b;width:min(1100px,calc(100vw - 32px))}.card.err .m{font-size:40px}.card .f{font-size:26px;font-weight:900;color:#ffeb3b;background:#7a000f;border-radius:8px;padding:8px 12px;margin:6px 0}
+#pilha{position:fixed;left:16px;right:16px;bottom:56px;display:flex;flex-direction:column;gap:8px;z-index:5;pointer-events:none}
+.card{border-radius:16px;padding:10px 24px;color:#fff;box-shadow:0 6px 24px #0008;animation:entra .2s ease-out;text-align:left}
+.card .q{display:flex;justify-content:space-between;align-items:baseline;gap:16px}.card .nome{font-size:36px;font-weight:900;letter-spacing:.5px}.card .hr{font-size:22px;font-weight:700;opacity:.9;white-space:nowrap}
+.card .m{font-size:28px;font-weight:900;line-height:1.15;margin:2px 0}.card .d{font-size:22px;line-height:1.3}
+.card.err{border:6px solid #ffeb3b}.card.err .m{font-size:32px}.card .f{font-size:22px;font-weight:900;color:#ffeb3b;background:#7a000f;border-radius:8px;padding:8px 12px;margin:6px 0}
 .card.sai{transition:opacity .4s;opacity:0}@keyframes entra{from{transform:translateY(30px);opacity:0}to{transform:none;opacity:1}}
 #modo{margin-top:16px;font-size:24px;padding:8px 18px;border-radius:8px;background:var(--av);color:#000;display:none}
 input{position:absolute;opacity:0;left:-999px}
@@ -46,11 +47,11 @@ function som(ev){const a=audio();if(!a)return;let t=a.currentTime+.02;for(const 
 function cartao(tipo,msg,det,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8",espera:"#3a3d48"}[tipo]||"var(--er)";
  const novo=!el||!el.isConnected;if(novo)el=document.createElement("div");clearTimeout(el._t);el.classList.remove("sai");
  el.className="card"+(tipo==="erro"?" err":"");el.style.background=cor;
- el.innerHTML=`<div class="q">${esc((quem||"SEM OPERADOR").toUpperCase())} · ${esc(POSTOS[posto]||"")} · ${new Date().toLocaleTimeString("pt-BR")}</div><div class="m">${tipo==="erro"?"⛔ ":""}${esc(msg)}</div>${fazer?`<div class="f">O QUE FAZER: ${esc(fazer)}</div>`:""}${det?`<div class="d">${det}</div>`:""}`;
- const p=$("pilha");if(novo)p.appendChild(el);const lim=innerHeight*.5,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1)p.removeChild(p.firstChild);
- el._t=setTimeout(()=>{el.classList.add("sai");setTimeout(()=>el.remove(),400)},tipo==="erro"?12000:tipo==="espera"?10000:5000);return el}
+ el.innerHTML=`<div class="q"><span class="nome">👤 ${esc((quem||"SEM CRACHÁ").toUpperCase())}</span><span class="hr">${esc(POSTOS[posto]||"")} · ${new Date().toLocaleTimeString("pt-BR")}</span></div><div class="m">${tipo==="erro"?"⛔ ":""}${esc(msg)}</div>${fazer?`<div class="f">O QUE FAZER: ${esc(fazer)}</div>`:""}${det?`<div class="d">${det}</div>`:""}`;
+ const p=$("pilha");if(novo)p.appendChild(el);const lim=innerHeight*.62,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1)p.removeChild(p.firstChild);
+ el._t=setTimeout(()=>{el.classList.add("sai");setTimeout(()=>el.remove(),400)},tipo==="erro"?8000:tipo==="espera"?10000:5000);return el}
 function tela(tipo,msg,det,ev,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
- $("tela").style.background=cor;$("msg").textContent=msg;$("det").innerHTML=det||"";som(ev||(tipo==="erro"?"erro":tipo));
+ $("tela").style.background=cor;som(ev||(tipo==="erro"?"erro":tipo));
  cartao(tipo,msg,det,quem||(op&&op.nome),fazer,el);
  clearTimeout(tela.t);tela.t=setTimeout(()=>{$("tela").style.background="var(--bg)"},tipo==="erro"?4000:1500)}
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
@@ -78,11 +79,11 @@ async function enviar(codigo){
  try{const r=await fetch("/api/bipe",{method:"POST",headers:{"Content-Type":"application/json","X-Chave":chave},
    body:JSON.stringify({posto,codigo:c,operador:op&&op.codigo,modo})});const d=await r.json();
   if(r.status===403){S("chave","");chave=null;return tela("erro","Chave do posto inválida","Recarregue a página e digite a chave",null,null,"Recarregue a página e digite a chave do posto.",el)}
-  if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome}
+  if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome;$("msg").textContent="👤 "+op.nome+" — bipe as etiquetas"}
   const i=d.item;let det="";
   if(i)det=`SKU <b>${esc(i.sku)}</b>${i.cor?" · "+esc(i.cor):""}`+
-    (i.nomes?`<br>Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"")+
-    `<br>Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}`;
+    (i.nomes?` · Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"")+
+    ` · Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}`;
   tela(d.tipo,d.msg,det,d.evento,d.colaborador,d.fazer,el);
  }catch(e){tela("erro","SEM INTERNET - bipe NÃO registrado","",null,null,"Confira a internet do computador e bipe a etiqueta de novo.",el)}
  finally{if(fim){fim();crachaPend=null}}}
