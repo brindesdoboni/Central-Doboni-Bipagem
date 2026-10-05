@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anúncios Shopee - Central Boni</title>
+<style>
+  body{font:16px Arial,sans-serif;margin:0;background:#f4f4f6;color:#222}
+  header{background:#ee4d2d;color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center}
+  header h1{font-size:20px;margin:0}header a{color:#fff;font-size:14px;margin-left:10px}
+  main{max-width:1100px;margin:0 auto;padding:10px 14px 40px}
+  .box{background:#fff;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 1px 3px #0001}
+  h2{font-size:19px;margin:0 0 8px}
+  .bts{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+  button{font-size:15px;padding:10px 14px;border:0;border-radius:8px;font-weight:bold;cursor:pointer;background:#e5e7eb}
+  .pri{background:#ee4d2d;color:#fff}.ok{background:#16a34a;color:#fff}.alt{background:#f59e0b}
+  .st{font-size:15px;line-height:1.5}
+  .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:13px;font-weight:bold}
+  .on{background:#dcfce7;color:#15803d}.off{background:#fee2e2;color:#b91c1c}
+  table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+  th{background:#fafafa;color:#666;font-size:12px}.tbl{overflow-x:auto;max-height:520px;overflow-y:auto}
+  .sobe{color:#15803d;font-weight:bold}.desce{color:#b91c1c;font-weight:bold}
+  .mini{font-size:13px;color:#666}.erro{color:#b91c1c;font-weight:bold}
+  details{margin-top:8px}summary{cursor:pointer;font-weight:bold}
+</style>
+</head>
+<body>
+<header><h1>🛍️ Anúncios Shopee</h1><div><a href="/shopee/pedidos">Pedidos</a><a href="/painel">Painel</a></div></header>
+<main>
+<div class="box">
+  <h2>📦 Estoque nos anúncios (nosso + XBZ)</h2>
+  <div class="st" id="st">Carregando...</div>
+  <div class="bts">
+    <button onclick="simular()">🔍 Simular (não grava)</button>
+    <button class="pri" onclick="aplicar()">Atualizar agora</button>
+    <button id="bAuto" onclick="auto()">...</button>
+  </div>
+  <div class="mini">Cada variação = nosso disponível + estoque da XBZ da mesma cor (kits: dividido pelo tamanho do kit). Só mexe em variação com SKU e cor reconhecidos. Não grava se a XBZ estiver desatualizada.</div>
+  <div id="sim"></div>
+</div>
+
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let AUTO=true;
+async function get(u){const r=await fetch(u);if(r.status==401){location.href="/painel";throw 0}return r.json()}
+async function post(u,b){const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});if(r.status==401){location.href="/painel";throw 0}return r.json()}
+async function status(){
+  const d=await get("/api/anuncios/status");AUTO=d.auto;
+  $("bAuto").textContent=AUTO?"⏸ Pausar automático":"▶ Ligar automático";$("bAuto").className=AUTO?"alt":"ok";
+  const s=d.status||{};let h=`Automático: <span class="tag ${AUTO?"on":"off"}">${AUTO?"LIGADO (a cada "+d.intervalo_min+" min)":"PAUSADO"}</span>`;
+  if(s.rodando)h+=" · <b>atualizando agora...</b>";
+  h+=`<br>Última atualização: <b>${esc(s.ultima||(d.ultimo&&d.ultimo.em)||"ainda não rodou")}</b>`;
+  const lojas=s.lojas&&Object.keys(s.lojas).length?s.lojas:(d.ultimo?Object.fromEntries((d.ultimo.lojas||[]).map(l=>[l.nome||l.shop_id,{gravados:l.gravados,mudar:l.mudar.length,igual:l.igual,sem_par:l.sem_par.length,erros:l.erros}])):{});
+  for(const [n,l] of Object.entries(lojas))h+=`<br>• <b>${esc(n)}</b>: ${l.gravados} atualizadas, ${l.igual} já certas, ${l.sem_par} sem SKU/cor reconhecido${l.erros&&l.erros.length?` · <span class="erro">${esc(l.erros.join(" | "))}</span>`:""}`;
+  if(s.erro)h+=`<br><span class="erro">${esc(s.erro)}</span>`;
+  $("st").innerHTML=h;
+}
+function tabela(rel){
+  if(!rel.ok)return `<p class="erro">${esc(rel.erro)}</p>`;
+  return rel.lojas.map(l=>`<h3>${esc(l.nome||l.shop_id)} — ${l.mudar.length} a mudar · ${l.igual} já certas · ${l.sem_par.length} sem par</h3>
+   ${l.erros.length?`<p class="erro">${esc(l.erros.join(" | "))}</p>`:""}
+   <div class="tbl"><table><tr><th>Anúncio / variação</th><th>SKU · cor</th><th>Nosso</th><th>XBZ</th><th>Antes</th><th>Depois</th></tr>
+   ${l.mudar.map(x=>`<tr><td>${esc(x.anuncio)}</td><td>${esc(x.sku)} · ${esc(x.cor)}${x.kit>1?" (kit "+x.kit+")":""}</td><td>${x.nosso}</td><td>${x.xbz}</td><td>${x.de??"—"}</td><td class="${(x.para>(x.de||0))?"sobe":"desce"}">${x.para}</td></tr>`).join("")}</table></div>
+   ${l.sem_par.length?`<details><summary>${l.sem_par.length} variação(ões) que não mexo (SKU/cor não reconhecido)</summary><div class="tbl"><table><tr><th>Anúncio</th><th>SKU</th><th>Motivo</th></tr>${l.sem_par.map(x=>`<tr><td>${esc(x.anuncio)}</td><td>${esc(x.sku)}</td><td>${esc(x.motivo)}</td></tr>`).join("")}</table></div></details>`:""}`).join("");
+}
+async function simular(){$("sim").innerHTML="<p>Lendo os anúncios das lojas (pode levar 1 a 3 minutos)...</p>";$("sim").innerHTML=tabela(await get("/api/anuncios/simular"))}
+async function aplicar(){if(!confirm("Atualizar agora o estoque dos anúncios das lojas?"))return;const r=await post("/api/anuncios/aplicar");$("sim").innerHTML=`<p>${esc(r.msg||r.erro)}</p>`;setTimeout(status,1500)}
+async function auto(){await post("/api/anuncios/auto",{ligado:!AUTO});status()}
+function lista(r){if(!r.ok)return `<p class="erro">${esc(r.erro)}</p>`;
+  return `<p>Loja <b>${esc(r.loja)}</b></p><div class="tbl"><table><tr><th>Anúncio</th><th>Sai</th><th>Situação</th></tr>${r.itens.map(i=>`<tr><td>${esc(i.anuncio||i.item_id)}</td><td>${esc((i.tirou||[]).join(", "))}</td><td>${esc(i.status)}</td></tr>`).join("")}</table></div>`}
+async function fotos(){$("fot").innerHTML="<p>Lendo...</p>";$("fot").innerHTML=lista(await get("/api/anuncios/fotos"))}
+async function fotosAplicar(){if(!confirm("Trocar as fotos de instrução nos anúncios personalizados da BEXLU?"))return;$("fot").innerHTML="<p>Trocando (pode levar 1 minuto)...</p>";$("fot").innerHTML=lista(await post("/api/anuncios/fotos/aplicar"))}
+async function fotosDesfazer(){if(!confirm("Voltar as fotos antigas nos anúncios trocados?"))return;const r=await post("/api/anuncios/fotos/desfazer");$("fot").innerHTML=r.ok?`<p>${r.itens.length} anúncio(s) voltaram.</p>`:`<p class="erro">${esc(r.erro)}</p>`}
+status();setInterval(status,30000);
+</script>
+</body>
+</html>

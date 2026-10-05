@@ -278,9 +278,81 @@ def importar_lote(dados):
 
 
 # ------------------------------------------------------------------ bipe
-def bipar(posto, codigo, operador, modo):
+# leitor em modo continuo le a mesma etiqueta varias vezes seguidas: so a 1a leitura vale.
+# Mesma etiqueta, mesmo posto, mesmo leitor/cracha: ignora enquanto continuar chegando em menos de REPETIDO_SEG
+# (cada leitura repetida renova o prazo; tirou a etiqueta da frente do leitor por 3 s, pode bipar de novo).
+REPETIDO_SEG = float(os.environ.get("REPETIDO_SEG", "3"))
+_repetidos = {}
+_repetidos_lock = threading.Lock()
+
+
+def _leitura_repetida(posto, codigo, operador, leitor=""):
+    import time
+    agora_m = time.monotonic()
+    k = ((posto or "").upper(), norm(operador), str(leitor or ""), norm(codigo))
+    with _repetidos_lock:
+        ult = _repetidos.get(k)
+        _repetidos[k] = agora_m
+        if len(_repetidos) > 5000:
+            for kk in [x for x, t in _repetidos.items() if agora_m - t > 60]:
+                _repetidos.pop(kk, None)
+    return ult is not None and agora_m - ult < REPETIDO_SEG
+
+
+_ctx = threading.local()
+
+
+def _codigo_de_etiqueta(cod):
+    """So inclui sozinho o que tem cara de etiqueta de envio (nao codigo de barras de produto, cracha etc.)."""
+    return bool(re.fullmatch(r"5\d{17}", cod) or re.fullmatch(r"9\d{13,15}", cod) or re.fullmatch(r"BR\d{12,14}[0-9A-Z]?", cod)
+                or re.fullmatch(r"2\d{5}[0-9A-Z]{8}", cod) and re.search(r"[A-Z]", cod) or re.fullmatch(r"UPPUS\d{4,}", cod))
+
+
+def _auto_incluir(c, codigo, posto):
+    """Etiqueta que nao estava na Central: entra sozinha no 1o bipe (separacao, gravacao ou expedicao).
+    Se for pedido da Shopee ja lido pela API, vem com SKU, cor, quantidade e loja."""
+    cod = norm(codigo)
+    if not _codigo_de_etiqueta(cod):
+        return None
+    canal, envio = canal_por_codigo(cod)
+    if re.fullmatch(r"9\d{13,15}", cod) and canal != "TIKTOK":
+        canal, envio = "SHOPEE", "ENTREGA DIRETA"
+    sku = cor = loja = ""
+    pecas, pers = [], None
+    sp = c.execute("SELECT * FROM shopee_pedidos WHERE order_sn=?", (cod,)).fetchone()
+    if sp:
+        loja = sp["loja"] or ""
+        canal = canal or "SHOPEE"
+        for i in json.loads(sp["itens"] or "[]"):
+            cr = (i.get("var") or "").split(",")[0].strip()
+            pecas.append({"sku": estoque_chave(i.get("sku") or "")[0] or (i.get("sku") or ""), "cor": cr, "qtd": int(i.get("qtd") or 1)})
+            t = ((i.get("nome") or "") + " " + (i.get("var") or "")).upper()
+            if "PERSONALIZ" in t and "SEM PERSONALIZ" not in t:
+                pers = 1
+        sku = " + ".join(dict.fromkeys(p["sku"] for p in pecas if p["sku"]))
+        cor = " + ".join(dict.fromkeys(p["cor"] for p in pecas if p["cor"]))
+    if posto == "GRAVACAO":
+        pers = 1
+    iid = c.execute("""INSERT INTO itens(chave,lote,pedido,rastreio,canal,envio,loja,sku,cor,personalizado,status,obs,pecas,qtd,criado_em,atualizado_em)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'AGUARDANDO',?,?,?,?,?)""",
+                    (f"AUTO|{cod}", "AUTO", codigo.strip(), cod if cod.startswith("BR") else "", canal, envio, loja, sku, cor,
+                     pers or 0, "incluida no 1o bipe" + ("" if sku else " - completar SKU no painel"),
+                     json.dumps(pecas, ensure_ascii=False) if pecas else "", sum(p["qtd"] for p in pecas) or 1, agora(), agora())).lastrowid
+    c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
+    if sp and sp["order_sn"] != cod:
+        c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (sp["order_sn"], iid))
+    return iid
+
+
+def bipar(posto, codigo, operador, modo, leitor=""):
     """Devolve tambem 'colaborador' (nome de quem bipou) e 'evento' (para cada coisa tocar um som diferente)."""
+    if norm(codigo) and _leitura_repetida(posto, codigo, operador, leitor):
+        return {"tipo": "ignorado", "evento": "ignorado", "msg": "Leitura repetida ignorada", "ignorado": True}
+    _ctx.auto = False
     r = _bipar(posto, codigo, operador, modo)
+    if getattr(_ctx, "auto", False):
+        r["msg"] = "NOVA ETIQUETA incluída  ·  " + (r.get("msg") or "")
+        r["novo"] = True
     if not r.get("evento"):
         r["evento"] = "erro" if r.get("tipo") == "erro" else ("repetido" if r.get("tipo") == "aviso" else "ok")
     if not r.get("colaborador"):
@@ -327,6 +399,13 @@ def _bipar(posto, codigo, operador, modo):
                             (f"DEV|{cod}|{agora()}", "DEVOLUCAO", codigo.strip(), "", agora(), agora())).lastrowid
             c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
             itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
+        auto_sep = False
+        if not itens and posto in ("SEPARACAO", "GRAVACAO", "EXPEDICAO"):
+            iid = _auto_incluir(c, codigo, posto)
+            if iid:
+                _ctx.auto = True
+                auto_sep = posto in ("GRAVACAO", "EXPEDICAO")   # chegou na gravacao/expedicao: ja foi separada
+                itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
         if not itens:
             return {"tipo": "erro", "msg": f"ETIQUETA NÃO ENCONTRADA ({codigo})",
                     "fazer": "Separe esta etiqueta e leve para o Lucas incluir no painel (+ Incluir etiquetas). Depois bipe de novo."}
@@ -349,6 +428,10 @@ def _bipar(posto, codigo, operador, modo):
             if etapa in ("SEPARADO", "GRAVACAO_INICIO", "EXPEDIDO"):
                 baixar_estoque(c, it["id"])  # baixa no estoque quando o material sai para a separacao
             return dict(c.execute("SELECT * FROM itens WHERE id=?", (it["id"],)).fetchone())
+
+        if auto_sep:
+            ev(itens[0], "SEPARADO", "incluida automaticamente")
+            itens = c.execute("SELECT * FROM itens WHERE id=?", (itens[0]["id"],)).fetchall()
 
         if modo == "FALTA":
             it = itens[0]
@@ -983,7 +1066,25 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             return self._envia(200, shopee_pedidos_resumo())
         if p == "/shopee/pedidos":
             return self._pagina("shopee.html")
-        if p == "/api/shopee/testar":
+        if p == "/shopee/anuncios":
+            return self._pagina("anuncios.html")
+        if p == "/api/anuncios/status":
+            with conn() as c:
+                r = c.execute("SELECT valor FROM meta WHERE chave='anuncios_ultimo'").fetchone()
+                f = c.execute("SELECT valor FROM meta WHERE chave='fotos_ultimo'").fetchone()
+            return self._envia(200, {"auto": anuncios_auto(), "status": _anuncios_status, "intervalo_min": ANUNCIOS_INTERVALO // 60,
+                                     "ultimo": json.loads(r[0]) if r else None, "fotos_ultimo": json.loads(f[0]) if f else None})
+        if p == "/api/anuncios/simular":
+            try:
+                return self._envia(200, anuncios_estoque(aplicar=False))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/anuncios/fotos":
+            try:
+                return self._envia(200, fotos_aplicar(aplicar=False))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+
             try:
                 return self._envia(200, shopee_testar(q.get("shop_id", "0")))
             except Exception as e:
@@ -1061,7 +1162,7 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
         if p == "/api/bipe":
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
-            return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo")))
+            return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo"), d.get("leitor") or ""))
         if p == "/api/importar-pdf":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"ok": False, "erro": "token invalido"})
@@ -1106,7 +1207,34 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, shopee_devolucoes_sincronizar())
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
-        if p == "/api/admin/reiniciar-etapas":
+        if p == "/api/anuncios/aplicar":
+            if _anuncios_status.get("rodando"):
+                return self._envia(200, {"ok": False, "erro": "ja esta atualizando, aguarde"})
+            def _rodar():
+                _anuncios_status["rodando"] = True
+                try:
+                    r = anuncios_estoque(aplicar=True)
+                    _anuncios_status["erro"] = "" if r.get("ok") else r.get("erro", "")
+                except Exception as e:
+                    _anuncios_status["erro"] = str(e)[:200]
+                _anuncios_status["rodando"] = False
+            threading.Thread(target=_rodar, daemon=True).start()
+            return self._envia(200, {"ok": True, "msg": "atualizando os anuncios..."})
+        if p == "/api/anuncios/auto":
+            with _lock, conn() as c:
+                c.execute("INSERT OR REPLACE INTO meta VALUES('anuncios_auto', ?)", ("1" if d.get("ligado") else "0",))
+            return self._envia(200, {"ok": True, "auto": bool(d.get("ligado"))})
+        if p == "/api/anuncios/fotos/aplicar":
+            try:
+                return self._envia(200, fotos_aplicar(aplicar=True))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/anuncios/fotos/desfazer":
+            try:
+                return self._envia(200, fotos_desfazer())
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+
             return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
         if p == "/api/estoque/desfazer":
             return self._envia(200, desfazer_contagem(d.get("ref")))
@@ -3077,6 +3205,327 @@ def shopee_pedidos_resumo():
     return out
 
 
+# ---------------- anuncios da Shopee: ESTOQUE (nosso + XBZ) e FOTOS de instrucao do nome
+# Autorizado pelo Lucas em 05/10/2026: estoque do anuncio = nosso disponivel + todo o estoque da XBZ, igual nas lojas.
+# Protecoes: so mexe em variacao com SKU e cor reconhecidos; nao escreve com XBZ desatualizada.
+ANUNCIOS_INTERVALO = int(os.environ.get("ANUNCIOS_INTERVALO", "1800"))
+ANUNCIOS_XBZ_MAX_HORAS = float(os.environ.get("ANUNCIOS_XBZ_MAX_HORAS", "16"))
+_anuncios_status = {"rodando": False, "ultima": "", "lojas": {}, "erro": ""}
+
+
+def _shopee_upload_imagem(caminho):
+    """Sobe uma imagem para o banco de imagens da Shopee (do app). Devolve o image_id."""
+    import urllib.request, urllib.parse, time
+    pid, key = _shopee_cred()
+    if not pid:
+        raise RuntimeError("SHOPEE_PARTNER_ID/SHOPEE_PARTNER_KEY nao configurados no Railway")
+    path, ts = "/api/v2/media_space/upload_image", int(time.time())
+    q = {"partner_id": pid, "timestamp": ts, "sign": _shopee_assina(key, pid, path, ts)}
+    lim = "----boni" + secrets.token_hex(8)
+    with open(caminho, "rb") as f:
+        dados = f.read()
+    corpo = (f"--{lim}\r\nContent-Disposition: form-data; name=\"scene\"\r\n\r\nnormal\r\n"
+             f"--{lim}\r\nContent-Disposition: form-data; name=\"ratio\"\r\n\r\n1:1\r\n"
+             f"--{lim}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{os.path.basename(caminho)}\"\r\n"
+             f"Content-Type: image/jpeg\r\n\r\n").encode() + dados + f"\r\n--{lim}--\r\n".encode()
+    req = urllib.request.Request(SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q), data=corpo, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={lim}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        res = json.loads(e.read() or b"{}") if e.fp else {"error": f"http {e.code}"}
+    if res.get("error"):
+        raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
+    rr = res.get("response") or {}
+    info = rr.get("image_info") or ((rr.get("image_info_list") or [{}])[0].get("image_info") or {})
+    if not info.get("image_id"):
+        raise RuntimeError("upload sem image_id")
+    return info["image_id"]
+
+
+def _shopee_itens_ativos(loja):
+    ids, off = [], 0
+    for _ in range(100):
+        res = _shopee_http("GET", "/api/v2/product/get_item_list", loja=loja,
+                           params={"offset": off, "page_size": 100, "item_status": "NORMAL"})
+        rr = res.get("response") or {}
+        ids += [int(i["item_id"]) for i in (rr.get("item") or [])]
+        if not rr.get("has_next_page"):
+            break
+        off = rr.get("next_offset") or off + 100
+    return ids
+
+
+def _shopee_base_info(loja, ids):
+    out = {}
+    for k in range(0, len(ids), 50):
+        res = _shopee_http("GET", "/api/v2/product/get_item_base_info", loja=loja,
+                           params={"item_id_list": ",".join(str(x) for x in ids[k:k + 50])})
+        for it in (res.get("response") or {}).get("item_list") or []:
+            out[int(it["item_id"])] = it
+    return out
+
+
+def _estoque_do_vendedor(info):
+    """(estoque atual, location_id) de stock_info_v2.seller_stock."""
+    ss = ((info or {}).get("stock_info_v2") or {}).get("seller_stock") or []
+    if not ss:
+        return None, None
+    return sum(int(x.get("stock") or 0) for x in ss), ss[0].get("location_id")
+
+
+def _kit_mult(*textos):
+    for t in textos:
+        t = (t or "").upper()
+        m = (re.search(r"(?<![0-9])(\d{1,4})\s*X\s*(?=\d)", t) or re.search(r"(\d{2,4})\s*(?:UND|UNID|UNIDS|UNIDADES|UN)\b", t)
+             or re.search(r"\bKIT\s*(?:C/|COM|DE)?\s*(\d{1,4})\b", t))
+        if m and int(m.group(1)) > 1:
+            return int(m.group(1))
+    return 1
+
+
+def _sku_do_texto(t):
+    m = re.search(r"(?<![0-9A-Z])(\d{4,6}[A-Z]?)(?![0-9A-Z])", (t or "").upper())
+    return estoque_chave(m.group(1))[0] if m else ""
+
+
+def _base_estoque_anuncios(c):
+    """Nosso disponivel e o estoque da XBZ por (sku, cor), com as cores conhecidas de cada sku."""
+    nosso, cores = {}, {}
+    for i in estoque()["itens"]:
+        if i.get("sem_cor"):
+            continue
+        cor = "" if i["cor"] == "PADRAO" else i["cor"]
+        nosso[(i["sku"], cor)] = i["saldo"] if i.get("conhecido") else max(0, i["saldo"])
+        cores.setdefault(i["sku"], set()).add(cor)
+    xbz = {}
+    for r in c.execute("SELECT codigo, cor, estoque FROM xbz"):
+        k = (estoque_chave(r[0])[0], r[1] or "")
+        xbz[k] = xbz.get(k, 0) + int(r[2] or 0)
+        cores.setdefault(k[0], set()).add(k[1])
+    return nosso, xbz, cores
+
+
+def _cor_do_modelo(sku, opcoes, cores):
+    """Acha nas opcoes da variacao (ex.: 'Rosa Claro', 'Personalizado') a cor que o estoque/XBZ conhece."""
+    cs = cores.get(sku, set())
+    if cs <= {""}:
+        return ""
+    for op in opcoes:
+        for parte in re.split(r"[,/|;]| - ", op or ""):
+            for cand in (estoque_chave(sku, parte)[1], cor_norm(parte)):
+                if cand and cand in cs:
+                    return cand
+    return None
+
+
+def _xbz_idade_horas(c):
+    r = c.execute("SELECT MAX(atualizado) FROM xbz").fetchone()[0]
+    if not r:
+        return None
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(r)).total_seconds() / 3600
+
+
+def anuncios_estoque(aplicar=False, so_loja=None):
+    """Calcula (e, se aplicar=True, grava) o estoque de cada variacao dos anuncios ativos de cada loja autorizada."""
+    import time
+    with conn() as c:
+        idade = _xbz_idade_horas(c)
+        nosso, xbz, cores = _base_estoque_anuncios(c)
+        lojas = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas ORDER BY shop_id")]
+    if idade is None or idade > ANUNCIOS_XBZ_MAX_HORAS:
+        return {"ok": False, "erro": f"estoque da XBZ desatualizado ({'sem dados' if idade is None else f'{idade:.0f} h'}): nada foi alterado"}
+    rel = {"ok": True, "aplicado": aplicar, "em": datetime.now(BR).strftime("%d/%m %H:%M"), "lojas": []}
+    for sid in lojas:
+        if so_loja and int(so_loja) != sid:
+            continue
+        L = {"shop_id": sid, "nome": "", "mudar": [], "igual": 0, "sem_par": [], "erros": [], "gravados": 0}
+        try:
+            loja = _shopee_token_ok(sid)
+            L["nome"] = loja.get("nome") or str(sid)
+            ids = _shopee_itens_ativos(loja)
+            base = _shopee_base_info(loja, ids)
+            for iid in ids:
+                it = base.get(iid) or {}
+                nome = it.get("item_name") or ""
+                modelos = []
+                if it.get("has_model"):
+                    res = _shopee_http("GET", "/api/v2/product/get_model_list", loja=loja, params={"item_id": iid})
+                    rr = res.get("response") or {}
+                    tiers = rr.get("tier_variation") or []
+                    for m in rr.get("model") or []:
+                        ops = []
+                        for t, ix in zip(tiers, m.get("tier_index") or []):
+                            ol = t.get("option_list") or []
+                            if ix < len(ol):
+                                ops.append(ol[ix].get("option") or "")
+                        atual, loc = _estoque_do_vendedor(m)
+                        modelos.append({"model_id": int(m["model_id"]), "sku_txt": m.get("model_sku") or it.get("item_sku") or "",
+                                        "ops": ops, "atual": atual, "loc": loc})
+                    time.sleep(0.15)
+                else:
+                    atual, loc = _estoque_do_vendedor(it)
+                    modelos.append({"model_id": 0, "sku_txt": it.get("item_sku") or "", "ops": [], "atual": atual, "loc": loc})
+                for m in modelos:
+                    rot = f"{nome[:45]} | {' / '.join(m['ops'])}".strip(" |")
+                    sku = _sku_do_texto(m["sku_txt"]) or _sku_do_texto(it.get("item_sku"))
+                    if not sku or sku not in cores:
+                        L["sem_par"].append({"item_id": iid, "anuncio": rot, "sku": m["sku_txt"], "motivo": "SKU nao reconhecido"})
+                        continue
+                    cor = _cor_do_modelo(sku, m["ops"] + [m["sku_txt"].split("-", 1)[1] if "-" in m["sku_txt"] else ""], cores)
+                    if cor is None:
+                        L["sem_par"].append({"item_id": iid, "anuncio": rot, "sku": sku, "motivo": "cor nao reconhecida"})
+                        continue
+                    k = (sku, cor)
+                    if k not in nosso and k not in xbz:
+                        L["sem_par"].append({"item_id": iid, "anuncio": rot, "sku": sku, "motivo": f"{sku} {cor or 'PADRAO'} sem estoque cadastrado"})
+                        continue
+                    mult = _kit_mult(m["sku_txt"], " ".join(m["ops"]))
+                    alvo = int((max(0, nosso.get(k, 0)) + xbz.get(k, 0)) // mult)
+                    if m["atual"] is not None and alvo == m["atual"]:
+                        L["igual"] += 1
+                        continue
+                    L["mudar"].append({"item_id": iid, "model_id": m["model_id"], "anuncio": rot, "sku": sku,
+                                       "cor": cor or "PADRAO", "kit": mult, "nosso": nosso.get(k, 0), "xbz": xbz.get(k, 0),
+                                       "de": m["atual"], "para": alvo, "loc": m["loc"]})
+            if aplicar:
+                por_item = {}
+                for x in L["mudar"]:
+                    por_item.setdefault(x["item_id"], []).append(x)
+                for iid, xs in por_item.items():
+                    for k in range(0, len(xs), 50):
+                        lista = [{"model_id": x["model_id"],
+                                  "seller_stock": [{**({"location_id": x["loc"]} if x["loc"] else {}), "stock": x["para"]}]}
+                                 for x in xs[k:k + 50]]
+                        try:
+                            res = _shopee_http("POST", "/api/v2/product/update_stock", loja=loja,
+                                               corpo={"item_id": iid, "stock_list": lista})
+                            rr = res.get("response") or {}
+                            L["gravados"] += len(rr.get("success_list") or [])
+                            for f in rr.get("failure_list") or []:
+                                L["erros"].append(f"{iid}/{f.get('model_id')}: {f.get('failed_reason', '')}"[:160])
+                        except Exception as e:
+                            L["erros"].append(f"{iid}: {e}"[:160])
+                        time.sleep(0.2)
+        except Exception as e:
+            L["erros"].append(str(e)[:200])
+        for x in L["mudar"]:
+            x.pop("loc", None)
+        rel["lojas"].append(L)
+    if aplicar:
+        _anuncios_status.update(ultima=rel["em"], lojas={l["nome"] or l["shop_id"]: {
+            "gravados": l["gravados"], "mudar": len(l["mudar"]), "igual": l["igual"], "sem_par": len(l["sem_par"]),
+            "erros": l["erros"][:5]} for l in rel["lojas"]}, erro="")
+        with _lock, conn() as c:
+            c.execute("INSERT OR REPLACE INTO meta VALUES('anuncios_ultimo', ?)", (json.dumps(rel, ensure_ascii=False)[:900000],))
+    return rel
+
+
+def anuncios_auto():
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='anuncios_auto'").fetchone()
+    return (r[0] if r else "1") == "1"
+
+
+def _anuncios_loop():
+    import time
+    time.sleep(180)
+    while True:
+        try:
+            if anuncios_auto():
+                _anuncios_status["rodando"] = True
+                r = anuncios_estoque(aplicar=True)
+                if not r.get("ok"):
+                    _anuncios_status["erro"] = r.get("erro", "")
+        except Exception as e:
+            _anuncios_status["erro"] = str(e)[:200]
+        _anuncios_status["rodando"] = False
+        time.sleep(ANUNCIOS_INTERVALO)
+
+
+# ---- fotos: troca as imagens antigas de instrucao pelas novas (plano revisado: web/fotos_plano.json)
+FOTOS_NOVAS = {"NOVO_A": "foto_nome_1_como_pedir.jpg", "NOVO_B": "foto_nome_2_fontes.jpg", "NOVO_C": "foto_nome_3_esqueceu.jpg"}
+
+
+def _arquivo_web(nome):
+    """Arquivo da pasta web (ou da raiz do repositorio, se subiu solto)."""
+    c = os.path.join(AQUI, "web", nome)
+    return c if os.path.exists(c) else os.path.join(AQUI, nome)
+
+
+def _fotos_plano():
+    with open(_arquivo_web("fotos_plano.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def fotos_aplicar(aplicar=False):
+    """Simula (ou aplica) a troca das fotos de instrucao. So mexe se as fotos do anuncio ainda forem as mesmas do plano."""
+    plano = _fotos_plano()
+    sid = int(plano["shop_id"])
+    loja = _shopee_token_ok(sid)
+    if not loja:
+        return {"ok": False, "erro": "loja do plano nao autorizada"}
+    base = _shopee_base_info(loja, [int(i) for i in plano["itens"]])
+    novos = {}
+    if aplicar:
+        with conn() as c:
+            r = c.execute("SELECT valor FROM meta WHERE chave='fotos_novas_ids'").fetchone()
+        novos = json.loads(r[0]) if r else {}
+        for k, arq in FOTOS_NOVAS.items():
+            if not novos.get(k):
+                novos[k] = _shopee_upload_imagem(_arquivo_web(arq))
+        with _lock, conn() as c:
+            c.execute("INSERT OR REPLACE INTO meta VALUES('fotos_novas_ids', ?)", (json.dumps(novos),))
+    out = {"ok": True, "aplicado": aplicar, "loja": loja.get("nome"), "itens": []}
+    for iid, p in plano["itens"].items():
+        it = base.get(int(iid)) or {}
+        atual = ((it.get("image") or {}).get("image_id_list")) or []
+        linha = {"item_id": int(iid), "anuncio": (it.get("item_name") or "")[:60], "tirou": p.get("tirou", [])}
+        if not it:
+            linha["status"] = "anuncio nao encontrado / inativo"
+        elif atual == p["depois"] or (novos and atual == [novos.get(x, x) for x in p["depois"]]):
+            linha["status"] = "ja estava com as fotos novas"
+        elif atual != p["antes"]:
+            linha["status"] = "PULADO: as fotos mudaram desde a revisao (nada alterado)"
+        elif not aplicar:
+            linha["status"] = "vai trocar"
+        else:
+            lista = [novos.get(x, x) for x in p["depois"]]
+            try:
+                _shopee_http("POST", "/api/v2/product/update_item", loja=loja,
+                             corpo={"item_id": int(iid), "image": {"image_id_list": lista}})
+                linha["status"] = "TROCADO"
+            except Exception as e:
+                linha["status"] = "ERRO: " + str(e)[:150]
+        out["itens"].append(linha)
+    if aplicar:
+        with _lock, conn() as c:
+            c.execute("INSERT OR REPLACE INTO meta VALUES('fotos_ultimo', ?)", (json.dumps(out, ensure_ascii=False),))
+    return out
+
+
+def fotos_desfazer():
+    """Volta as fotos antigas (lista 'antes' do plano) nos anuncios que foram trocados."""
+    plano = _fotos_plano()
+    loja = _shopee_token_ok(int(plano["shop_id"]))
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='fotos_novas_ids'").fetchone()
+    novos = json.loads(r[0]) if r else {}
+    base = _shopee_base_info(loja, [int(i) for i in plano["itens"]])
+    out = []
+    for iid, p in plano["itens"].items():
+        atual = (((base.get(int(iid)) or {}).get("image") or {}).get("image_id_list")) or []
+        if atual == [novos.get(x, x) for x in p["depois"]]:
+            try:
+                _shopee_http("POST", "/api/v2/product/update_item", loja=loja,
+                             corpo={"item_id": int(iid), "image": {"image_id_list": p["antes"]}})
+                out.append({"item_id": int(iid), "status": "voltou"})
+            except Exception as e:
+                out.append({"item_id": int(iid), "status": "ERRO: " + str(e)[:150]})
+    return {"ok": True, "itens": out}
+
+
 def shopee_lojas():
     from time import time as _t
     pid, _ = _shopee_cred()
@@ -3102,6 +3551,7 @@ if __name__ == "__main__":
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
     threading.Thread(target=_shopee_loop, daemon=True).start()
+    threading.Thread(target=_anuncios_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))
     print(f"Central Boni rodando na porta {porta} (banco: {DB})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", porta), H).serve_forever()

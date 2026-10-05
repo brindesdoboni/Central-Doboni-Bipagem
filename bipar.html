@@ -61,8 +61,12 @@ function escolherPosto(){ $("msg").textContent="Qual é este posto?";
 function pronto(){ $("posto").textContent=POSTOS[posto]; $("msg").textContent="Bipe seu CRACHÁ"; $("det").textContent="";
  setInterval(()=>{if(document.activeElement!==inp)inp.focus()},500)}
 function sairOp(){op=null;$("op").textContent="Bipe seu CRACHÁ"}
+// leitor continuo: a mesma etiqueta chega varias vezes seguidas; so a 1a vale (cada repeticao renova os 3 s)
+const ULT={};
+function repetida(c){const t=Date.now(),u=ULT[c];ULT[c]=t;return u!==undefined&&t-u<3000}
 async function enviar(codigo){
  const c=codigo.trim().toUpperCase(); if(!c)return;
+ if(repetida(c))return;
  const cmd=c.replace(/[^A-Z]/g,"");
  if(["CMDSEPARACAO","CMDGRAVACAO","CMDEXPEDICAO","CMDDEVOLUCAO"].includes(cmd)){posto=cmd.slice(3);S("posto",posto);
    $("posto").textContent=POSTOS[posto];modo=null;$("modo").style.display="none";
@@ -78,6 +82,7 @@ async function enviar(codigo){
  else if(crachaPend)await crachaPend;
  try{const r=await fetch("/api/bipe",{method:"POST",headers:{"Content-Type":"application/json","X-Chave":chave},
    body:JSON.stringify({posto,codigo:c,operador:op&&op.codigo,modo})});const d=await r.json();
+  if(d.tipo==="ignorado"){el.remove();return}
   if(r.status===403){S("chave","");chave=null;return tela("erro","Chave do posto inválida","Recarregue a página e digite a chave",null,null,"Recarregue a página e digite a chave do posto.",el)}
   if(d.tipo==="operador"){op=d.operador;$("op").textContent="👤 "+op.nome;$("msg").textContent="👤 "+op.nome+" — bipe as etiquetas"}
   const i=d.item;let det="";
