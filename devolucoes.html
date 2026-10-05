@@ -199,16 +199,24 @@ async function arquivoEscolhido(ev){const f=ev.target.files[0];if(!f||!TIRAR)ret
   catch(e){$("msg").textContent="❌ Não salvou: "+e}}
 $("arqFoto").onchange=arquivoEscolhido;$("arqVideo").onchange=arquivoEscolhido;
 async function apagar(a){const r=await post("/api/devolucoes/apagar-midia",{id:OQ.id,arquivo:a});if(r.ok){OQ.midias=r.midias;desenharOq()}}
-async function enviar(){const t=$("oqTxt").value,em=$("oqMail").value.trim();
+async function enviar(motivoId){const t=$("oqTxt").value,em=$("oqMail").value.trim();
   if(!/@/.test(em)){alert("Preencha o e-mail da loja (a Shopee exige).");$("oqMail").focus();return}
   if(/\[.*\]/.test(t))return alert("Ajuste o que está entre [colchetes] no texto antes de enviar.");
   const nf=OQ.midias.filter(m=>m.tipo=="foto").length,nv=OQ.midias.filter(m=>m.tipo=="video").length;
-  if(!confirm(`Enviar a contestação do pedido ${OQ.pedido} para a Shopee?\n\n${nf} foto(s) + ${nv} vídeo + o texto.\n\nSó envie se tudo for verdade.`))return;
+  if(motivoId==null&&!confirm(`Enviar a contestação do pedido ${OQ.pedido} para a Shopee?\n\n${nf} foto(s) + o texto.${nv?"\n(O vídeo a Shopee só aceita pelo Seller Center.)":""}\n\nSó envie se tudo for verdade.`))return;
   if(em)await post("/api/devolucoes/email",{email:em});
+  const ant=$("escMot");if(ant)ant.remove();
   $("msg").textContent="Enviando para a Shopee... (pode levar 1 minuto)";
-  const r=await post("/api/devolucoes/enviar",{id:OQ.id,texto:t,email:em});
+  const r=await post("/api/devolucoes/enviar",{id:OQ.id,texto:t,email:em,motivo_id:motivoId??null});
+  if(!r.ok&&r.escolher){$("msg").textContent="Escolha o motivo (texto da própria Shopee)";
+    const d=document.createElement("div");d.id="escMot";d.className="passo";
+    d.innerHTML=`<h3>Qual destes é o seu caso? (opções da Shopee)</h3>`+r.escolher.map(m=>`<div style="border:1px solid #ddd;border-radius:10px;padding:10px;margin:8px 0">
+      ${m.requisito?`<div>${esc(m.requisito)}</div>`:""}<ul style="margin:6px 0 8px 18px;padding:0">${m.modulos.map(x=>`<li>${x.is_required?"<b>(obrigatório)</b> ":""}${esc(x.requirement)}</li>`).join("")}</ul>
+      <button class="env" style="width:100%" onclick="enviar(${m.id})">Usar este motivo (nº ${m.id}) e enviar</button></div>`).join("");
+    $("oq").appendChild(d);d.scrollIntoView({behavior:"smooth"});return}
   $("msg").textContent=r.ok?"✅ Enviado e conferido na Shopee":"❌ "+r.erro;
-  if(r.ok)oque(OQ.id);else{alert(r.erro);if(r.bruto){const d=document.createElement("details");d.open=true;
+  if(r.ok){if(r.avisos&&r.avisos.length)alert("Enviado ✅\n\nAtenção: "+r.avisos.join("\n"));oque(OQ.id)}
+  else{alert(r.erro);if(r.bruto){const d=document.createElement("details");d.open=true;
     d.innerHTML=`<summary><b>Detalhes técnicos (mande print ao Lucas)</b></summary><pre style="white-space:pre-wrap;font-size:12px">${esc(JSON.stringify(r.bruto,null,1))}</pre>`;$("oq").appendChild(d)}}}
 // ---- leitura pela camera do celular
 let CAM=null,ZX=null;

@@ -1439,7 +1439,7 @@ def _foto_menor(dados, lado=1280, alvo=FOTO_ALVO):
     return melhor
 
 
-def _dev_converter_foto(loja, nome, dados):
+def _dev_converter_foto(loja, nome, dados, sn=""):
     """Sobe a foto para a Shopee (returns/convert_image) e devolve a URL. A Shopee nao documenta bem o nome do campo
     do arquivo: tenta os nomes conhecidos e guarda o que funcionou. Foto grande e diminuida antes (e de novo se der 413)."""
     if len(dados) > FOTO_ALVO:
@@ -1451,7 +1451,8 @@ def _dev_converter_foto(loja, nome, dados):
     while i < len(nomes):
         campo = nomes[i]
         try:
-            res = _shopee_multipart("/api/v2/returns/convert_image", {}, [(campo, nome, dados, "image/jpeg")], loja=loja)
+            res = _shopee_multipart("/api/v2/returns/convert_image", {"return_sn": sn} if sn else {},
+                                    [(campo, nome, dados, "image/jpeg")], loja=loja)
         except Exception as e:
             ult = str(e)
             if "413" in ult:
@@ -1464,7 +1465,8 @@ def _dev_converter_foto(loja, nome, dados):
                 i += 1
                 continue
             raise RuntimeError(f"foto: {ult}")
-        us = _urls_em(res.get("response") or res)
+        rr = res.get("response") or {}
+        us = ([rr["url"]] if isinstance(rr, dict) and rr.get("url") else []) + _urls_em(rr or res)
         if us:
             _CAMPO_FOTO["nome"] = campo
             return us[0]
@@ -1490,7 +1492,22 @@ def _tenta(etapa, fn, vezes=3):
             raise RuntimeError(f"{etapa}: {e}"[:220])
 
 
-def dev_enviar_shopee(dev_id, texto, email=""):
+def _motivos_shopee(res):
+    """get_return_dispute_reason -> [{id, requisito, modulos:[{module_index, requirement, is_required}]}]"""
+    rr = res.get("response") or {}
+    out = []
+    for x in rr.get("dispute_reason_list") or []:
+        try:
+            rid = int(str(x.get("dispute_reason")).strip())
+        except Exception:
+            continue
+        out.append({"id": rid, "requisito": (x.get("dispute_requirement") or "")[:300],
+                    "modulos": [{"module_index": int(m.get("module_index") or 0), "requirement": m.get("requirement") or "",
+                                 "is_required": bool(m.get("is_required"))} for m in (x.get("evidence_module_list") or [])]})
+    return out
+
+
+def dev_enviar_shopee(dev_id, texto, email="", motivo_id=None):
     """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar).
     So diz 'enviado' depois de conferir na propria Shopee que a contestacao entrou."""
     import time
@@ -1522,30 +1539,37 @@ def dev_enviar_shopee(dev_id, texto, email=""):
         return {"ok": False, "erro": "Tire pelo menos as fotos da lista antes de enviar."}
     loja = _shopee_token_ok(sr["shop_id"])
     passos, urls, avisos = [], [], []
+    # 1) motivos que a Shopee aceita para ESTA devolucao (cada um com os tipos de prova que pede)
+    lista = _motivos_shopee(_tenta("motivos da contestação", lambda: _shopee_http(
+        "GET", "/api/v2/returns/get_return_dispute_reason", loja=loja, params={"return_sn": sn})))
+    if not lista:
+        return {"ok": False, "erro": "A Shopee não ofereceu nenhum motivo de contestação para esta devolução pelo sistema "
+                                     "(nesta fase talvez só pelo Seller Center). Conteste pelo Seller Center, botão Disputar."}
+    if motivo_id in (None, ""):
+        if len(lista) > 1:   # a pessoa escolhe o motivo pelo texto da propria Shopee
+            return {"ok": False, "escolher": lista, "erro": "Escolha o motivo da contestação"}
+        motivo = lista[0]
+    else:
+        motivo = next((m for m in lista if m["id"] == int(motivo_id)), None)
+        if not motivo:
+            return {"ok": False, "escolher": lista, "erro": "Esse motivo não está mais disponível: escolha de novo"}
+    # 2) fotos -> URLs da Shopee
     for m in fotos[:9]:
         with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
             dados_f = f.read()
-        urls.append(_tenta("foto", lambda: _dev_converter_foto(loja, m["arquivo"], dados_f)))
+        urls.append(_tenta("foto", lambda: _dev_converter_foto(loja, m["arquivo"], dados_f, sn)))
     passos.append(f"{len(urls)} foto(s) enviada(s)")
-    vids = []
-    for m in videos[:1]:
-        try:
-            with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
-                dados_v = f.read()
-            vids.append(_tenta("vídeo", lambda: _shopee_video(loja, dados_v), vezes=2))
-            passos.append("vídeo enviado")
-        except Exception as e:
-            avisos.append(f"o vídeo não subiu pela API ({str(e)[:80]}): anexe o vídeo pelo Seller Center")
-    motivos = (_tenta("motivos da contestação", lambda: _shopee_http("GET", "/api/v2/returns/get_return_dispute_reason", loja=loja,
-                                                                      params={"return_sn": sn})).get("response") or {})
-    lista = motivos.get("dispute_reason_list") or motivos.get("reason_list") or motivos.get("dispute_reason") or []
-    rid, rtxt = _motivo_disputa(lista, o["categoria"])
-    corpo = {"return_sn": sn, "dispute_text_reason": texto[:1000], "images": urls}
-    if rid is not None:
-        corpo["dispute_reason"] = rid
-    if email:
-        corpo["email"] = email
-    bruto = {"motivos_oferecidos": lista[:20], "motivo_escolhido": rid}
+    if videos:
+        avisos.append("a Shopee não aceita vídeo pela API: anexe o vídeo pelo Seller Center (na contestação já aberta)")
+    # 3) as fotos vao em cada bloco de prova que a Shopee pede (obrigatorios; se nenhum for, no primeiro)
+    mods = [x for x in motivo["modulos"] if x["is_required"]] or motivo["modulos"][:1]
+    image_list = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:9]} for x in mods]
+    corpo = {"return_sn": sn, "email": email, "dispute_reason_id": motivo["id"], "dispute_text_reason": texto[:1000]}
+    if image_list:
+        corpo["image_list"] = image_list
+    rid, rtxt, vids = motivo["id"], "", []
+    bruto = {"motivos_oferecidos": lista[:20], "motivo_escolhido": rid,
+             "blocos_de_prova": [x["requirement"][:80] for x in mods]}
     def _ja_contestou():
         try:
             return _dev_contestou(_shopee_http("GET", "/api/v2/returns/get_return_detail", loja=loja,
@@ -1578,9 +1602,7 @@ def dev_enviar_shopee(dev_id, texto, email=""):
     bruto["resposta_disputa"] = {k: v for k, v in res_d.items() if k != "request_id"}
     if vids or urls:
         try:
-            prova = {"return_sn": sn, "photo": [{"url": u} for u in urls], "description": texto[:500]}
-            if vids:
-                prova["video"] = [{"video_upload_id": v} for v in vids]
+            prova = {"return_sn": sn, "photo": [{"url": u, "thumbnail": u} for u in urls], "description": texto[:500]}
             _shopee_http("POST", "/api/v2/returns/upload_proof", loja=loja, corpo=prova)
             passos.append("provas anexadas")
         except Exception as e:
@@ -1935,7 +1957,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True, "email": em})
             if p == "/api/devolucoes/enviar":
                 try:
-                    return self._envia(200, dev_enviar_shopee(d.get("id") or 0, d.get("texto") or "", str(d.get("email") or "").strip()))
+                    return self._envia(200, dev_enviar_shopee(d.get("id") or 0, d.get("texto") or "", str(d.get("email") or "").strip(),
+                                                                    d.get("motivo_id")))
                 except Exception as e:
                     return self._envia(200, {"ok": False, "erro": "A Shopee recusou: " + str(e)[:200]})
             if p == "/api/devolucoes/shopee":
