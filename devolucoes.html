@@ -197,13 +197,16 @@ async function arquivoEscolhido(ev){const f=ev.target.files[0];if(!f||!TIRAR)ret
 $("arqFoto").onchange=arquivoEscolhido;$("arqVideo").onchange=arquivoEscolhido;
 async function apagar(a){const r=await post("/api/devolucoes/apagar-midia",{id:OQ.id,arquivo:a});if(r.ok){OQ.midias=r.midias;desenharOq()}}
 async function enviar(){const t=$("oqTxt").value,em=$("oqMail").value.trim();
+  if(!/@/.test(em)){alert("Preencha o e-mail da loja (a Shopee exige).");$("oqMail").focus();return}
   if(/\[.*\]/.test(t))return alert("Ajuste o que está entre [colchetes] no texto antes de enviar.");
   const nf=OQ.midias.filter(m=>m.tipo=="foto").length,nv=OQ.midias.filter(m=>m.tipo=="video").length;
   if(!confirm(`Enviar a contestação do pedido ${OQ.pedido} para a Shopee?\n\n${nf} foto(s) + ${nv} vídeo + o texto.\n\nSó envie se tudo for verdade.`))return;
   if(em)await post("/api/devolucoes/email",{email:em});
   $("msg").textContent="Enviando para a Shopee... (pode levar 1 minuto)";
   const r=await post("/api/devolucoes/enviar",{id:OQ.id,texto:t,email:em});
-  $("msg").textContent=r.ok?"✅ Enviado para a Shopee":"❌ "+r.erro;if(r.ok)oque(OQ.id);else alert(r.erro)}
+  $("msg").textContent=r.ok?"✅ Enviado e conferido na Shopee":"❌ "+r.erro;
+  if(r.ok)oque(OQ.id);else{alert(r.erro);if(r.bruto){const d=document.createElement("details");d.open=true;
+    d.innerHTML=`<summary><b>Detalhes técnicos (mande print ao Lucas)</b></summary><pre style="white-space:pre-wrap;font-size:12px">${esc(JSON.stringify(r.bruto,null,1))}</pre>`;$("oq").appendChild(d)}}}
 // ---- leitura pela camera do celular
 let CAM=null,ZX=null;
 async function abrirCamera(){const box=$("camBox");box.style.display="flex";$("camMsg").textContent="Aponte para o código de barras da etiqueta";

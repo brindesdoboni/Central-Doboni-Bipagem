@@ -1275,7 +1275,9 @@ def _motivo_disputa(lista, cat):
 
 
 def dev_enviar_shopee(dev_id, texto, email=""):
-    """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar)."""
+    """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar).
+    So diz 'enviado' depois de conferir na propria Shopee que a contestacao entrou."""
+    import time
     o = dev_orientacao(dev_id)
     if not o.get("ok"):
         return o
@@ -1295,6 +1297,8 @@ def dev_enviar_shopee(dev_id, texto, email=""):
             email = r[0] if r else ""
     if d["enviado_em"]:
         return {"ok": False, "erro": f"Ja foi enviada em {d['enviado_em'][:16].replace('T', ' ')}."}
+    if not email or "@" not in email:
+        return {"ok": False, "erro": "Preencha o e-mail da loja (a Shopee exige para a contestação)."}
     midias = json.loads(d["midias"] or "[]")
     fotos = [m for m in midias if m["tipo"] == "foto"]
     videos = [m for m in midias if m["tipo"] == "video"]
@@ -1326,8 +1330,9 @@ def dev_enviar_shopee(dev_id, texto, email=""):
         corpo["dispute_reason"] = rid
     if email:
         corpo["email"] = email
-    _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
-    passos.append("contestação aberta" + (f" (motivo: {rtxt})" if rtxt else ""))
+    bruto = {"motivos_oferecidos": lista[:20], "motivo_escolhido": rid}
+    res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
+    bruto["resposta_disputa"] = {k: v for k, v in res_d.items() if k != "request_id"}
     if vids or urls:
         try:
             prova = {"return_sn": sn, "photo": [{"url": u} for u in urls], "description": texto[:500]}
@@ -1337,7 +1342,29 @@ def dev_enviar_shopee(dev_id, texto, email=""):
             passos.append("provas anexadas")
         except Exception as e:
             avisos.append(f"provas extras não anexadas ({str(e)[:80]})")
-    resp = {"passos": passos, "avisos": avisos, "em": agora()}
+    # confere na propria Shopee se a contestacao entrou (nunca dizer "enviado" sem ver la)
+    det, st = {}, ""
+    for _ in range(4):
+        time.sleep(2)
+        try:
+            det = _shopee_http("GET", "/api/v2/returns/get_return_detail", loja=loja, params={"return_sn": sn}).get("response") or {}
+        except Exception as e:
+            bruto["erro_conferencia"] = str(e)[:200]
+            continue
+        st = det.get("status") or ""
+        if _dev_contestou(det):
+            break
+    bruto["status_depois"] = st
+    bruto["seller_proof"] = det.get("seller_proof")
+    if not _dev_contestou(det):
+        with _lock, conn() as c:
+            c.execute("UPDATE devolucoes SET envio_resp=? WHERE id=?",
+                      (json.dumps({"passos": passos, "avisos": avisos, "bruto": bruto, "em": agora(), "falhou": True}, ensure_ascii=False, default=str), int(dev_id)))
+        return {"ok": False, "bruto": bruto,
+                "erro": f"A Shopee respondeu, mas a contestação NÃO apareceu na devolução (situação: {st or '?'}). "
+                        "Conteste agora pelo Seller Center (botão Copiar texto) para não perder o prazo, e mande um print desta mensagem ao Lucas."}
+    passos.append("contestação aberta e conferida na Shopee" + (f" (motivo: {rtxt})" if rtxt else ""))
+    resp = {"passos": passos, "avisos": avisos, "em": agora(), "bruto": bruto}
     with _lock, conn() as c:
         if email:
             c.execute("INSERT OR REPLACE INTO meta VALUES('dev_email', ?)", (email[:120],))
