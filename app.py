@@ -1181,7 +1181,7 @@ def shopee_devolucoes_sincronizar(dias=15):
                                          itens=excluded.itens, atualizado=excluded.atualizado""",
                                       (sn, l["shop_id"], loja.get("nome") or l["nome"], norm(x.get("order_sn")),
                                        x.get("status") or "", x.get("reason") or "", (x.get("text_reason") or "")[:300],
-                                       int(x.get("due_date") or 0), norm(x.get("tracking_number") or ""),
+                                       int(x.get("return_seller_due_date") or x.get("due_date") or 0), norm(x.get("tracking_number") or ""),
                                        float(x.get("refund_amount") or 0), json.dumps(itens, ensure_ascii=False),
                                        int(x.get("create_time") or 0), int(x.get("update_time") or 0)))
                             if not ant or not ant[1] or int(ant[0] or 0) != int(x.get("update_time") or 0):
@@ -1384,15 +1384,14 @@ def dev_orientacao(dev_id):
             porque += f" {e['perdeu_sem_prova']} das perdidas foram SEM prova enviada: mande sempre o vídeo e as fotos."
     else:
         rec, porque = "CONTESTAR COM VÍDEO", "Ainda há pouco histórico nesse motivo: a chance sobe muito com o vídeo sem corte e as fotos abaixo."
-    prazo = ""
+    prazo, prazo_vencido = "", False
     if sr and sr.get("prazo"):
         import time as _t
         prazo = datetime.fromtimestamp(sr["prazo"], BR).strftime("%d/%m %H:%M")
-        if sr["prazo"] < _t.time():   # data da API ja passou: nao e o prazo de contestar (veja no Seller Center)
-            prazo = "veja no Seller Center (a data da API, " + prazo + ", já passou)"
+        prazo_vencido = sr["prazo"] < _t.time()
     with conn() as c2:
         em = c2.execute("SELECT valor FROM meta WHERE chave='dev_email'").fetchone()
-    return {"ok": True, "midias": json.loads(d["midias"] or "[]"), "enviado_em": d["enviado_em"] or "",
+    return {"ok": True, "prazo_vencido": prazo_vencido, "midias": json.loads(d["midias"] or "[]"), "enviado_em": d["enviado_em"] or "",
             "envio": json.loads(d["envio_resp"] or "{}"), "email": em[0] if em else "",
             "id": d["id"], "pedido": campos["pedido"], "loja": d["loja"] or (sr or {}).get("loja") or "",
             "categoria": cat, "motivo": DEV_CAT_PT[cat], "motivo_comprador": (sr or {}).get("texto") or "",
@@ -1702,8 +1701,16 @@ def _dev_enviar_core(dev_id, texto, email, motivo_id, diag):
     diag["motivos_resposta"] = json.dumps(res_m.get("response") or res_m, default=str, ensure_ascii=False)[:4000]
     lista = _motivos_shopee(res_m)
     if not lista:
-        return {"ok": False, "erro": "A Shopee não ofereceu nenhum motivo de contestação para esta devolução pelo sistema "
-                                     "(nesta fase talvez só pelo Seller Center). Conteste pelo Seller Center, botão Disputar."}
+        import time as _t
+        sit = diag.get("situacao_antes") if isinstance(diag.get("situacao_antes"), dict) else {}
+        lim = int(sit.get("return_seller_due_date") or 0) or int(sit.get("due_date") or 0)
+        st_pt = SHOPEE_DEV_PT.get(sit.get("status") or "", sit.get("status") or "?")
+        if lim and lim < _t.time():
+            return {"ok": False, "erro": f"⛔ O PRAZO para contestar acabou em {datetime.fromtimestamp(lim, BR).strftime('%d/%m às %H:%M')} "
+                                         f"(situação na Shopee: {st_pt}). A Shopee não aceita mais contestação desta devolução pelo sistema. "
+                                         "Confira no Seller Center se ainda aparece alguma opção (ex.: pedir compensação)."}
+        return {"ok": False, "erro": f"A Shopee não ofereceu nenhum motivo de contestação para esta devolução agora (situação: {st_pt}). "
+                                     "Conteste pelo Seller Center, botão Disputar."}
     if motivo_id in (None, ""):
         if len(lista) > 1:   # a pessoa escolhe o motivo pelo texto da propria Shopee
             return {"ok": False, "escolher": lista, "erro": "Escolha o motivo da contestação"}

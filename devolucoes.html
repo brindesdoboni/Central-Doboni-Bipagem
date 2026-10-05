@@ -159,7 +159,7 @@ function desenharOq(){const o=OQ,el=$("oq");
   el.innerHTML=`<button class="fechar" onclick="$('oq').style.display='none'">✕ fechar</button>
    <h3>Pedido ${esc(o.pedido)} ${o.loja?"· "+esc(o.loja):""}</h3>
    <span class="rec ${cls}">${esc(o.recomendacao)}</span>
-   <p><b>Motivo:</b> ${esc(o.motivo)}${o.motivo_comprador?` — “${esc(o.motivo_comprador)}”`:""}${o.prazo?`<br><b>⏰ Responder na Shopee até: ${esc(o.prazo)}</b>`:""}
+   <p><b>Motivo:</b> ${esc(o.motivo)}${o.motivo_comprador?` — “${esc(o.motivo_comprador)}”`:""}${o.prazo?(o.prazo_vencido?`<br><b style="color:#dc2626">⛔ Prazo da Shopee para responder: ${esc(o.prazo)} — JÁ PASSOU</b>`:`<br><b>⏰ Responder na Shopee até: ${esc(o.prazo)}</b>`):""}
    ${o.shopee?`<br>Shopee: ${esc(o.shopee.situacao)}`:"<br><span class='mini'>Ainda não achei essa devolução na Shopee (ela aparece quando o comprador abre o pedido de devolução).</span>"}</p>
    <p>${esc(o.porque)}</p>
    <div class="bloco"><b>🎥 1. Grave o vídeo ANTES de abrir</b>${esc(o.video)}
