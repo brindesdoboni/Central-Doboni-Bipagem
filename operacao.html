@@ -40,7 +40,8 @@ const COR={AGUARDANDO:"#71717a",SEPARADO:"#0891b2",EM_GRAVACAO:"#d97706",EXPEDID
 const NOM={AGUARDANDO:"Aguardando",SEPARADO:"Separados",EM_GRAVACAO:"Em gravação",EXPEDIDO:"Expedidos"};
 async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-Chave":chave}});
  if(r.status===403){S("chave","");return location.reload()}const d=await r.json(),c=d.contagem,t=d.total||1;
- $("kpis").innerHTML=`<div class="k"><b>${d.total}</b><span>Pedidos do dia</span></div>`+Object.keys(NOM).map(k=>`<div class="k" style="border-left:8px solid ${COR[k]}"><b>${c[k]}</b><span>${NOM[k]}</span></div>`).join("");
+ $("kpis").innerHTML=`<div class="k"><b>${d.total}</b><span>Pedidos do dia</span></div>`+Object.keys(NOM).map(k=>`<div class="k" style="border-left:8px solid ${COR[k]}"><b>${c[k]}</b><span>${NOM[k]}</span></div>`).join("")
+  +(d.dia?`<div class="k" style="border-left:8px solid #f59e0b"><b>${d.dia.na_retirada}</b><span>📦 Na retirada (Shopee)</span></div><div class="k" style="border-left:8px solid #22c55e;background:#12251a"><b>${d.dia.despachados}</b><span>🚚 Despachados hoje (Shopee)</span></div><div class="k" style="border-left:8px solid #7c3aed"><b>${d.dia.devolucoes}</b><span>↩ Devoluções hoje</span></div>`:"");
  $("barra").innerHTML=Object.keys(NOM).map(k=>`<div style="width:${100*c[k]/t}%;background:${COR[k]}"></div>`).join("");
  const R=d.ritmo,rit=["SEPARACAO","GRAVACAO","EXPEDICAO"].map(p=>R[p].por_hora?`${{SEPARACAO:"Separação",GRAVACAO:"Gravação",EXPEDICAO:"Expedição"}[p]}: ${R[p].por_hora}/h`:"").filter(Boolean).join(" · ");
  $("prev").innerHTML=d.previsao==="concluido"?"<b>✅ Tudo expedido!</b>":d.previsao?`Previsão de término: <b>${d.previsao}</b><br><span style="font-size:20px;color:#a1a1aa">${rit}</span>`:"Previsão aparece depois dos primeiros bipes";

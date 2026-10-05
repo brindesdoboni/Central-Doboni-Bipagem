@@ -64,6 +64,10 @@ def iniciar_db():
             c.execute("ALTER TABLE itens ADD COLUMN impresso TEXT DEFAULT ''")
         if "pecas" not in cols_it:
             c.execute("ALTER TABLE itens ADD COLUMN pecas TEXT DEFAULT ''")
+        if "despachado_em" not in cols_it:   # saiu daqui com a transportadora (bipe no DESPACHO ou Shopee "enviado")
+            c.execute("ALTER TABLE itens ADD COLUMN despachado_em TEXT")
+            c.execute("ALTER TABLE itens ADD COLUMN despachado_por TEXT DEFAULT ''")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_itens_desp ON itens(despachado_em)")
         c.execute("DELETE FROM custos WHERE length(COALESCE(atualizado_em,''))=10")  # custos vindos de nota (valor nao real)
         c.execute("""CREATE TABLE IF NOT EXISTS estoque_mov(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             qtd REAL, tipo TEXT, ref TEXT UNIQUE, obs TEXT)""")
@@ -94,6 +98,8 @@ def iniciar_db():
             status TEXT, criado INTEGER, atualizado INTEGER, prazo INTEGER, envio TEXT, msg TEXT, itens TEXT,
             motivo TEXT, visto_em TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_sp_status ON shopee_pedidos(status)")
+        if "despachado" not in [r[1] for r in c.execute("PRAGMA table_info(shopee_pedidos)")]:
+            c.execute("ALTER TABLE shopee_pedidos ADD COLUMN despachado INTEGER")  # quando a transportadora levou
         c.execute("""CREATE TABLE IF NOT EXISTS xbz_alertas(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             tipo TEXT, detalhe TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS xbz(codigo_xbz TEXT PRIMARY KEY, codigo TEXT, composto TEXT, nome TEXT,
@@ -464,6 +470,8 @@ def _bipar(posto, codigo, operador, modo):
             if not ev:
                 return {"tipo": "aviso", "msg": "Nada para desfazer."}
             c.execute("UPDATE eventos SET desfeito=1 WHERE id=?", (ev["id"],))
+            if ev["etapa"] == "DESPACHADO":
+                c.execute("UPDATE itens SET despachado_em=NULL, despachado_por='' WHERE id=?", (ev["item_id"],))
             recalcular(c, ev["item_id"])
             if ev["etapa"] == "DEVOLVIDO":  # desfez a devolucao: some a ficha e o que tinha voltado ao estoque
                 dv = c.execute("SELECT id FROM devolucoes WHERE item_id=?", (ev["item_id"],)).fetchone()
@@ -584,8 +592,41 @@ def _bipar(posto, codigo, operador, modo):
             sem_sku = any(not i["sku"] for i in pend)
             msg = f"DEVOLUÇÃO registrada ({len(pend)} item(ns))  →  " + ("GRAVADO: separe como PERDA" if perda else "confira e guarde na prateleira")
             msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
+            msg += f"  ·  Hoje: {_contar_hoje(c, 'devolucoes')} devolução(ões)"
             return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "evento": "devolucao", "item": r}
         return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição ou Devolução) e bipe de novo."}
+
+
+def _contar_hoje(c, o_que, data=None):
+    """Contadores do dia (horario de Brasilia): 'despachados' (etiquetas que sairam com a transportadora)
+    e 'devolucoes' (pacotes de devolucao bipados/registrados)."""
+    ini, fim = dia_utc(data or datetime.now(BR).strftime("%Y-%m-%d"))
+    if o_que == "despachados":
+        return c.execute("SELECT COUNT(*) FROM itens WHERE despachado_em>=? AND despachado_em<?", (ini, fim)).fetchone()[0]
+    return c.execute("SELECT COUNT(*) FROM devolucoes WHERE em>=? AND em<?", (ini, fim)).fetchone()[0]
+
+
+def contadores_dia(data=None):
+    """Pacotes do dia, igual a aba Retirada do UpSeller:
+    - na_retirada: etiqueta impressa (esta na Central) e a Shopee ainda nao recebeu (pedido 'PROCESSED');
+    - despachados: a transportadora/ponto de coleta recebeu HOJE (Shopee mudou para 'enviado').
+    Assim, de 500 na retirada, quando 200 vao para a coleta: 300 na retirada e 200 despachados.
+    TikTok ainda nao entra (sem a API do TikTok nao da para saber quando foi coletado)."""
+    data = data or datetime.now(BR).strftime("%Y-%m-%d")
+    d0 = datetime.strptime(data, "%Y-%m-%d").replace(tzinfo=BR)
+    t_ini, t_fim = int(d0.timestamp()), int((d0 + timedelta(days=1)).timestamp())
+    ini, fim = dia_utc(data)
+    with conn() as c:
+        impressos = "order_sn IN (SELECT codigo FROM codigos)"
+        ret = c.execute(f"SELECT loja, COUNT(*) n FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP') AND {impressos} GROUP BY loja").fetchall()
+        desp = c.execute(f"""SELECT loja, COUNT(*) n FROM shopee_pedidos WHERE despachado>=? AND despachado<?
+                             AND status NOT IN ('CANCELLED','IN_CANCEL') AND {impressos} GROUP BY loja""", (t_ini, t_fim)).fetchall()
+        dev = c.execute("""SELECT COALESCE(k.nome,'Painel/celular') quem, COUNT(*) n FROM devolucoes d
+                           LEFT JOIN colaboradores k ON k.id=d.colaborador_id WHERE d.em>=? AND d.em<? GROUP BY 1""", (ini, fim)).fetchall()
+    return {"data": data,
+            "despachados": sum(r["n"] for r in desp), "despachados_por_loja": {r["loja"]: r["n"] for r in desp},
+            "na_retirada": sum(r["n"] for r in ret), "na_retirada_por_loja": {r["loja"]: r["n"] for r in ret},
+            "devolucoes": sum(r["n"] for r in dev), "devolucoes_por_pessoa": {r["quem"]: r["n"] for r in dev}}
 
 
 def ultimo_op(c, iid):
@@ -669,8 +710,14 @@ def painel(data):
         for e in evs:
             if e["alerta"] and e["alerta"] != "falta de material":
                 alertas.append({"tipo": e["alerta"].upper(), "item": next((i for i in itens if i["id"] == e["item_id"]), {"pedido": "?"})})
-        return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
-                "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens}
+        for e in evs:
+            if e["colaborador_id"] is not None and e["nome"] in equipe:
+                q = equipe[e["nome"]]
+                q["despachados"] = q.get("despachados", 0) + (e["etapa"] == "DESPACHADO")
+                q["devolucoes"] = q.get("devolucoes", 0) + (e["etapa"] == "DEVOLVIDO")
+    return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
+            "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens,
+            "dia": contadores_dia(data)}
 
 
 def operacao():
@@ -718,7 +765,7 @@ def operacao():
         prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
     return {"contagem": cont, "total": len(itens), "por_canal": por_canal, "ritmo": ritmo,
             "plataformas": d["plataformas"],
-            "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"])}
+            "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"]), "dia": d["dia"]}
 
 
 def _num(v):
@@ -960,6 +1007,7 @@ def devolucoes_tela(de, ate):
     for chave in ("por_motivo", "por_produto", "por_loja"):
         res[chave] = sorted(res[chave].items(), key=lambda x: -x[1])
     return {"pendentes": pend, "historico": hist, "resumo": res, "a_caminho": cam, "motivos": list(DEV_CAT_PT.values()),
+            "hoje": contadores_dia()["devolucoes"],
             "shopee": _shopee_dev_status}
 
 
@@ -1210,7 +1258,10 @@ def dev_orientacao(dev_id):
         rec, porque = "CONTESTAR COM VÍDEO", "Ainda há pouco histórico nesse motivo: a chance sobe muito com o vídeo sem corte e as fotos abaixo."
     prazo = ""
     if sr and sr.get("prazo"):
+        import time as _t
         prazo = datetime.fromtimestamp(sr["prazo"], BR).strftime("%d/%m %H:%M")
+        if sr["prazo"] < _t.time():   # data da API ja passou: nao e o prazo de contestar (veja no Seller Center)
+            prazo = "veja no Seller Center (a data da API, " + prazo + ", já passou)"
     with conn() as c2:
         em = c2.execute("SELECT valor FROM meta WHERE chave='dev_email'").fetchone()
     return {"ok": True, "midias": json.loads(d["midias"] or "[]"), "enviado_em": d["enviado_em"] or "",
@@ -1422,6 +1473,23 @@ def _dev_converter_foto(loja, nome, dados):
     raise RuntimeError(f"foto nao subiu ({ult[:150]})")
 
 
+_RX_TEMPORARIO = re.compile(r"internal_server_error|retry later|try again|timed? ?out|http 5\d\d|temporar|busy|Remote end closed|Connection reset", re.I)
+
+
+def _tenta(etapa, fn, vezes=3):
+    """Chama a Shopee; se der erro temporario dela (internal_server_error...), espera e tenta de novo.
+    O erro final diz em que etapa parou."""
+    import time
+    for n in range(vezes):
+        try:
+            return fn()
+        except Exception as e:
+            if n < vezes - 1 and _RX_TEMPORARIO.search(str(e)):
+                time.sleep(3 * (n + 1))
+                continue
+            raise RuntimeError(f"{etapa}: {e}"[:220])
+
+
 def dev_enviar_shopee(dev_id, texto, email=""):
     """Contesta a devolucao na Shopee com o texto revisado + fotos + video (so quando a pessoa toca em Enviar).
     So diz 'enviado' depois de conferir na propria Shopee que a contestacao entrou."""
@@ -1456,17 +1524,20 @@ def dev_enviar_shopee(dev_id, texto, email=""):
     passos, urls, avisos = [], [], []
     for m in fotos[:9]:
         with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
-            urls.append(_dev_converter_foto(loja, m["arquivo"], f.read()))
+            dados_f = f.read()
+        urls.append(_tenta("foto", lambda: _dev_converter_foto(loja, m["arquivo"], dados_f)))
     passos.append(f"{len(urls)} foto(s) enviada(s)")
     vids = []
     for m in videos[:1]:
         try:
             with open(os.path.join(_dev_pasta(dev_id), m["arquivo"]), "rb") as f:
-                vids.append(_shopee_video(loja, f.read()))
+                dados_v = f.read()
+            vids.append(_tenta("vídeo", lambda: _shopee_video(loja, dados_v), vezes=2))
             passos.append("vídeo enviado")
         except Exception as e:
             avisos.append(f"o vídeo não subiu pela API ({str(e)[:80]}): anexe o vídeo pelo Seller Center")
-    motivos = (_shopee_http("GET", "/api/v2/returns/get_return_dispute_reason", loja=loja, params={"return_sn": sn}).get("response") or {})
+    motivos = (_tenta("motivos da contestação", lambda: _shopee_http("GET", "/api/v2/returns/get_return_dispute_reason", loja=loja,
+                                                                      params={"return_sn": sn})).get("response") or {})
     lista = motivos.get("dispute_reason_list") or motivos.get("reason_list") or motivos.get("dispute_reason") or []
     rid, rtxt = _motivo_disputa(lista, o["categoria"])
     corpo = {"return_sn": sn, "dispute_text_reason": texto[:1000], "images": urls}
@@ -1475,7 +1546,35 @@ def dev_enviar_shopee(dev_id, texto, email=""):
     if email:
         corpo["email"] = email
     bruto = {"motivos_oferecidos": lista[:20], "motivo_escolhido": rid}
-    res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
+    def _ja_contestou():
+        try:
+            return _dev_contestou(_shopee_http("GET", "/api/v2/returns/get_return_detail", loja=loja,
+                                               params={"return_sn": sn}).get("response") or {})
+        except Exception:
+            return False
+    res_d, erro_d = {}, ""
+    for n in range(3):
+        try:
+            res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=corpo)
+            erro_d = ""
+            break
+        except Exception as e:
+            erro_d = str(e)
+            time.sleep(3 * (n + 1))
+            if _ja_contestou():          # deu erro, mas entrou: nao manda de novo
+                erro_d = ""
+                break
+            if not _RX_TEMPORARIO.search(erro_d):
+                break
+    if erro_d:
+        bruto["erro_disputa"] = erro_d[:300]
+        with _lock, conn() as c:
+            c.execute("UPDATE devolucoes SET envio_resp=? WHERE id=?",
+                      (json.dumps({"passos": passos, "avisos": avisos, "bruto": bruto, "em": agora(), "falhou": True},
+                                  ensure_ascii=False, default=str), int(dev_id)))
+        return {"ok": False, "bruto": bruto,
+                "erro": f"Fotos subiram, mas a Shopee recusou ABRIR a contestação ({erro_d[:150]}). "
+                        "Tentei 3 vezes. Conteste agora pelo Seller Center (botão Disputar) usando o texto (Copiar) e as fotos."}
     bruto["resposta_disputa"] = {k: v for k, v in res_d.items() if k != "request_id"}
     if vids or urls:
         try:
@@ -3742,14 +3841,17 @@ def _shopee_salvar_pedidos(shop_id, nome, detalhes):
             itens = [{"sku": (i.get("model_sku") or i.get("item_sku") or "").strip(), "nome": (i.get("item_name") or "")[:80],
                       "var": (i.get("model_name") or "")[:60], "qtd": int(i.get("model_quantity_purchased") or 1)}
                      for i in (o.get("item_list") or [])]
-            c.execute("""INSERT INTO shopee_pedidos(order_sn, shop_id, loja, status, criado, atualizado, prazo, envio, msg, itens, motivo, visto_em)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET status=excluded.status,
+            st = o.get("order_status") or ""
+            desp = int(o.get("pickup_done_time") or 0) or (int(o.get("update_time") or 0) if st in SHOPEE_SAIU else 0) or None
+            c.execute("""INSERT INTO shopee_pedidos(order_sn, shop_id, loja, status, criado, atualizado, prazo, envio, msg, itens, motivo, visto_em, despachado)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET status=excluded.status,
+                         despachado=COALESCE(shopee_pedidos.despachado, excluded.despachado),
                          atualizado=excluded.atualizado, prazo=excluded.prazo, envio=excluded.envio, msg=excluded.msg,
                          itens=excluded.itens, motivo=excluded.motivo, loja=excluded.loja, visto_em=excluded.visto_em""",
                       (sn, int(shop_id), nome, o.get("order_status") or "", int(o.get("create_time") or 0),
                        int(o.get("update_time") or 0), int(o.get("ship_by_date") or 0), o.get("shipping_carrier") or "",
                        (o.get("message_to_seller") or "").strip()[:500], json.dumps(itens, ensure_ascii=False),
-                       (o.get("cancel_reason") or "")[:120], agora()))
+                       (o.get("cancel_reason") or "")[:120], agora(), desp))
 
 
 SHOPEE_SAIU = ("SHIPPED", "TO_CONFIRM_RECEIVE", "COMPLETED")
@@ -3760,6 +3862,7 @@ def _shopee_estoque(detalhes):
     - pedido ENVIADO cuja etiqueta nunca foi bipada: da baixa (o material saiu e ninguem bipou);
     - pedido CANCELADO que ja tinha dado baixa e ainda nao foi gravado nem despachado: o produto volta para a prateleira.
     Gravado (personalizado) nao volta: a peca ja foi gravada. Cada etiqueta so mexe uma vez (ref unica)."""
+    import time
     feitos = {"baixa_enviado": 0, "volta_cancelado": 0}
     with _lock, conn() as c:
         for o in detalhes:
@@ -3772,6 +3875,12 @@ def _shopee_estoque(detalhes):
                 if not it or it["lote"] == "DEVOLUCAO":
                     continue
                 if st in SHOPEE_SAIU:
+                    if not it["despachado_em"] and it["status"] != "DEVOLVIDO":
+                        # a transportadora retirou: conta como DESPACHADO (hora da coleta, se a Shopee informar)
+                        ts = int(o.get("pickup_done_time") or o.get("update_time") or 0) or None
+                        quando = datetime.fromtimestamp(min(ts, time.time()), timezone.utc).isoformat() if ts else agora()
+                        c.execute("UPDATE itens SET despachado_em=?, despachado_por='SHOPEE' WHERE id=?", (quando, iid))
+                        feitos["despachados"] = feitos.get("despachados", 0) + 1
                     if not _ja_baixado(c, iid) and it["status"] != "DEVOLVIDO":
                         baixar_estoque(c, iid)
                         feitos["baixa_enviado"] += _ja_baixado(c, iid)
@@ -3818,7 +3927,7 @@ def shopee_sincronizar(shop_id, dias_iniciais=3):
     for k in range(0, len(sns), 50):
         res = _shopee_http("GET", "/api/v2/order/get_order_detail", loja=loja,
                            params={"order_sn_list": ",".join(sns[k:k + 50]),
-                                   "response_optional_fields": "item_list,shipping_carrier,cancel_reason"})
+                                   "response_optional_fields": "item_list,shipping_carrier,cancel_reason,pickup_done_time"})
         det += (res.get("response") or {}).get("order_list") or []
     _shopee_salvar_pedidos(shop_id, loja.get("nome") or str(shop_id), det)
     try:

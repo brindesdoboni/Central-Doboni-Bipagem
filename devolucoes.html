@@ -64,7 +64,7 @@
 </head>
 <body>
 <header>
-  <h1>↩️ Devoluções <a href="#" onclick="pedirChave();return false">trocar senha</a></h1>
+  <h1>↩️ Devoluções <span id="hoje" style="background:#fff;color:#5b21b6;border-radius:10px;padding:2px 10px;font-size:.8em;white-space:nowrap" title="Pacotes de devolução registrados hoje">hoje: …</span> <a href="#" onclick="pedirChave();return false">trocar senha</a></h1>
   <div class="reg"><input id="cod" placeholder="Bipe ou digite a etiqueta / nº do pedido" autocomplete="off" onkeydown="if(event.key=='Enter')registrar()"><button onclick="registrar()">Registrar</button><button onclick="abrirCamera()" title="Ler com a câmera do celular">📷</button></div>
   <div id="msg"></div>
 </header>
@@ -106,6 +106,7 @@ const hoje=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
 $("de").value=new Date(Date.now()-3*3600e3-29*864e5).toISOString().slice(0,10);$("ate").value=hoje;
 async function carregar(){
   D=await api(`/api/devolucoes/tela?de=${$("de").value}&ate=${$("ate").value}`);const mot=D.motivos;
+  if(D.hoje!=null)$("hoje").textContent=`hoje: ${D.hoje} pacote${D.hoje==1?"":"s"}`;
   $("nPend").textContent=D.pendentes.length?`(${D.pendentes.length})`:"";
   $("pend").innerHTML=D.pendentes.map(p=>`<div class="card ${p.sugestao=="PERDA"?"perda":""}" id="d${p.id}">
     <div class="t">${esc(p.sku||"SKU desconhecido")} ${esc(p.cor||"")}</div>

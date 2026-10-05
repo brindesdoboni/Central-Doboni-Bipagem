@@ -27,7 +27,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <header><h1>Central Boni · Produção</h1>
 <div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/setores" target="_blank">Etiquetas de setor</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="dlgMail.showModal();carregarMail()">E-mail de etiquetas</button><button onclick="abrirEst()"><b>Estoque</b></button><button onclick="abrirMat()"><b>Materiais e compras</b></button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
 <div class="wrap">
-<div class="kpis" id="kpis"></div>
+<div class="kpis" id="kpis"></div><p id="dia" class="mut" style="margin:6px 0"></p>
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
 <div class="box"><h2>Por plataforma (pedidos)</h2><table id="plats"></table></div>
 <div class="box"><h2>Por canal</h2><table id="canais"></table></div>
@@ -123,7 +123,7 @@ $("data").onchange=carregar;
 async function carregar(){const d=$("data").value;$("exp").href=`/exportar.csv?de=${d}&ate=${d}`;
  const r=await fetch("/api/painel?data="+d);if(r.status===401)return location.reload();D=await r.json();render()}
 function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_material).length;
- $("kpis").innerHTML=[["Total",D.total],...Object.keys(NOMES).map(k=>[NOMES[k],c[k]]),["Falta material",falta]]
+ $("kpis").innerHTML=[["Total",D.total],...Object.keys(NOMES).map(k=>[NOMES[k],c[k]]),["Falta material",falta],...(D.dia?[["📦 Na retirada",D.dia.na_retirada],["🚚 Despachados",D.dia.despachados],["↩ Devoluções",D.dia.devolucoes]]:[])]
   .map(([t,v])=>`<div class="k"><b>${v}</b><span>${t}</span></div>`).join("");
  $("alertas").innerHTML=D.alertas.length?D.alertas.map(a=>`<div class="al"><b>${esc(a.tipo)}</b> — pedido ${esc(a.item.pedido)} ${esc(a.item.sku||"")} ${a.item.etiqueta?"(etiqueta "+esc(a.item.etiqueta)+")":""}</div>`).join(""):"Nenhum alerta 👍";
  const PL=D.plataformas||[],sm=k=>PL.reduce((a,p)=>a+p[k],0);
@@ -132,8 +132,10 @@ function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_mater
   `<tr><td><b>TOTAL</b></td><td><b>${sm("total")}</b></td><td><b>${sm("enviados")}</b></td><td><b>${sm("faltam")}</b></td></tr>`;
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOMES).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+
   Object.entries(D.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOMES).map(s=>`<td>${v[s]}</td>`).join("")+`<td><b style="color:${v.FALTA?"#d7263d":"inherit"}">${v.FALTA||0}</b></td></tr>`).join("");
- $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Média por peça</th><th>Expedidos</th><th>Faltas</th><th>1º bipe</th><th>Último</th></tr>"+
-  Object.entries(D.equipe).map(([n,p])=>`<tr><td><b>${esc(n)}</b></td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.media_gravacao_min??"-"}${p.media_gravacao_min!=null?" min":""}</td><td>${p.expedidos}</td><td>${p.faltas}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}</td></tr>`).join("");
+ const pl=o=>Object.keys(o||{}).length?" ("+Object.entries(o).map(([n,q])=>esc(n)+": "+q).join(", ")+")":"";
+ $("dia").innerHTML=D.dia?`Shopee (pacotes impressos): 📦 <b>${D.dia.na_retirada}</b> na retirada${pl(D.dia.na_retirada_por_loja)} · 🚚 <b>${D.dia.despachados}</b> despachados${pl(D.dia.despachados_por_loja)} · TikTok entra quando liberarem a API · ↩ <b>${D.dia.devolucoes}</b> devoluções`+(Object.keys(D.dia.devolucoes_por_pessoa).length?" ("+Object.entries(D.dia.devolucoes_por_pessoa).map(([n,q])=>esc(n)+": "+q).join(", ")+")":""):"";
+ $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Média por peça</th><th>Expedidos</th><th>Devoluções</th><th>Faltas</th><th>1º bipe</th><th>Último</th></tr>"+
+  Object.entries(D.equipe).map(([n,p])=>`<tr><td><b>${esc(n)}</b></td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.media_gravacao_min??"-"}${p.media_gravacao_min!=null?" min":""}</td><td>${p.expedidos}</td><td>${p.devolucoes||0}</td><td>${p.faltas}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}</td></tr>`).join("");
  tabela()}
 function tabela(){if(!D)return;const b=$("busca").value.toLowerCase(),f=$("fst").value;
  const L=D.itens.filter(i=>(!f||(f==="FALTA"?i.falta_material:i.status===f))&&(!b||[i.pedido,i.nomes,i.sku,i.rastreio,i.loja].join(" ").toLowerCase().includes(b)));
