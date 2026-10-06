@@ -91,6 +91,22 @@ def _iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS estoque_mov(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             qtd REAL, tipo TEXT, ref TEXT UNIQUE, obs TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_mov_sku ON estoque_mov(sku, cor)")
+        cols_mov = {r[1] for r in c.execute("PRAGMA table_info(estoque_mov)")}
+        if "xbz_pedido" not in cols_mov:
+            c.execute("ALTER TABLE estoque_mov ADD COLUMN xbz_pedido TEXT")
+        if "importado_em" not in cols_mov:
+            c.execute("ALTER TABLE estoque_mov ADD COLUMN importado_em TEXT")
+        # compras XBZ recebidas (API PedidosListar): 1 linha por CNPJ + pedido + SKU XBZ + codigo composto = nunca entra 2 vezes
+        c.execute("""CREATE TABLE IF NOT EXISTS xbz_pedidos_importados(id INTEGER PRIMARY KEY, cnpj TEXT NOT NULL,
+            pedido_numero TEXT NOT NULL, produto_codigo_xbz TEXT NOT NULL, produto_codigo_composto TEXT NOT NULL DEFAULT '',
+            quantidade INTEGER NOT NULL, status_logistico TEXT, sku TEXT, cor TEXT, resultado TEXT, mov_id INTEGER,
+            importado_em TEXT, UNIQUE(cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS xbz_pendencias(id INTEGER PRIMARY KEY, cnpj TEXT NOT NULL, pedido_numero TEXT NOT NULL,
+            produto_codigo_xbz TEXT NOT NULL, produto_codigo_composto TEXT NOT NULL DEFAULT '', codigo_amigavel TEXT, produto_nome TEXT,
+            quantidade INTEGER, status_logistico TEXT, data_ref TEXT, tipo TEXT, motivo TEXT, dados TEXT, criado_em TEXT,
+            atualizado_em TEXT, resolvido_em TEXT, resolucao TEXT,
+            UNIQUE(cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto))""")
+        c.execute("CREATE TABLE IF NOT EXISTS xbz_mapa(chave TEXT PRIMARY KEY, sku TEXT NOT NULL, cor TEXT, em TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS compra_aprendizado(sku TEXT PRIMARY KEY, fator REAL, pedidos INTEGER,
             atualizado TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS pedidos_xbz(id INTEGER PRIMARY KEY, em TEXT, itens TEXT, total REAL)""")
@@ -2480,6 +2496,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             return self._envia(200, cores_para_conferir())
         if p == "/api/xbz/retiradas":
             return self._envia(200, xbz_retiradas_log())
+        if p == "/api/xbz/compras":
+            return self._envia(200, xbz_compras_painel())
         if p == "/api/etiquetas/ocultas":
             return self._envia(200, etiquetas_ocultas())
         if p == "/api/etiquetas/limpar":
@@ -2708,6 +2726,13 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/estoque/cor":
             return self._envia(200, decidir_cor(d.get("sku"), d.get("cor"), d.get("acao"), d.get("para")))
+        if p == "/api/xbz/compras/sincronizar":
+            try:
+                return self._envia(200, xbz_compras_sincronizar(aplicar=not d.get("simular")))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/xbz/compras/pendencia":
+            return self._envia(200, xbz_resolver_pendencia(d.get("id") or 0, str(d.get("acao") or ""), d.get("sku"), d.get("cor")))
         if p == "/api/xbz/retiradas/ler":
             try:
                 return self._envia(200, xbz_retiradas())
@@ -3307,7 +3332,7 @@ def _excluido(c, sku, cor):
 
 
 # palavras que costumam ser a mesma cor escrita de outro jeito
-_COR_GRUPOS = [{"ROSA", "PINK", "ROSE"}, {"ROXO", "LILAS", "VIOLETA", "LAVANDA"}, {"CINZA", "CHUMBO", "GRAFITE"},
+_COR_GRUPOS = [{"ROSA", "PINK", "ROSE", "SALMAO", "CORAL"}, {"ROXO", "LILAS", "VIOLETA", "LAVANDA"}, {"CINZA", "CHUMBO", "GRAFITE", "FUME", "FUMACA"},
                {"BRANCO", "OFF", "GELO"}, {"PRATA", "INOX", "PRATEADO"}, {"MARROM", "CAFE", "CHOCOLATE"},
                {"BEGE", "CREME", "NUDE", "AREIA"}, {"DOURADO", "OURO"}, {"VERMELHO", "VINHO", "BORDO"},
                {"AZUL", "MARINHO"}, {"VERDE", "MILITAR", "AGUA"}]
@@ -3322,17 +3347,32 @@ def _cores_parecidas(a, b):
     return any(wa[0] in g and wb[0] in g for g in _COR_GRUPOS)
 
 
+def _skus_parecidos(sku):
+    """01622B, 1622B, 01622, 1622: o mesmo produto escrito de jeitos diferentes (catalogo XBZ x etiqueta)."""
+    b = sku_base(sku)
+    v = {sku, b, b.lstrip("0"), "0" + b.lstrip("0"), re.sub(r"[A-Z]+$", "", b), re.sub(r"[A-Z]+$", "", b).lstrip("0")}
+    return {x for x in v if x}
+
+
 def cores_para_conferir():
-    """Cores que eu nao reconheco ou que parecem a mesma (para voce decidir: juntar, manter separadas ou excluir)."""
+    """Cores que eu nao reconheco ou que parecem a mesma (para voce decidir: juntar, manter separadas, arquivar ou excluir).
+    As opcoes de 'e a mesma que' trazem as cores do nosso estoque E as variacoes da XBZ (ex.: SALMAO, FUME)."""
     lim = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
     with conn() as c:
         linhas = c.execute("""SELECT sku, cor, SUM(qtd) saldo, MAX(em) ult, GROUP_CONCAT(DISTINCT tipo) tipos FROM estoque_mov
                               WHERE cor<>'' GROUP BY sku, cor HAVING MAX(em)>=? OR SUM(qtd)<>0""", (lim,)).fetchall()
+        saldo_de = {(r[0], r[1]): r[2] for r in c.execute("SELECT sku, cor, SUM(qtd) FROM estoque_mov WHERE cor<>'' GROUP BY sku, cor")}
         ok = {(r[0], r[1], r[2]) for r in c.execute("SELECT sku, cor, outra FROM cor_ok")}
         cat = {}
         for r in c.execute("SELECT codigo, cor FROM xbz WHERE cor<>''"):
-            cat.setdefault(r[0], set()).add(r[1])
-        exc = {(r[0], r[1]) for r in c.execute("SELECT sku, cor FROM sku_status WHERE status='EXCLUIDO'")}
+            cat.setdefault(r[0], set()).add(cor_norm(r[1]))
+        exc = {(r[0], r[1]) for r in c.execute("SELECT sku, cor FROM sku_status WHERE status IN ('EXCLUIDO','ARQUIVADO')")}
+        juntou = {}
+        for r in c.execute("SELECT sku, de, para FROM cor_alias"):
+            juntou.setdefault((r[0], r[2]), []).append(r[1])
+        fora = [dict(r) for r in c.execute("""SELECT s.sku, s.cor, s.status, s.em, COALESCE((SELECT SUM(qtd) FROM estoque_mov m
+                    WHERE m.sku=s.sku AND m.cor=s.cor), 0) saldo FROM sku_status s WHERE s.status IN ('EXCLUIDO','ARQUIVADO')
+                    ORDER BY s.em DESC LIMIT 300""")]
     por = {}
     for r in linhas:
         if (r["sku"], r["cor"]) in exc or (r["sku"], "") in exc:
@@ -3341,23 +3381,32 @@ def cores_para_conferir():
     out = []
     for sku, L in por.items():
         cores = [x["cor"] for x in L]
-        cat_sku = cat.get(sku_base(sku), set())
+        cat_sku = set()
+        for k in _skus_parecidos(sku):
+            cat_sku |= cat.get(k, set())
         for x in L:
             motivos, parecidas = [], []
             if cat_sku and x["cor"] not in cat_sku and not any(x["cor"].startswith(k) or k.startswith(x["cor"]) for k in cat_sku):
                 motivos.append("a XBZ nao tem essa cor para esse produto")
             if len(x["cor"]) <= 3 or re.search(r"\d|/", x["cor"]):
                 motivos.append("parece codigo, nao nome de cor")
-            for y in cores:
+            for y in sorted(set(cores) | cat_sku):
                 if y != x["cor"] and _cores_parecidas(x["cor"], y) and (sku, x["cor"], y) not in ok and (sku, y, x["cor"]) not in ok:
                     parecidas.append(y)
             if parecidas:
                 motivos.append("parecida com " + ", ".join(parecidas))
             if motivos and (sku, x["cor"], "*") not in ok:
+                # sugestao: a parecida que a XBZ usa (o nome certo e o do fornecedor); senao a parecida do nosso estoque
+                sug = next((p_ for p_ in parecidas if p_ in cat_sku), "")
+                if not sug and parecidas and x["cor"] not in cat_sku:
+                    sug = parecidas[0]
+                opcoes = [{"cor": o, "xbz": o in cat_sku, "nosso": o in cores, "saldo": round(saldo_de.get((sku, o), 0) or 0)}
+                          for o in sorted((set(cores) | cat_sku) - {x["cor"]}, key=lambda o: (o not in cat_sku, o))]
                 out.append({"sku": sku, "cor": x["cor"], "saldo": round(x["saldo"] or 0), "motivos": motivos,
-                            "parecidas": parecidas, "opcoes": sorted((set(cores) | cat_sku) - {x["cor"]})})
+                            "parecidas": parecidas, "sugestao": sug, "opcoes": opcoes, "nome_xbz": x["cor"] in cat_sku,
+                            "cores_xbz": sorted(cat_sku), "ja_juntou": sorted(juntou.get((sku, x["cor"]), []))})
     out.sort(key=lambda d: (d["sku"], d["cor"]))
-    return {"ok": True, "itens": out}
+    return {"ok": True, "itens": out, "fora": fora}
 
 
 def decidir_cor(sku, cor, acao, para=""):
@@ -3369,6 +3418,14 @@ def decidir_cor(sku, cor, acao, para=""):
         return {"ok": False, "erro": "dados invalidos"}
     if acao == "EXCLUIR":
         return marcar_sku(sku, cor, "EXCLUIDO")
+    if acao == "ARQUIVAR":
+        return marcar_sku(sku, cor, "ARQUIVADO")
+    if acao == "INCLUIR":   # volta a valer (estava excluida/arquivada); o saldo que ela tinha continua
+        return marcar_sku(sku, cor, "")
+    para = cor_norm(para)   # "Fumê" = FUME, "salmão" = SALMAO (igual ao resto do estoque)
+    if para:
+        p2 = estoque_chave(sku, para)[1]
+        para = p2 if p2 and p2 != cor else para
     with _lock, conn() as c:
         if acao == "OUTRA":
             outras = [para] if para else ["*"]
@@ -3890,6 +3947,361 @@ def _xbz_retiradas_loop():
         time.sleep(30 * 60)
 
 
+# ------------------------------------------------------------------ compras XBZ recebidas (API oficial PedidosListar)
+# Variables do Railway (so o servidor le; nunca vai para o navegador nem para o log):
+#   XBZ_CNPJ_1 / XBZ_TOKEN_1, XBZ_CNPJ_2 / XBZ_TOKEN_2, ... (todos os CNPJs alimentam o MESMO estoque)
+#   (XBZ_CNPJ / XBZ_TOKEN do catalogo tambem entram, se estiverem la)
+# Regras: so status que comeca com RETIRADO/ENVIADO/FINALIZADO; cada CNPJ+pedido+SKU XBZ+composto entra UMA vez;
+# SKU que nao da para ligar com certeza ao nosso -> pendencia de mapeamento (o estoque NAO muda).
+XBZ_API_BASE = os.environ.get("XBZ_API_BASE", "https://api.minhaxbz.com.br:5001/api/clientes").rstrip("/")
+XBZ_API_DIAS = int(os.environ.get("XBZ_API_DIAS", "10"))
+XBZ_STATUS_OK = "RETIRADO/ENVIADO/FINALIZADO"
+_xbz_api_lock = threading.Lock()
+_xbz_api_status = {"ultima": "", "ok": None, "erro": "", "contas": []}
+
+
+def _xbz_contas():
+    vistas, contas = set(), []
+    geral = os.environ.get("XBZ_TOKEN", "")   # o mesmo token serve para todos os CNPJs ligados a nos
+    pares = [(os.environ.get(f"XBZ_CNPJ_{n}", ""), os.environ.get(f"XBZ_TOKEN_{n}", "") or geral) for n in range(1, 21)]
+    pares += [(x, geral) for x in re.split(r"[,;\s]+", os.environ.get("XBZ_CNPJS", "")) if x.strip()]   # XBZ_CNPJS=cnpj1,cnpj2,...
+    pares.append((os.environ.get("XBZ_CNPJ", ""), geral))
+    for cnpj, tok in pares:
+        cnpj = re.sub(r"\D", "", cnpj or "")
+        if cnpj and tok and cnpj not in vistas:
+            vistas.add(cnpj)
+            contas.append((cnpj, tok.strip()))
+    return contas
+
+
+def xbz_api_configurada():
+    return bool(_xbz_contas())
+
+
+def _cnpj_mascara(cnpj):
+    d = re.sub(r"\D", "", cnpj or "")
+    return f"**.***.***/{d[8:12]}-{d[12:14]}" if len(d) == 14 else "***" + d[-4:]
+
+
+def _xbz_buscar_pedidos(cnpj, token, dias=None):
+    """GET /PedidosListar (so no servidor). CNPJ e token vao no cabecalho, nunca na URL nem no log."""
+    import urllib.request
+    url = (f"{XBZ_API_BASE}/PedidosListar?qtd_dias={int(dias or XBZ_API_DIAS)}"
+           "&exibir_finalizados=true&exibir_cancelados=false")
+    req = urllib.request.Request(url, headers={"cnpj": cnpj, "token": token, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            dados = json.loads(r.read() or b"[]")
+    except urllib.error.HTTPError as e:
+        corpo = ""
+        try:
+            corpo = e.read().decode("utf-8", "replace")[:150]
+        except Exception:
+            pass
+        raise RuntimeError(f"XBZ respondeu {e.code}: {_xbz_sem_segredo(corpo, cnpj, token)}")
+    except Exception as e:
+        raise RuntimeError(_xbz_sem_segredo(str(e), cnpj, token)[:150])
+    if isinstance(dados, dict):   # caso a XBZ embrulhe a lista
+        dados = next((v for v in dados.values() if isinstance(v, list)), None)
+        if dados is None:
+            raise RuntimeError("resposta inesperada da XBZ (sem lista de pedidos)")
+    if not isinstance(dados, list):
+        raise RuntimeError("resposta inesperada da XBZ")
+    return [x for x in dados if isinstance(x, dict)]
+
+
+def _xbz_sem_segredo(t, cnpj, token):
+    t = str(t or "")
+    for seg in (token, cnpj):
+        if seg:
+            t = t.replace(seg, "***")
+    return t
+
+
+def _xbz_chave(cnpj, x):
+    return (cnpj, str(x.get("numero") or "").strip(), str(x.get("produtoCodigoXbz") or "").strip().upper(),
+            str(x.get("produtoCodigoComposto") or "").strip().upper())
+
+
+_RX_DATA = re.compile(r"(\d{4})-(\d{2})-(\d{2})|(\d{2})/(\d{2})/(\d{4}|\d{2})(?!\d)")
+
+
+def _xbz_data_retirada(x):
+    """Data da retirada: a mais recente escrita no status ("RETIRADO/... DATA: 06/10/26 10:00") ou em retiradaDetalhes."""
+    datas = []
+    for m in _RX_DATA.finditer(f"{x.get('statusLogistico') or ''} {x.get('retiradaDetalhes') or ''}"):
+        if m[1]:
+            datas.append(f"{m[1]}-{m[2]}-{m[3]}")
+        else:
+            a = m[6] if len(m[6]) == 4 else "20" + m[6]
+            datas.append(f"{a}-{m[5]}-{m[4]}")
+    return max(datas) if datas else None
+
+
+def _sku_conhecido(c, sku):
+    return bool(c.execute("""SELECT 1 FROM xbz WHERE codigo=? UNION ALL SELECT 1 FROM estoque_mov WHERE sku=?
+                             UNION ALL SELECT 1 FROM itens WHERE sku=? LIMIT 1""", (sku, sku, sku)).fetchone())
+
+
+def _xbz_mapear_seguro(c, x):
+    """(sku, cor, como) do NOSSO estoque, ou (None, None, motivo) quando nao da para ter certeza. Nunca adivinha."""
+    comp = str(x.get("produtoCodigoComposto") or "").strip().upper()
+    cxbz = str(x.get("produtoCodigoXbz") or "").strip().upper()
+    nome = x.get("produtoNome") or ""
+    # 1) ligacao feita a mao no painel
+    for k in ([comp] if comp else []) + (["X:" + cxbz] if cxbz else []):
+        r = c.execute("SELECT sku, cor FROM xbz_mapa WHERE chave=?", (k,)).fetchone()
+        if r:
+            sku, cor = estoque_chave(r["sku"], r["cor"] or "", nome)
+            return sku, cor, "ligacao manual"
+    # 2) catalogo da XBZ: o codigo composto (ou o SKU XBZ) aparece exatamente, com o nosso codigo
+    rows = []
+    if comp:
+        rows = c.execute("SELECT codigo, cor FROM xbz WHERE composto=?", (comp,)).fetchall()
+    if not rows and cxbz:
+        rows = c.execute("SELECT codigo, cor FROM xbz WHERE codigo_xbz=? OR codigo_xbz=?", (cxbz, cxbz.lstrip("X"))).fetchall()
+    alvos = {(r["codigo"], (r["cor"] or "").upper()) for r in rows if r["codigo"]}
+    if len(alvos) == 1:
+        sku, cor = alvos.pop()
+        variantes = c.execute("SELECT COUNT(DISTINCT COALESCE(cor,'')) FROM xbz WHERE codigo=?", (sku,)).fetchone()[0]
+        if cor or variantes <= 1:
+            sku, cor = estoque_chave(sku, cor, nome)
+            return sku, cor, "catalogo XBZ"
+        return None, None, f"catalogo XBZ sem a cor de {comp or cxbz}"
+    if len(alvos) > 1:
+        return None, None, f"{comp or cxbz} aparece em mais de um produto do catalogo"
+    # 3) codigo composto "18949M-ROS": produto que ja conhecemos + codigo de cor conhecido
+    if comp:
+        partes = comp.split("-", 1)
+        base = partes[0]
+        if not _sku_conhecido(c, base):
+            return None, None, f"produto {base} nao existe no nosso estoque/catalogo"
+        if len(partes) == 1:
+            if c.execute("SELECT COUNT(DISTINCT COALESCE(cor,'')) FROM xbz WHERE codigo=?", (base,)).fetchone()[0] > 1:
+                return None, None, f"{base} tem varias cores e o codigo nao diz qual"
+            sku, cor = estoque_chave(base, "", nome)
+            return sku, cor, "codigo composto (produto de uma cor)"
+        cods = partes[1].split("/")
+        desconhecidas = [p_ for p_ in cods if p_ not in XBZ_COR_COD]
+        if desconhecidas:
+            return None, None, "codigo de cor desconhecido: " + ", ".join(desconhecidas)
+        sku, cor = estoque_chave(base, " ".join(XBZ_COR_COD[p_] for p_ in cods), nome)
+        return sku, cor, "codigo composto"
+    return None, None, "sem codigo composto e sem SKU XBZ no catalogo"
+
+
+def _xbz_registrar(c, chave, x, qtd, sku, cor, resultado, mov_id=None):
+    cur = c.execute("""INSERT OR IGNORE INTO xbz_pedidos_importados(cnpj, pedido_numero, produto_codigo_xbz,
+                       produto_codigo_composto, quantidade, status_logistico, sku, cor, resultado, mov_id, importado_em)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (*chave, int(qtd), str(x.get("statusLogistico") or "")[:80], sku, cor, resultado, mov_id, agora()))
+    return cur.rowcount == 1
+
+
+def _xbz_processar(c, chave, x, qtd, confirmar_data=False):
+    """Um item (ja somado). Devolve 'ja', 'entrou', 'antes', 'excluida', 'pendente' ou 'existente'. Tudo dentro da
+    mesma transacao: o controle e o movimento entram juntos (ou nenhum dos dois)."""
+    if c.execute("""SELECT 1 FROM xbz_pedidos_importados WHERE cnpj=? AND pedido_numero=? AND produto_codigo_xbz=?
+                    AND produto_codigo_composto=?""", chave).fetchone():
+        return "ja", None
+    cnpj, numero, cxbz, comp = chave
+    # retirada que ja tinha entrado pela leitura antiga do site (Minha XBZ): so registra, nao soma de novo
+    antigo = c.execute("SELECT id FROM estoque_mov WHERE tipo='ENTRADA_XBZ' AND obs LIKE ? AND ref LIKE 'XBZ|%'",
+                       (f"retirada XBZ {numero} {comp} %",)).fetchone()
+    if antigo:
+        _xbz_registrar(c, chave, x, qtd, None, None, "ja estava no estoque (leitura antiga)", antigo[0])
+        return "existente", None
+    data_ret = _xbz_data_retirada(x)
+    emissao = str(x.get("dataEmissao") or "")[:10]
+    if not confirmar_data:
+        if data_ret and data_ret < ESTOQUE_XBZ_DESDE:
+            _xbz_registrar(c, chave, x, qtd, None, None, f"retirado em {data_ret}: antes da contagem do estoque")
+            return "antes", None
+        if not data_ret and emissao and emissao < ESTOQUE_XBZ_DESDE:
+            return "pendente", ("data", f"pedido de {emissao} sem data de retirada: confirme se chegou depois da contagem")
+    sku, cor, como = _xbz_mapear_seguro(c, x)
+    if not sku:
+        return "pendente", ("mapeamento", como)
+    if _excluido(c, sku, cor):
+        _xbz_registrar(c, chave, x, qtd, sku, cor, "cor/produto excluido: nao entra")
+        return "excluida", None
+    imp = agora()
+    ref = "XBZAPI|" + "|".join(chave)
+    mid = c.execute("""INSERT OR IGNORE INTO estoque_mov(em, sku, cor, qtd, tipo, ref, obs, xbz_pedido, importado_em)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (imp, sku, cor, float(qtd), "ENTRADA_XBZ", ref,
+                     f"compra XBZ {numero} {comp or cxbz} ({como})" + (f" retirado {data_ret}" if data_ret else ""),
+                     numero, imp)).lastrowid
+    if not c.execute("SELECT 1 FROM estoque_mov WHERE ref=?", (ref,)).fetchone():
+        raise RuntimeError("movimento nao gravou")
+    mid = c.execute("SELECT id FROM estoque_mov WHERE ref=?", (ref,)).fetchone()[0]
+    _xbz_registrar(c, chave, x, qtd, sku, cor, "entrou no estoque", mid)
+    c.execute("UPDATE xbz_pendencias SET resolvido_em=?, resolucao=? WHERE cnpj=? AND pedido_numero=? AND produto_codigo_xbz=? "
+              "AND produto_codigo_composto=? AND resolvido_em IS NULL", (imp, f"entrou como {sku} {cor}".strip(), *chave))
+    return "entrou", (sku, cor)
+
+
+def _xbz_pendencia(c, chave, x, qtd, tipo, motivo):
+    agora_ = agora()
+    c.execute("""INSERT INTO xbz_pendencias(cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto, codigo_amigavel,
+                 produto_nome, quantidade, status_logistico, data_ref, tipo, motivo, dados, criado_em, atualizado_em)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto) DO UPDATE SET
+                 quantidade=excluded.quantidade, tipo=excluded.tipo, motivo=excluded.motivo, dados=excluded.dados,
+                 atualizado_em=excluded.atualizado_em WHERE resolvido_em IS NULL""",
+              (*chave, str(x.get("produtoCodigoAmigavel") or ""), str(x.get("produtoNome") or "")[:120], int(qtd),
+               str(x.get("statusLogistico") or "")[:80], _xbz_data_retirada(x) or str(x.get("dataEmissao") or "")[:10],
+               tipo, motivo, json.dumps({k: x.get(k) for k in ("numero", "produtoCodigoXbz", "produtoCodigoComposto",
+                                         "produtoCodigoAmigavel", "produtoNome", "statusLogistico", "dataEmissao",
+                                         "retiradaDetalhes")}, ensure_ascii=False), agora_, agora_))
+
+
+def xbz_compras_sincronizar(aplicar=True):
+    """Le todas as contas e da entrada no estoque. Rodar 1 ou 100 vezes da o MESMO estoque."""
+    contas = _xbz_contas()
+    if not contas:
+        _xbz_api_status.update(ok=False, erro="falta XBZ_CNPJ_1 / XBZ_TOKEN_1 nas Variables do Railway", ultima=agora())
+        return {"ok": False, "erro": _xbz_api_status["erro"]}
+    if not _xbz_api_lock.acquire(blocking=False):
+        return {"ok": False, "erro": "ja esta sincronizando (tente em 1 minuto)"}
+    try:
+        res = {"ok": True, "contas": [], "entrou": 0, "ja": 0, "pendentes": 0, "antes_da_contagem": 0, "excluidas": 0,
+               "ignorados_status": 0, "itens": []}
+        for cnpj, tok in contas:
+            cr = {"cnpj": _cnpj_mascara(cnpj), "ok": True, "lidos": 0}
+            try:
+                dados = _xbz_buscar_pedidos(cnpj, tok)
+            except Exception as e:
+                cr.update(ok=False, erro=str(e)[:200])
+                res["contas"].append(cr)
+                res["ok"] = False
+                continue
+            cr["lidos"] = len(dados)
+            soma = {}
+            for x in dados:
+                if not str(x.get("statusLogistico") or "").strip().upper().startswith(XBZ_STATUS_OK):
+                    res["ignorados_status"] += 1
+                    continue
+                ch = _xbz_chave(cnpj, x)
+                if not ch[1] or not (ch[2] or ch[3]):
+                    continue
+                try:
+                    q = int(round(float(x.get("quantidade") or 0)))
+                except (TypeError, ValueError):
+                    q = 0
+                if q <= 0:
+                    continue
+                if ch in soma:
+                    soma[ch][1] += q   # mesma linha repetida no pedido: soma (continua entrando 1 vez so)
+                else:
+                    soma[ch] = [x, q]
+            with _lock, conn() as c:
+                for ch, (x, q) in soma.items():
+                    if not aplicar:
+                        c.execute("SAVEPOINT sim")
+                    pj = c.execute("""SELECT tipo FROM xbz_pendencias WHERE cnpj=? AND pedido_numero=? AND produto_codigo_xbz=?
+                                      AND produto_codigo_composto=? AND resolvido_em IS NULL""", ch).fetchone()
+                    st, info = _xbz_processar(c, ch, x, q, confirmar_data=bool(pj and pj[0] == "mapeamento"))
+                    if st == "pendente":
+                        if aplicar:
+                            _xbz_pendencia(c, ch, x, q, *info)
+                        res["pendentes"] += 1
+                        res["itens"].append({"pedido": ch[1], "composto": ch[3] or ch[2], "qtd": q, "pendente": info[1]})
+                    elif st == "entrou":
+                        res["entrou"] += 1
+                        res["itens"].append({"pedido": ch[1], "composto": ch[3] or ch[2], "qtd": q, "sku": info[0], "cor": info[1]})
+                    elif st == "antes":
+                        res["antes_da_contagem"] += 1
+                    elif st == "excluida":
+                        res["excluidas"] += 1
+                    else:
+                        res["ja"] += 1
+                    if not aplicar:
+                        c.execute("ROLLBACK TO sim")
+                        c.execute("RELEASE sim")
+            res["contas"].append(cr)
+        if aplicar:
+            _xbz_api_status.update(ok=res["ok"], erro="; ".join(f"{x['cnpj']}: {x['erro']}" for x in res["contas"] if not x["ok"]),
+                                   ultima=agora(), contas=res["contas"],
+                                   resumo={k: res[k] for k in ("entrou", "ja", "pendentes", "antes_da_contagem", "excluidas")})
+            if res["entrou"]:
+                _op_cache["v"] = None
+                print(f"XBZ compras: {res['entrou']} item(ns) entraram no estoque, {res['pendentes']} pendente(s)", flush=True)
+        res["simulacao"] = not aplicar
+        return res
+    finally:
+        _xbz_api_lock.release()
+
+
+def xbz_compras_painel():
+    with conn() as c:
+        pend = [dict(r) for r in c.execute("""SELECT id, cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto,
+                 codigo_amigavel, produto_nome, quantidade, data_ref, tipo, motivo, criado_em FROM xbz_pendencias
+                 WHERE resolvido_em IS NULL ORDER BY id DESC LIMIT 300""")]
+        imp = [dict(r) for r in c.execute("""SELECT cnpj, pedido_numero, produto_codigo_xbz, produto_codigo_composto, quantidade,
+                 sku, cor, resultado, importado_em FROM xbz_pedidos_importados ORDER BY id DESC LIMIT 200""")]
+        mapa = [dict(r) for r in c.execute("SELECT chave, sku, cor, em FROM xbz_mapa ORDER BY em DESC LIMIT 200")]
+    for x in pend + imp:
+        x["cnpj"] = _cnpj_mascara(x["cnpj"])   # nunca manda o CNPJ inteiro para a tela
+    return {"ok": True, "configurado": xbz_api_configurada(), "contas": len(_xbz_contas()), "desde": ESTOQUE_XBZ_DESDE,
+            "status": {k: v for k, v in _xbz_api_status.items()}, "pendencias": pend, "importados": imp, "mapa": mapa}
+
+
+def xbz_resolver_pendencia(pid, acao, sku="", cor=""):
+    """acao: 'mapear' (liga o codigo XBZ ao nosso SKU/cor e da a entrada), 'entrar' (confirma a data e da a entrada),
+    'ignorar' (nunca entra)."""
+    sku = str(sku or "").strip().upper()
+    cor = str(cor or "").strip().upper()
+    with _lock, conn() as c:
+        p = c.execute("SELECT * FROM xbz_pendencias WHERE id=? AND resolvido_em IS NULL", (int(pid),)).fetchone()
+        if not p:
+            return {"ok": False, "erro": "pendencia nao encontrada (ja resolvida?)"}
+        x = json.loads(p["dados"] or "{}")
+        chave = (p["cnpj"], p["pedido_numero"], p["produto_codigo_xbz"], p["produto_codigo_composto"])
+        if acao == "ignorar":
+            _xbz_registrar(c, chave, x, p["quantidade"], None, None, "ignorado no painel")
+            c.execute("UPDATE xbz_pendencias SET resolvido_em=?, resolucao='ignorado' WHERE id=?", (agora(), p["id"]))
+            return {"ok": True, "resultado": "ignorado"}
+        if acao == "mapear":
+            if not sku:
+                return {"ok": False, "erro": "informe o SKU"}
+            k = p["produto_codigo_composto"] or "X:" + p["produto_codigo_xbz"]
+            c.execute("INSERT OR REPLACE INTO xbz_mapa(chave, sku, cor, em) VALUES(?,?,?,?)", (k, sku, cor, agora()))
+        elif acao != "entrar":
+            return {"ok": False, "erro": "acao invalida"}
+        # tenta de novo esta e as outras pendencias do mesmo codigo
+        alvo = [p] + ([r for r in c.execute("""SELECT * FROM xbz_pendencias WHERE resolvido_em IS NULL AND id<>? AND tipo='mapeamento'
+                        AND produto_codigo_composto=? AND produto_codigo_xbz=?""",
+                       (p["id"], p["produto_codigo_composto"], p["produto_codigo_xbz"]))] if acao == "mapear" else [])
+        feitos, falta = 0, ""
+        for r in alvo:
+            xr = json.loads(r["dados"] or "{}")
+            ch = (r["cnpj"], r["pedido_numero"], r["produto_codigo_xbz"], r["produto_codigo_composto"])
+            st, info = _xbz_processar(c, ch, xr, r["quantidade"], confirmar_data=(acao == "entrar" or r["tipo"] != "data"))
+            if st == "pendente":
+                _xbz_pendencia(c, ch, xr, r["quantidade"], *info)
+                falta = info[1]
+            else:
+                c.execute("UPDATE xbz_pendencias SET resolvido_em=?, resolucao=COALESCE(resolucao, ?) WHERE id=? AND resolvido_em IS NULL",
+                          (agora(), st, r["id"]))
+                feitos += st == "entrou"
+    _op_cache["v"] = None
+    return {"ok": not falta, "entraram": feitos, "erro": falta}
+
+
+def _xbz_compras_loop():
+    import time
+    time.sleep(90)
+    while True:
+        try:
+            r = xbz_compras_sincronizar()
+            if not r.get("ok"):
+                print("XBZ compras:", r.get("erro") or _xbz_api_status.get("erro"), flush=True)
+        except Exception as e:
+            print("XBZ compras:", str(e)[:150], flush=True)
+        time.sleep(30 * 60)
+
+
 def xbz_de(c, sku, cor=""):
     """Preco de custo e estoque da XBZ para o produto (e a cor, se achar)."""
     sku = sku_base(sku)
@@ -3899,7 +4311,7 @@ def xbz_de(c, sku, cor=""):
     cn = cor_norm(cor)
     sel = [r for r in rows if cn and (r["cor"] == cn or cn.startswith(r["cor"] + " ") or r["cor"].startswith(cn))] or rows
     precos = [r["preco"] for r in sel if r["preco"]]
-    return {"preco": round(sum(precos) / len(precos), 2) if precos else None, "estoque": sum(r["estoque"] for r in sel),
+    return {"preco": round(sum(precos) / len(precos), 2) if precos else None, "estoque": sum(r["estoque"] or 0 for r in sel),
             "nome": rows[0]["nome"], "cor_xbz": ", ".join(sorted({r["cor"] for r in sel})),
             "reposicao": min((r["reposicao"] for r in sel if r["reposicao"] and not r["reposicao"].startswith("0001")), default="")}
 
@@ -4142,8 +4554,8 @@ ESTOQUE_NF_DESDE = os.environ.get("ESTOQUE_NF_DESDE", "2026-10-06")   # contagem
 def _nf_entra_no_estoque(data_nf):
     """Nota fiscal so entra no estoque se a leitura das retiradas da Minha XBZ (com cor) NAO estiver ligada;
     e so a partir do dia seguinte a contagem."""
-    if xbz_site_configurado():
-        return False   # o estoque entra pelas retiradas da Minha XBZ (com cor); a nota fica so para custo
+    if xbz_site_configurado() or xbz_api_configurada():
+        return False   # o estoque entra pelas retiradas/compras da XBZ (com cor); a nota fica so para custo
     return (data_nf or "9999") >= ESTOQUE_NF_DESDE
 
 
@@ -4635,8 +5047,9 @@ def _shopee_assina(key, *partes):
     return hmac.new(key.encode(), "".join(str(x) for x in partes).encode(), hashlib.sha256).hexdigest()
 
 
-def _shopee_http(metodo, path, params=None, corpo=None, loja=None):
-    """Chamada assinada. Nunca registra URL/assinatura/token em log."""
+def _shopee_http(metodo, path, params=None, corpo=None, loja=None, aceitar_erro=False):
+    """Chamada assinada. Nunca registra URL/assinatura/token em log. aceitar_erro: devolve a resposta mesmo com erro
+    (o update_stock diz o motivo de cada variacao em failure_list)."""
     import urllib.request, urllib.parse, time
     pid, key = _shopee_cred()
     if not pid:
@@ -4662,7 +5075,7 @@ def _shopee_http(metodo, path, params=None, corpo=None, loja=None):
             res = {}
         if not res.get("error"):
             res = {"error": f"http {e.code}", "message": res.get("message", "")}
-    if res.get("error"):
+    if res.get("error") and not aceitar_erro:
         raise RuntimeError(f"{res.get('error')}: {res.get('message', '')}"[:200])
     return res
 
@@ -5054,15 +5467,26 @@ def _kit_mult(*textos):
     for t in textos:
         t = (t or "").upper()
         m = (re.search(r"(?<![0-9])(\d{1,4})\s*X\s*(?=\d)", t) or re.search(r"(\d{2,4})\s*(?:UND|UNID|UNIDS|UNIDADES|UN)\b", t)
-             or re.search(r"\bKIT\s*(?:C/|COM|DE)?\s*(\d{1,4})\b", t))
+             or re.search(r"\bKIT\s*(?:C/|COM|DE)?\s*(\d{1,4})\b", t) or re.search(r"(?<![0-9])(\d)\s*(?:UN|UND)\b", t))
         if m and int(m.group(1)) > 1:
             return int(m.group(1))
     return 1
 
 
-def _sku_do_texto(t):
-    m = re.search(r"(?<![0-9A-Z])(\d{4,6}[A-Z]?)(?![0-9A-Z])", (t or "").upper())
-    return estoque_chave(m.group(1))[0] if m else ""
+def _sku_do_texto(t, conhecidos=None, extra=""):
+    """SKU do anuncio -> SKU do estoque. Usa o texto todo (18949 + '550ml' = 18949M) e, se o estoque conhece
+    o produto com outro numero de zeros (018637 x 18637, 1093 x 01093), usa o do estoque."""
+    T = (t or "").upper()
+    m = re.search(r"(?<![0-9A-Z])(?:\d{1,4}X)?(\d{4,6}[A-Z]?)(?![0-9A-Z])", T)
+    if not m:
+        return ""
+    sku = estoque_chave(m.group(1), "", f"{T} {extra}")[0]
+    if conhecidos is not None and sku not in conhecidos:
+        for v in sorted(_skus_parecidos(sku)):
+            v2 = estoque_chave(v, "", f"{T} {extra}")[0]
+            if v2 in conhecidos:
+                return v2
+    return sku
 
 
 def _base_estoque_anuncios(c):
@@ -5089,6 +5513,8 @@ def _cor_do_modelo(sku, opcoes, cores):
         return ""
     for op in opcoes:
         for parte in re.split(r"[,/|;]| - ", op or ""):
+            parte = re.sub(r"^\s*\d+\s*(?:UN|UND|UNID|UNIDADES|X)\b\.?\s*", "", parte, flags=re.I)
+            parte = re.sub(r"\(?\d+\s*ML\)?", "", parte, flags=re.I)
             for cand in (estoque_chave(sku, parte)[1], cor_norm(parte)):
                 if cand and cand in cs:
                     return cand
@@ -5144,7 +5570,8 @@ def anuncios_estoque(aplicar=False, so_loja=None):
                     modelos.append({"model_id": 0, "sku_txt": it.get("item_sku") or "", "ops": [], "atual": atual, "loc": loc})
                 for m in modelos:
                     rot = f"{nome[:45]} | {' / '.join(m['ops'])}".strip(" |")
-                    sku = _sku_do_texto(m["sku_txt"]) or _sku_do_texto(it.get("item_sku"))
+                    extra = f"{nome} {' '.join(m['ops'])}"
+                    sku = _sku_do_texto(m["sku_txt"], cores, extra) or _sku_do_texto(it.get("item_sku"), cores, extra)
                     if not sku or sku not in cores:
                         L["sem_par"].append({"item_id": iid, "anuncio": rot, "sku": m["sku_txt"], "motivo": "SKU nao reconhecido"})
                         continue
@@ -5175,11 +5602,15 @@ def anuncios_estoque(aplicar=False, so_loja=None):
                                  for x in xs[k:k + 50]]
                         try:
                             res = _shopee_http("POST", "/api/v2/product/update_stock", loja=loja,
-                                               corpo={"item_id": iid, "stock_list": lista})
+                                               corpo={"item_id": iid, "stock_list": lista}, aceitar_erro=True)
                             rr = res.get("response") or {}
                             L["gravados"] += len(rr.get("success_list") or [])
-                            for f in rr.get("failure_list") or []:
-                                L["erros"].append(f"{iid}/{f.get('model_id')}: {f.get('failed_reason', '')}"[:160])
+                            falhas = rr.get("failure_list") or []
+                            nomes = {x["model_id"]: x["anuncio"] for x in xs}
+                            for f in falhas:
+                                L["erros"].append(f"{nomes.get(f.get('model_id'), iid)}: {f.get('failed_reason', '')}"[:200])
+                            if res.get("error") and not falhas:
+                                L["erros"].append(f"{nomes.get(xs[0]['model_id'], iid)}: {res.get('error')} {res.get('message', '')}"[:200])
                         except Exception as e:
                             L["erros"].append(f"{iid}: {e}"[:160])
                         time.sleep(0.2)
@@ -5335,7 +5766,9 @@ if __name__ == "__main__":
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
     threading.Thread(target=_shopee_loop, daemon=True).start()
-    if xbz_site_configurado():
+    if xbz_api_configurada():
+        threading.Thread(target=_xbz_compras_loop, daemon=True).start()   # API oficial (substitui a leitura do site)
+    elif xbz_site_configurado():
         threading.Thread(target=_xbz_retiradas_loop, daemon=True).start()
     threading.Thread(target=_anuncios_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))

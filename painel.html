@@ -180,22 +180,55 @@ const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number
 let MT=null,ES=null;
 function abrirEst(){dlgEst.showModal();carregarEst();contarPrat();carregarRet();carregarCores()}
 async function carregarCores(){try{const r=await (await fetch("/api/estoque/cores")).json(),b=$("esCores");
- if(!r.itens.length){b.style.display="none";return}b.style.display="block";
- b.innerHTML=`<details open><summary><b>🎨 Cores para conferir (${r.itens.length})</b> — cores que não reconheci ou que parecem a mesma. Decida uma vez e eu não pergunto mais.</summary>
+ const fora=r.fora||[];if(!r.itens.length&&!fora.length){b.style.display="none";return}b.style.display="block";
+ const opt=(x,o)=>`<option value="${esc(o.cor)}" ${x.sugestao===o.cor?"selected":""}>${esc(o.cor)}${o.nosso?` (nosso: ${o.saldo})`:""}</option>`;
+ b.innerHTML=(r.itens.length?`<details open><summary><b>🎨 Cores para conferir (${r.itens.length})</b> — juntar soma o saldo das duas (o que contamos + o que veio da XBZ) na cor escolhida. Use o nome da XBZ (vem marcado).</summary>
  <div style="overflow-x:auto"><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Por quê</th><th>É a mesma que…</th><th></th></tr>`+
- r.itens.map((x,i)=>`<tr><td><b>${esc(x.sku)}</b></td><td>${esc(x.cor)}</td><td>${x.saldo}</td><td class="mut">${esc(x.motivos.join(" · "))}</td>
-  <td><select id="cj${i}"><option value="">— escolha —</option>${x.opcoes.map(o=>`<option ${x.parecidas[0]===o?"selected":""}>${esc(o)}</option>`).join("")}</select> <button onclick="decCor(${i},'JUNTAR')">Juntar</button></td>
-  <td style="white-space:nowrap"><button onclick="decCor(${i},'OUTRA')">É outra cor</button> <button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d">Excluir</button></td></tr>`).join("")+`</table></div></details>`;
- window.__CORES=r.itens}catch(e){}}
-async function decCor(i,acao){const x=__CORES[i],para=acao==="JUNTAR"?$("cj"+i).value:(acao==="OUTRA"?"":"");
- if(acao==="JUNTAR"&&!para)return alert("Escolha com qual cor juntar");
- if(acao==="JUNTAR"&&!confirm(`Juntar ${x.sku} ${x.cor} em ${para}? O saldo vai para ${para} e daqui pra frente entra em ${para}.`))return;
- if(acao==="EXCLUIR"&&!confirm(`Excluir ${x.sku} ${x.cor}? Ela não entra mais em nada (retirada, compra, lista).`))return;
+ r.itens.map((x,i)=>{const xb=x.opcoes.filter(o=>o.xbz),ns=x.opcoes.filter(o=>!o.xbz);
+  return `<tr><td><b>${esc(x.sku)}</b></td><td>${esc(x.cor)}${x.nome_xbz?' <span title="nome usado pela XBZ" style="font-size:11px;background:#dbeafe;border-radius:6px;padding:0 4px">XBZ</span>':""}${x.ja_juntou.length?`<br><span class="mut" style="font-size:12px">já juntou aqui: ${esc(x.ja_juntou.join(", "))}</span>`:""}</td><td>${x.saldo}</td>
+  <td class="mut">${esc(x.motivos.join(" · "))}${x.cores_xbz.length?`<br><span style="font-size:12px">XBZ tem: ${esc(x.cores_xbz.join(", "))}</span>`:""}</td>
+  <td style="white-space:nowrap"><select id="cj${i}" onchange="if(this.value==='__outra')digCor(${i})"><option value="">— escolha —</option>`+
+  (xb.length?`<optgroup label="Variações da XBZ">${xb.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
+  (ns.length?`<optgroup label="Só no nosso estoque">${ns.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
+  `<option value="__outra">✏️ Digitar outra cor…</option></select> <button onclick="decCor(${i},'JUNTAR')">Juntar</button></td>
+  <td style="white-space:nowrap"><button onclick="decCor(${i},'OUTRA')">É outra cor</button> <button onclick="decCor(${i},'ARQUIVAR')" title="Some da lista e da compra; dá para incluir de novo">Arquivar</button> <button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d" title="Não trabalha mais; dá para incluir de novo">Excluir</button></td></tr>`}).join("")+`</table></div></details>`:"")+
+ (fora.length?`<details><summary>🗄️ Excluídas / arquivadas (${fora.length}) — se aparecer uma parecida depois, inclua de novo e junte</summary><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Como</th><th>Desde</th><th></th></tr>`+
+  fora.map((f,i)=>`<tr><td><b>${esc(f.sku)}</b></td><td>${esc(f.cor||"(produto inteiro)")}</td><td>${Math.round(f.saldo)}</td><td>${f.status==="EXCLUIDO"?"excluída":"arquivada"}</td><td class="mut">${esc((f.em||"").slice(0,10).split("-").reverse().join("/"))}</td><td><button onclick="inclCor(${i})">Incluir de novo</button></td></tr>`).join("")+`</table></details>`:"");
+ window.__CORES=r.itens;window.__FORA=fora}catch(e){}}
+function digCor(i){const v=(prompt("Nome da cor certa (como está na XBZ):")||"").trim().toUpperCase();const s=$("cj"+i);
+ if(!v){s.value="";return}const o=document.createElement("option");o.value=v;o.textContent=v+" (digitada)";s.insertBefore(o,s.lastChild);s.value=v}
+async function inclCor(i){const f=__FORA[i];if(!confirm(`Incluir de novo ${f.sku} ${f.cor||""}? Ela volta para o estoque, a lista e a compra.`))return;
+ const r=await POST("/api/estoque/cor",{sku:f.sku,cor:f.cor||"PADRAO",acao:"INCLUIR"});if(!r.ok)return alert(r.erro||"erro");carregarCores();carregarEst()}
+async function decCor(i,acao){const x=__CORES[i],para=acao==="JUNTAR"?$("cj"+i).value:"";
+ if(acao==="JUNTAR"){if(!para||para==="__outra")return alert("Escolha (ou digite) a cor certa");const alvo=x.opcoes.find(o=>o.cor===para),sa=alvo?alvo.saldo:0;
+  if(!confirm(`Juntar ${x.sku} ${x.cor} em ${para}?\n\nSaldo: ${x.cor} ${x.saldo} + ${para} ${sa} = ${x.saldo+sa} em ${para}.\nDaqui pra frente tudo que vier como ${x.cor} entra em ${para}.`))return}
+ if(acao==="EXCLUIR"&&!confirm(`Excluir ${x.sku} ${x.cor}? Some do estoque, da lista e da compra, e a XBZ não lança mais nela. Dá para incluir de novo depois.`))return;
+ if(acao==="ARQUIVAR"&&!confirm(`Arquivar ${x.sku} ${x.cor}? Some da lista e da compra. Dá para incluir de novo depois.`))return;
  const r=await POST("/api/estoque/cor",{sku:x.sku,cor:x.cor,acao,para});if(!r.ok)return alert(r.erro||"erro");carregarCores();carregarEst()}
-async function carregarRet(){try{const r=await (await fetch("/api/xbz/retiradas")).json(),s=r.status||{};
+// compras XBZ recebidas (API oficial): o CNPJ e o token ficam so no servidor
+const dm=s=>s?new Date(s).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):"-";
+async function carregarRet(){try{const x=await (await fetch("/api/xbz/compras")).json();if(x.configurado)return mostraCompras(x);}catch(e){}return carregarRetSite()}
+function mostraCompras(x){const s=x.status||{},rs=s.resumo||{};
+ $("esRet").innerHTML=`<b>📥 Compras XBZ recebidas → estoque</b> (${x.contas} CNPJ, só RETIRADO/ENVIADO/FINALIZADO, a partir de ${esc(x.desde.split("-").reverse().join("/"))}) · última leitura: ${s.ultima?dm(s.ultima):"ainda não leu"}`+
+ (s.ok===false?` <b style="color:#d7263d">${esc(s.erro)}</b>`:"")+(s.ultima?` <span class="mut">(${rs.entrou||0} entraram agora)</span>`:"")+
+ ` <button onclick="sincCompras(false)">Sincronizar agora</button> <button onclick="sincCompras(true)" style="background:#6b7280">Simular</button>`+
+ (x.pendencias.length?`<div style="margin-top:8px;background:#fff7ed;border-radius:8px;padding:8px"><b style="color:#b45309">⚠️ ${x.pendencias.length} pendência(s): o estoque NÃO mudou para estas</b><table>`+
+  x.pendencias.map(p=>`<tr><td>${esc(p.pedido_numero)}<br><span class="mut">${esc(p.cnpj)}</span></td><td><b>${esc(p.produto_codigo_composto||p.produto_codigo_xbz)}</b><br><span class="mut">${esc(p.produto_nome)}</span></td><td>${p.quantidade}</td><td>${esc(p.motivo)}</td><td>`+
+  (p.tipo==="data"?`<button onclick="resPend(${p.id},'entrar')">Chegou depois da contagem: entrar</button>`:
+   `<input id="pk${p.id}" placeholder="nosso SKU${p.codigo_amigavel?" (XBZ: "+esc(p.codigo_amigavel)+")":""}" size="14"> <input id="pc${p.id}" placeholder="cor" size="9"> <button onclick="resPend(${p.id},'mapear')">Ligar e entrar</button>`)+
+  ` <button onclick="resPend(${p.id},'ignorar')" style="background:#6b7280">Nunca entrar</button></td></tr>`).join("")+`</table></div>`:"")+
+ (x.importados.length?`<details><summary>${x.importados.length} registro(s) importado(s)</summary><table>${x.importados.slice(0,120).map(i=>`<tr><td>${dm(i.importado_em)}</td><td>${esc(i.pedido_numero)}</td><td>${esc(i.produto_codigo_composto||i.produto_codigo_xbz)}</td><td><b>${esc(i.sku||"")}</b> ${esc(i.cor||"")}</td><td>${i.resultado==="entrou no estoque"?"+"+i.quantidade:""}</td><td class="mut">${esc(i.resultado)}</td></tr>`).join("")}</table></details>`:"")}
+async function sincCompras(sim){$("esRet").insertAdjacentHTML("beforeend"," <i>lendo a XBZ...</i>");const r=await POST("/api/xbz/compras/sincronizar",{simular:sim});
+ const t=`${r.entrou||0} item(ns) ${sim?"entrariam":"entraram"} no estoque · ${r.pendentes||0} pendência(s) · ${r.ja||0} já importado(s) · ${r.antes_da_contagem||0} antes da contagem`;
+ alert((r.ok?"":"Atenção: "+(r.erro||(r.contas||[]).filter(c=>!c.ok).map(c=>c.cnpj+": "+c.erro).join("; "))+"\n")+(sim?"SIMULAÇÃO (nada mudou): ":"")+t);carregarRet();if(!sim)carregarEst()}
+async function resPend(id,acao){const b={id,acao};if(acao==="mapear"){b.sku=$("pk"+id).value.trim();b.cor=$("pc"+id).value.trim();if(!b.sku)return alert("Digite o nosso SKU");
+  if(!confirm(`Ligar este código XBZ a ${b.sku} ${b.cor}? Ele entra no estoque agora e as próximas compras dele entram sozinhas.`))return}
+ if(acao==="ignorar"&&!confirm("Esta compra nunca vai entrar no estoque. Confirmar?"))return;
+ const r=await POST("/api/xbz/compras/pendencia",b);if(!r.ok)alert(r.erro||"erro");carregarRet();carregarEst()}
+async function carregarRetSite(){try{const r=await (await fetch("/api/xbz/retiradas")).json(),s=r.status||{};
  $("esRet").innerHTML=`<b>📥 Retiradas da XBZ → estoque</b> (Minha XBZ, com cor, a partir de ${esc(r.desde.split("-").reverse().join("/"))}) `+
   (r.configurado?`· última leitura: ${s.ultima?hora(s.ultima):"ainda não leu"} ${s.ok===false?`<b style="color:#d7263d">${esc(s.erro)}</b>`:""} <button onclick="lerRet()">Ler agora</button>`:
-   `<b style="color:#d7263d">falta colocar XBZ_SITE_USUARIO e XBZ_SITE_SENHA nas Variables do Railway</b>`)+
+   `<b style="color:#d7263d">falta colocar XBZ_CNPJ_1 e XBZ_TOKEN_1 (um par para cada CNPJ) nas Variables do Railway</b>`)+
   (r.itens.length?`<details><summary>${r.itens.length} entrada(s) recente(s)</summary><table>${r.itens.slice(0,80).map(i=>`<tr><td>${esc(new Date(i.em).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}))}</td><td><b>${esc(i.sku)}</b></td><td>${esc(i.cor)}</td><td>+${i.qtd}</td><td class="mut">${esc(i.obs)}</td></tr>`).join("")}</table></details>`:"")}catch(e){}}
 async function lerRet(){$("esRet").innerHTML+=" <i>lendo...</i>";const r=await POST("/api/xbz/retiradas/ler",{});
  alert(r.ok?`Retiradas lidas: ${r.novos} item(ns) novo(s) entraram no estoque`+(r.laura_ignorados?` (${r.laura_ignorados} ignorados)`:""):"Erro: "+r.erro);carregarRet();carregarEst()}
