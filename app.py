@@ -69,6 +69,11 @@ def iniciar_db():
             c.execute("ALTER TABLE itens ADD COLUMN despachado_em TEXT")
             c.execute("ALTER TABLE itens ADD COLUMN despachado_por TEXT DEFAULT ''")
         c.execute("CREATE INDEX IF NOT EXISTS ix_itens_desp ON itens(despachado_em)")
+        # velocidade do bipe e da TV (sem isso cada consulta varre a tabela de eventos inteira)
+        c.execute("CREATE INDEX IF NOT EXISTS ix_ev_item ON eventos(item_id, etapa)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_ev_etapa_em ON eventos(etapa, em)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_it_status ON itens(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_cod_item ON codigos(item_id)")
         c.execute("DELETE FROM custos WHERE length(COALESCE(atualizado_em,''))=10")  # custos vindos de nota (valor nao real)
         c.execute("""CREATE TABLE IF NOT EXISTS estoque_mov(id INTEGER PRIMARY KEY, em TEXT, sku TEXT, cor TEXT,
             qtd REAL, tipo TEXT, ref TEXT UNIQUE, obs TEXT)""")
@@ -351,8 +356,15 @@ def _corrigir_personalizados(c, ids=None, dias=30):
 
 
 def corrigir_personalizados_todos(dias=30):
+    """Procura SEM travar os bipes (so leitura); trava so por um instante para corrigir as poucas que tiverem prova."""
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    with conn() as c:
+        ids = [it["id"] for it in c.execute("SELECT * FROM itens WHERE personalizado=0 AND COALESCE(criado_em,'')>=?",
+                                             (desde,)).fetchall() if _prova_personalizado(c, it)]
+    if not ids:
+        return []
     with _lock, conn() as c:
-        return _corrigir_personalizados(c, None, dias)
+        return _corrigir_personalizados(c, ids, dias)
 
 
 def personalizados_corrigidos():
@@ -686,7 +698,7 @@ def dia_utc(data):
     return d.astimezone(timezone.utc).isoformat(), (d + timedelta(days=1)).astimezone(timezone.utc).isoformat()
 
 
-def painel(data):
+def painel(data, leve=False):
     ini, fim = dia_utc(data)
     with conn() as c:
         # itens do dia = criados no dia OU com movimento no dia OU ainda nao expedidos
@@ -712,12 +724,12 @@ def painel(data):
             if e["etapa"] == "GRAVACAO_INICIO":
                 p["gravados"] += 1
         tempos = {}
-        for nome, _, m in _gravacoes(c, ini, fim):
+        for nome, _, m in ([] if leve else _gravacoes(c, ini, fim)):
             tempos.setdefault(nome, []).append(m)
         for n, p in equipe.items():
             m = sorted(tempos.get(n, []))
             p["media_gravacao_min"] = round(m[len(m) // 2], 1) if m else None   # mediana: pausa/engano nao puxa o numero
-        for n, q in _parados(c, data, ini, fim).items():
+        for n, q in ({} if leve else _parados(c, data, ini, fim)).items():
             if n in equipe:
                 equipe[n].update(q)
         esp = _espera_expedicao(c, ini, fim)
@@ -740,10 +752,26 @@ def painel(data):
             "dia": contadores_dia(data), "espera_expedicao": espera}
 
 
+_op_cache = {"t": 0, "v": None}
+_op_lock = threading.Lock()
+
+
 def operacao():
+    """TV: varias TVs/abas pedem a cada 2 s; calcula no maximo a cada 3 s e entrega a mesma resposta a todas
+    (assim a TV nunca deixa o bipe lento)."""
+    import time
+    with _op_lock:
+        if _op_cache["v"] is not None and time.time() - _op_cache["t"] < 3:
+            return _op_cache["v"]
+        v = _operacao()
+        _op_cache.update(t=time.time(), v=v)
+        return v
+
+
+def _operacao():
     """Visao geral SEM dados por funcionario (para a TV da operacao)."""
     hoje = datetime.now(BR).strftime("%Y-%m-%d")
-    d = painel(hoje)
+    d = painel(hoje, leve=True)
     itens = [i for i in d["itens"] if i["status"] != "DEVOLVIDO"]
     cont = {e: 0 for e in ETAPAS if e != "DEVOLVIDO"}
     for i in itens:
@@ -947,7 +975,20 @@ def _espera_expedicao(c, ini, fim):
     return out
 
 
+_tempos_cache = {"t": 0, "dias": None, "v": None}
+
+
 def tempos_por_material(c, dias):
+    """Tempo medio de gravacao por material nos ultimos dias (guardado por 10 min: nao muda a cada bipe)."""
+    import time
+    if _tempos_cache["dias"] == dias and time.time() - _tempos_cache["t"] < 600:
+        return _tempos_cache["v"]
+    v = _tempos_por_material(c, dias)
+    _tempos_cache.update(t=time.time(), dias=dias, v=v)
+    return v
+
+
+def _tempos_por_material(c, dias):
     ini = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
     g = _gravacoes(c, ini)
     por = {}
@@ -4178,10 +4219,6 @@ def shopee_sincronizar(shop_id, dias_iniciais=3):
                                    "response_optional_fields": "item_list,shipping_carrier,cancel_reason,pickup_done_time"})
         det += (res.get("response") or {}).get("order_list") or []
     _shopee_salvar_pedidos(shop_id, loja.get("nome") or str(shop_id), det)
-    try:
-        corrigir_personalizados_todos()
-    except Exception as e:
-        print("corrigir personalizados:", e, flush=True)
     est = _shopee_estoque(det)
     with _lock, conn() as c:
         c.execute("INSERT INTO meta(chave, valor) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
@@ -4200,6 +4237,10 @@ def shopee_sincronizar_todas():
         except Exception as e:
             _shopee_sync[int(sid)] = {"em": datetime.now(BR).strftime("%d/%m %H:%M"), "pedidos": 0, "erro": str(e)[:200]}
             out.append({"ok": False, "shop_id": sid, "erro": str(e)[:200]})
+    try:
+        corrigir_personalizados_todos()
+    except Exception as e:
+        print("corrigir personalizados:", e, flush=True)
     return out
 
 
