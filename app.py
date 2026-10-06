@@ -2226,6 +2226,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not r["ok"]:
                 return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
             return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/xbz/retiradas":
+            return self._envia(200, xbz_retiradas_log())
         if p == "/api/etiquetas/ocultas":
             return self._envia(200, etiquetas_ocultas())
         if p == "/api/etiquetas/limpar":
@@ -2445,6 +2447,11 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_desfazer())
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/xbz/retiradas/ler":
+            try:
+                return self._envia(200, xbz_retiradas())
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": re.sub(r"(passwd|user)=[^&\s]+", r"\1=***", str(e))[:200]})
         if p == "/api/etiquetas/reabrir":
             return self._envia(200, reabrir_etiqueta(d.get("id") or 0))
         if p == "/api/admin/reiniciar-etapas":
@@ -3403,6 +3410,124 @@ def _xbz_loop():
             xbz_sincronizar()
 
 
+# ---- RETIRADAS na XBZ (Minha XBZ > Pedidos > finalizados): cada item retirado entra no NOSSO estoque, ja com a cor.
+# Login do site nas Variables do Railway: XBZ_SITE_USUARIO e XBZ_SITE_SENHA (so o servidor le; nunca aparece em log).
+XBZ_PEDIDOS_URL = os.environ.get("XBZ_PEDIDOS_URL", "https://api.minhaxbz.com.br:5001/api/ruiz/consultaPedidos")
+ESTOQUE_XBZ_DESDE = os.environ.get("ESTOQUE_XBZ_DESDE", "2026-10-06")   # contagem de 05/10 a tarde ja inclui o de antes
+XBZ_COR_COD = {"PRE": "PRETO", "BCO": "BRANCO", "AZU": "AZUL", "AZC": "AZUL CLARO", "AZE": "AZUL ESCURO", "VM": "VERMELHO",
+               "VD": "VERDE", "VDC": "VERDE CLARO", "VDE": "VERDE ESCURO", "ROS": "ROSA", "RSC": "ROSA CLARO",
+               "RSE": "ROSA ESCURO", "ROX": "ROXO", "LIL": "LILAS", "CIN": "CINZA", "LAR": "LARANJA", "CRE": "CREME",
+               "BEG": "BEGE", "INO": "INOX", "PRA": "PRATA", "DOU": "DOURADO", "MAR": "MARROM", "AMA": "AMARELO",
+               "TUR": "TURQUESA", "VIN": "VINHO", "CHA": "CHAMPAGNE", "MAD": "MADEIRA", "KRA": "KRAFT", "PNK": "PINK"}
+# tudo que for retirado, de todos os CNPJs, entra (pedido de 06/10). Para ignorar algum: XBZ_RETIRADAS_IGNORAR=LAURA
+XBZ_RETIRADAS_IGNORAR = [x.strip().upper() for x in os.environ.get("XBZ_RETIRADAS_IGNORAR", "").split(",") if x.strip()]
+_xbz_ret_status = {"ultima": "", "ok": None, "erro": "", "entraram": 0, "lidos": 0}
+
+
+def xbz_site_configurado():
+    return bool(os.environ.get("XBZ_SITE_USUARIO") and os.environ.get("XBZ_SITE_SENHA"))
+
+
+def _xbz_item_para_estoque(c, x):
+    """Item do pedido da XBZ -> (sku, cor) do nosso estoque. Usa o catalogo da XBZ (codigo composto -> cor)."""
+    comp = str(x.get("produtoCodigoComposto") or "").strip().upper()
+    sis = str(x.get("produtoCodigoSistema") or "").strip().upper()
+    r = c.execute("SELECT codigo, cor FROM xbz WHERE composto=? OR codigo_xbz=? OR codigo_xbz=? LIMIT 1",
+                  (comp, sis, sis.lstrip("X"))).fetchone()
+    if r and r["codigo"]:
+        sku, cor = r["codigo"], r["cor"] or ""
+    else:
+        partes = comp.split("-", 1)
+        sku = partes[0]
+        cor = " ".join(XBZ_COR_COD.get(p_, p_) for p_ in (partes[1].split("/") if len(partes) > 1 else []))
+    return estoque_chave(sku, cor, x.get("produtoNome") or "")
+
+
+def xbz_retiradas(aplicar=True):
+    """Le na Minha XBZ os pedidos RETIRADOS/FINALIZADOS e da entrada no estoque de cada item retirado a partir de
+    ESTOQUE_XBZ_DESDE (uma vez so por item), de TODOS os CNPJs do grupo."""
+    import urllib.request
+    from urllib.parse import urlencode
+    if not xbz_site_configurado():
+        _xbz_ret_status.update(ok=False, erro="falta XBZ_SITE_USUARIO / XBZ_SITE_SENHA no Railway", ultima=agora())
+        return {"ok": False, "erro": _xbz_ret_status["erro"]}
+    q = {"user": os.environ["XBZ_SITE_USUARIO"], "passwd": os.environ["XBZ_SITE_SENHA"], "browserFingerPrint": "xbz",
+         "idPeriodoSelecionado": "0", "idStatusFinanceiroSelecionado": "1", "idStatusLogisticoSelecionado": "1",
+         "idPessoaEmissao": "0", "idTipoListagemSelecionada": "2", "idMostraEntregues": "3", "numeroPedido": ""}
+    try:
+        with urllib.request.urlopen(XBZ_PEDIDOS_URL + "?" + urlencode(q), timeout=90) as r:
+            dados = json.loads(r.read() or b"[]")
+    except Exception as e:
+        msg = re.sub(r"(passwd|user)=[^&\s]+", r"\1=***", str(e))[:200]   # nunca mostra o login
+        _xbz_ret_status.update(ok=False, erro=msg, ultima=agora())
+        return {"ok": False, "erro": msg}
+    if not isinstance(dados, list):
+        _xbz_ret_status.update(ok=False, erro="resposta inesperada da Minha XBZ (login certo?)", ultima=agora())
+        return {"ok": False, "erro": _xbz_ret_status["erro"]}
+    novos, ignorados, lidos = [], 0, 0
+    with conn() as c:
+        for x in dados:
+            st = str(x.get("statusLogistico") or "").upper()
+            if not (x.get("idStatus") == 9 or st.startswith("RETIRADO")):
+                continue
+            quando = str(x.get("statusData") or "")[:19]
+            if quando[:10] < ESTOQUE_XBZ_DESDE:
+                continue
+            lidos += 1
+            obs = f"{x.get('numeroPedidoInternoCliente') or ''} {x.get('razaoSocial') or ''}".upper()
+            if any(i_ and i_ in obs for i_ in XBZ_RETIRADAS_IGNORAR):
+                ignorados += 1
+                continue
+            iid, qtd = x.get("pedidoItemId"), x.get("pedidoItemQuantidade")
+            if not iid or not qtd:
+                continue
+            ref = f"XBZ|{iid}"
+            if c.execute("SELECT 1 FROM estoque_mov WHERE ref=?", (ref,)).fetchone():
+                continue
+            sku, cn = _xbz_item_para_estoque(c, x)
+            try:
+                em = datetime.fromisoformat(quando).replace(tzinfo=BR).astimezone(timezone.utc).isoformat()
+            except Exception:
+                em = agora()
+            novos.append((em, sku, cn, float(qtd), "ENTRADA_XBZ", ref,
+                          f"retirada XBZ {x.get('numero') or ''} {x.get('produtoCodigoComposto') or ''} {(x.get('razaoSocial') or '')[:30]}"))
+    if aplicar and novos:
+        with _lock, conn() as c:
+            for m in novos:
+                c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)", m)
+            r = c.execute("SELECT valor FROM meta WHERE chave='xbz_retiradas_log'").fetchone()
+            log = (json.loads(r[0]) if r and r[0] else [])[-300:] + [
+                {"em": m[0], "sku": m[1], "cor": m[2] or "(cor a definir)", "qtd": m[3], "obs": m[6]} for m in novos]
+            c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('xbz_retiradas_log', ?)", (json.dumps(log, ensure_ascii=False),))
+    _xbz_ret_status.update(ok=True, erro="" if dados else "a Minha XBZ nao devolveu nenhum pedido finalizado no ultimo mes: confira usuario/senha no Railway",
+                           ultima=agora(), lidos=lidos, entraram=len(novos) if aplicar else 0)
+    if novos and aplicar:
+        print(f"XBZ retiradas: {len(novos)} item(ns) entraram no estoque", flush=True)
+    return {"ok": True, "lidos_desde_corte": lidos, "laura_ignorados": ignorados, "novos": len(novos),
+            "itens": [{"sku": m[1], "cor": m[2] or "(cor a definir)", "qtd": m[3], "obs": m[6]} for m in novos]}
+
+
+def xbz_retiradas_log():
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='xbz_retiradas_log'").fetchone()
+    return {"status": _xbz_ret_status, "configurado": xbz_site_configurado(), "desde": ESTOQUE_XBZ_DESDE,
+            "itens": (json.loads(r[0]) if r and r[0] else [])[::-1][:200]}
+
+
+def _xbz_retiradas_loop():
+    """De 30 em 30 minutos (o material retirado entra no estoque no mesmo dia)."""
+    import time
+    time.sleep(60)
+    while True:
+        try:
+            r = xbz_retiradas()
+            if not r.get("ok"):
+                print("XBZ retiradas:", r.get("erro"), flush=True)
+        except Exception as e:
+            print("XBZ retiradas:", str(e)[:150], flush=True)
+        time.sleep(30 * 60)
+
+
 def xbz_de(c, sku, cor=""):
     """Preco de custo e estoque da XBZ para o produto (e a cor, se achar)."""
     sku = sku_base(sku)
@@ -3427,8 +3552,8 @@ def estoque():
                  -SUM(CASE WHEN tipo IN ('ETIQUETA','CANCELADO') AND em>=? THEN qtd ELSE 0 END) s7,
                  -SUM(CASE WHEN tipo IN ('ETIQUETA','CANCELADO') AND em>=? THEN qtd ELSE 0 END) s15,
                  MAX(CASE WHEN tipo='CONTAGEM' THEN em END) contado,
-                 SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF','AJUSTE') THEN 1 ELSE 0 END) conhecido,
-                 SUM(CASE WHEN tipo='ENTRADA_NF' AND em>=? THEN qtd ELSE 0 END) e15
+                 SUM(CASE WHEN tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF','ENTRADA_XBZ','AJUSTE') THEN 1 ELSE 0 END) conhecido,
+                 SUM(CASE WHEN tipo IN ('ENTRADA_NF','ENTRADA_XBZ') AND em>=? THEN qtd ELSE 0 END) e15
                  FROM estoque_mov GROUP BY sku, cor""", (d7, d15, d15)):
             linhas[(r["sku"], r["cor"])] = dict(r)
         pend = {}
@@ -3650,7 +3775,10 @@ ESTOQUE_NF_DESDE = os.environ.get("ESTOQUE_NF_DESDE", "2026-10-06")   # contagem
 
 
 def _nf_entra_no_estoque(data_nf):
-    """So entra no estoque a nota (retirada na XBZ) a partir do dia seguinte a contagem."""
+    """Nota fiscal so entra no estoque se a leitura das retiradas da Minha XBZ (com cor) NAO estiver ligada;
+    e so a partir do dia seguinte a contagem."""
+    if xbz_site_configurado():
+        return False   # o estoque entra pelas retiradas da Minha XBZ (com cor); a nota fica so para custo
     return (data_nf or "9999") >= ESTOQUE_NF_DESDE
 
 
@@ -3694,7 +3822,9 @@ def importar_nfe(xml):
                           (agora(), estoque_chave(codigo_xbz_nf(it["cprod"]))[0], "", it["qtd"], "ENTRADA_NF",
                            f"NF|{n['chave'] or n['nf']}|{it['item']}", f"NF {n['nf']} {n['conta']}"))
     return {"ok": True, "nf": n["nf"], "data": n["data"], "conta": n["conta"], "itens": len(n["itens"]), "novos": novos,
-            "estoque": "entrou no estoque" if _nf_entra_no_estoque(n["data"]) else f"nota antes de {ESTOQUE_NF_DESDE}: so registrada (a contagem ja inclui)",
+            "estoque": "entrou no estoque" if _nf_entra_no_estoque(n["data"]) else
+                       ("so registrada: o estoque entra pelas retiradas da Minha XBZ (com cor)" if xbz_site_configurado()
+                        else f"nota antes de {ESTOQUE_NF_DESDE}: so registrada (a contagem ja inclui)"),
             "total": round(sum(i["total"] for i in n["itens"]), 2)}
 
 
@@ -4840,6 +4970,8 @@ if __name__ == "__main__":
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
     threading.Thread(target=_shopee_loop, daemon=True).start()
+    if xbz_site_configurado():
+        threading.Thread(target=_xbz_retiradas_loop, daemon=True).start()
     threading.Thread(target=_anuncios_loop, daemon=True).start()
     porta = int(os.environ.get("PORT", "8000"))
     print(f"Central Boni rodando na porta {porta} (banco: {DB})", flush=True)
