@@ -76,9 +76,15 @@
   <h2>📦 Chegou: conferir agora <span id="nPend"></span></h2>
   <div id="pend"></div>
 
-  <h2>🚚 Pedidas na Shopee (a caminho) <button onclick="syncShopee()" style="font-size:13px">Atualizar</button></h2>
+  <h2>🎯 Devoluções na Shopee: plano de ação <button onclick="syncShopee()" style="font-size:13px">Atualizar</button></h2>
   <div class="mini" id="shInfo"></div>
   <div id="cam"></div>
+
+  <h2>📋 Relatório do dia <input type="date" id="rlData" onchange="relatorio()" style="font-size:14px"></h2>
+  <div id="rel"></div>
+
+  <h2>📉 Por que estamos perdendo (histórico das lojas)</h2>
+  <div id="diag" class="mini" style="font-size:14px;color:#111"></div>
 
   <h2>🏆 O que funciona na Shopee (histórico das lojas)</h2>
   <div class="tbl"><table id="apr"></table></div>
@@ -105,6 +111,7 @@ async function api(url,body){const h={"X-Chave":chave()};if(body!==undefined)h["
 const hoje=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
 $("de").value=new Date(Date.now()-3*3600e3-29*864e5).toISOString().slice(0,10);$("ate").value=hoje;
 async function carregar(){
+  relatorio();
   D=await api(`/api/devolucoes/tela?de=${$("de").value}&ate=${$("ate").value}`);const mot=D.motivos;
   if(D.hoje!=null)$("hoje").textContent=`hoje: ${D.hoje} pacote${D.hoje==1?"":"s"}`;
   $("nPend").textContent=D.pendentes.length?`(${D.pendentes.length})`:"";
@@ -119,10 +126,31 @@ async function carregar(){
     <div class="bts"><button class="b-est" onclick="decidir(${p.id},'ESTOQUE')">✅ Volta pro estoque</button><button class="b-per" onclick="decidir(${p.id},'PERDA')">🗑️ Perda</button></div></div>`).join("")
     ||'<div class="vazio">Nada para conferir. ✅</div>';
   $("shInfo").textContent=(D.shopee.em?"Última leitura: "+D.shopee.em:"Lê sozinho a cada 10 min.")+(D.shopee.erro?" · ERRO: "+D.shopee.erro:"");
-  $("cam").innerHTML=D.a_caminho.length?`<div class="tbl"><table><tr><th>Prazo</th><th>Pedido</th><th>Loja</th><th>Situação</th><th>Motivo</th><th>Itens</th><th>Chegou?</th></tr>`+
-    D.a_caminho.map(x=>`<tr><td>${esc(x.prazo_txt)}</td><td>${esc(x.order_sn)}</td><td>${esc(x.loja)}</td><td>${esc(x.status_pt)}</td><td>${esc(x.motivo)}${x.texto?`<div class="mini">${esc(x.texto)}</div>`:""}</td>
-    <td>${x.itens.map(i=>esc(i.sku||i.nome)+" ×"+i.qtd).join("<br>")}</td><td>${x.chegou?'<span class="tag t-ESTOQUE">chegou</span>':"—"}</td></tr>`).join("")+"</table></div>"
-    :'<div class="vazio">Nenhuma devolução aberta na Shopee.</div>';
+  const RESP=D.a_caminho.filter(x=>x.responder),OUT=D.a_caminho.filter(x=>!x.responder);
+  const hr=p=>p.horas==null?"quando chegar":p.horas<0?"VENCIDO":p.horas<24?`faltam ${Math.floor(p.horas)} h`:`faltam ${Math.floor(p.horas/24)} d ${Math.floor(p.horas%24)} h`;
+  const corA={CONTESTAR:"#16a34a",ACORDO:"#7c3aed",ACEITAR:"#6b7280",CONFERIR:"#d97706"},corC={"ALTA":"#16a34a","MÉDIA":"#d97706","BAIXA":"#dc2626"};
+  const urg=RESP.filter(x=>x.plano.horas!=null&&x.plano.horas<24).length;
+  $("cam").innerHTML=(RESP.length?`<div style="background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:8px 12px;margin:6px 0"><b>🎯 Plano de ação: ${RESP.length} devoluções</b> · <b style="color:#dc2626">${urg} vencem em menos de 24 h</b> · ${RESP.filter(x=>x.plano.vale==="SIM").length} valem a pena contestar/negociar. Sem resposta no prazo a Shopee aceita sozinha.</div>`+
+    RESP.map((x,i)=>{const p=x.plano;return `<div class="card" style="border-left:6px solid ${corA[p.acao]||"#999"};margin:8px 0;padding:10px 12px">
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><b style="font-size:1.05em;color:${p.horas!=null&&p.horas<24?"#dc2626":"#111"}">⏰ ${esc(x.prazo_txt)} (${hr(p)})</b>
+     <span class="tag" style="background:${corA[p.acao]||"#999"};color:#fff">${esc(p.acao)}</span>
+     <span class="tag" style="background:#f3f4f6;color:${corC[p.chance]}">chance ${esc(p.chance)}</span>
+     <span class="tag" style="background:#f3f4f6">vale a pena: <b>${esc(p.vale)}</b></span>
+     ${x.personalizado?'<span class="tag" style="background:#ede9fe;color:#5b21b6">personalizado</span>':""}${x.sem_nome?'<span class="tag" style="background:#fee2e2;color:#b91c1c">cliente não mandou nome</span>':""}</div>
+    <div style="margin:4px 0">Pedido <b>${esc(x.order_sn)}</b> · ${esc(x.loja)} · ${brl(p.valor)} · <b>${esc(p.motivo)}</b> · ${esc(x.status_pt)}${x.texto?`<div class="mini">Cliente: “${esc(x.texto)}”</div>`:""}
+     <div class="mini">${x.itens.map(i=>esc(i.sku||i.nome)+" ×"+i.qtd).join(" · ")}</div></div>
+    <div style="background:#f9fafb;border-radius:8px;padding:6px 10px;margin:4px 0">💡 ${esc(p.porque)}</div>
+    <details ${i<3?"open":""}><summary><b>Passo a passo, fotos e texto</b></summary>
+     <ol style="margin:6px 0 6px 18px;padding:0">${p.passos.map(s=>`<li>${esc(s)}</li>`).join("")}</ol>
+     <b>📸 Fotos (a Shopee aceita 3: as 3 primeiras são as que mais provam):</b><ol style="margin:4px 0 6px 18px;padding:0">${p.fotos.map(f=>`<li>${esc(f)}</li>`).join("")}</ol>
+     ${p.acao!=="ACEITAR"?`<b>✍️ Texto:</b><textarea id="pt${i}" style="width:100%;min-height:110px;box-sizing:border-box">${esc(p.texto)}</textarea><button class="cp" onclick="copiar('pt${i}')">📋 Copiar texto</button>`:""}
+    </details>
+    <div style="margin-top:6px">${x.tem_registro?`<button style="font-size:13px" onclick="verComprovante('${esc(x.order_sn)}')">🧾 Comprovante</button> `:""}${p.acao==="ACORDO"||p.etapa==="ACORDO"||x.personalizado?`<button style="font-size:13px" onclick="acordo('${esc(x.return_sn)}',${+p.valor||0})">🤝 Acordo</button>`:""}</div></div>`}).join(""):"")+
+    (OUT.length?`<details><summary>Outras ${OUT.length} (aceitas/encerrando, em análise)</summary><div class="tbl"><table><tr><th>Pedido</th><th>Loja</th><th>Situação</th><th>Motivo</th><th>Valor</th><th>Chegou?</th></tr>`+
+    OUT.slice(0,300).map(x=>`<tr><td>${esc(x.order_sn)}</td><td>${esc(x.loja)}</td><td>${esc(x.status_pt)}</td><td>${esc(x.motivo)}</td><td>${brl(x.valor)}</td><td>${x.chegou?'<span class="tag t-ESTOQUE">chegou</span>':"—"}</td></tr>`).join("")+"</table></div></details>":"")+
+    (D.a_caminho.length?"":'<div class="vazio">Nenhuma devolução aberta na Shopee.</div>');
+  const G=D.diagnostico;$("diag").innerHTML=G?`<ul style="margin:4px 0 8px 18px;padding:0">${G.achados.map(a=>`<li style="margin:4px 0">${esc(a)}</li>`).join("")}</ul>
+    <div class="tbl"><table><tr><th>Motivo</th><th>Casos</th><th>Perdidas</th><th>Valor perdido</th><th>Aceitas por prazo vencido</th></tr>${G.por_categoria.map(e=>`<tr><td>${esc(e.categoria)}</td><td>${e.casos}</td><td>${e.perdidas}</td><td>${brl(e.valor)}</td><td><b>${e.por_prazo}</b></td></tr>`).join("")}</table></div>`:"";
   const R=D.resumo;
   $("res").innerHTML=`<div><b>${R.total}</b>devoluções</div><div><b>${R.estoque}</b>voltaram ao estoque</div><div><b>${R.perda}</b>perdas</div><div><b>${brl(R.custo_perda)}</b>custo das perdas</div><div><b>${R.conferir}</b>a conferir</div>`;
   const bx=(t,a)=>`<div class="box"><b>${t}</b>${a.map(([k,v])=>`<div><span>${esc(k)}</span><b>${v}</b></div>`).join("")||'<div class="mini">—</div>'}</div>`;
@@ -168,6 +196,7 @@ function desenharOq(){const o=OQ,el=$("oq");
      ${vids.length?`<button class="tb" style="background:#dc2626" onclick="apagar('${vids[0].arquivo}')">✕</button>`:""}</div>
      <div class="barra" id="barra" style="display:none"><i></i></div></div>
    <div class="bloco"><b>📸 2. Tire estas fotos</b>${o.fotos.map((f,i)=>{const t=daFoto(f);return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}${esc(f)}</span><button class="tb" onclick="tirar('foto',OQ.fotos[${i}])">📸 ${t.length?"Mais uma":"Tirar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`}).join("")}
+     ${o.personalizado||o.categoria=="sem_nome"?(()=>{const t=o.midias.filter(m=>m.tipo=="foto"&&m.rotulo.startsWith("Comprovante de produção"));return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}🧾 Comprovante de produção (a Central monta com os bipes: nome pedido, quem gravou e quando)</span><button class="tb" onclick="comprovante()">${t.length?"Gerar de novo":"🧾 Gerar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`})():""}
      <div class="foto"><span>Outra foto (opcional)</span><button class="tb" onclick="tirar('foto','Outra foto')">📸 Tirar</button><div class="th">${daFoto("Outra foto").map(thumb).join("")}</div></div></div>
    <div class="bloco"><b>✍️ 3. Texto para a Shopee</b><textarea id="oqTxt">${esc(o.texto)}</textarea>
      <button class="cp" onclick="copiar('oqTxt')">📋 Copiar texto</button>
@@ -181,6 +210,28 @@ function desenharOq(){const o=OQ,el=$("oq");
        <div class="mini">${!o.shopee?"O botão libera depois de ligar com o pedido da Shopee.":!nFotos?"Tire as fotos antes de enviar.":"Confira o texto: ele vai exatamente como está acima, com as fotos e o vídeo. Envie SÓ o que é verdade."}</div>
        <details style="margin-top:6px"><summary>Prefere enviar pelo Seller Center?</summary>${o.como_enviar.map((x,i)=>`<div>${i+1}. ${esc(x)}</div>`).join("")}</details>`}</div>`;
 }
+async function comprovante(){$("msg").textContent="Montando o comprovante...";const r=await post("/api/devolucoes/comprovante",{id:OQ.id});
+  if(!r.ok){$("msg").textContent="❌ "+r.erro;return}OQ.midias=r.midias;$("msg").textContent="🧾 Comprovante adicionado às fotos";desenharOq()}
+async function verComprovante(pedido){const r=await fetch("/api/devolucoes/comprovante?pedido="+encodeURIComponent(pedido),{headers:{"X-Chave":chave()}});
+  if(!r.ok){const j=await r.json().catch(()=>({}));return alert(j.erro||"Sem registro de produção deste pedido")}
+  const u=URL.createObjectURL(await r.blob());const w=window.open("","_blank");if(w){w.document.write(`<title>Comprovante ${esc(pedido)}</title><img src="${u}" style="max-width:100%"><p style="font-family:Arial">Segure o dedo na imagem (ou clique com o botão direito) para salvar e anexar na Shopee.</p>`)}else location.href=u}
+async function acordo(sn,valor){$("msg").textContent="Vendo o que a Shopee permite...";const s=await api("/api/devolucoes/solucoes?sn="+encodeURIComponent(sn));
+  if(!s.ok){$("msg").textContent="❌ "+(s.erro||"sem opção de acordo");return}
+  const op=s.solucoes.map((x,i)=>`${i+1}) ${x.nome}${x.max!=null?" — até R$ "+x.max.toFixed(2).replace(".",","):""}`).join("\n");
+  const i=parseInt(prompt(`Acordo com o comprador (devolução ${sn}, pedido R$ ${(valor||0).toFixed(2).replace(".",",")}):\n\n${op}\n\nDigite o número da opção:`,s.solucoes.findIndex(x=>/sem devolver/.test(x.nome))+1||1))-1;
+  const x=s.solucoes[i];if(!x){$("msg").textContent="";return}
+  const sug=((x.max??valor??0)*0.4).toFixed(2).replace(".",",");
+  const v=prompt(`${x.nome}\nQuanto devolver ao comprador? (R$)${x.max!=null?` máximo ${x.max.toFixed(2).replace(".",",")}`:""}\nDica: num personalizado, devolver só uma parte (ex.: 30% a 50%) e o cliente ficar com o produto sai mais barato que perder tudo.`,sug);if(!v)return;
+  if(!confirm(`Enviar para o comprador a proposta: ${x.nome}, R$ ${v}?\nIsso vai para a Shopee agora.`))return;
+  const r=await post("/api/devolucoes/oferecer",{sn,solucao:x.solucao,valor:v});$("msg").textContent=r.ok?"🤝 "+r.msg:"❌ "+r.erro;carregar()}
+async function relatorio(){const dt=$("rlData").value||new Date(Date.now()-3*3600e3).toISOString().slice(0,10);$("rlData").value=dt;
+  const r=await api("/api/devolucoes/relatorio?data="+dt);if(!r.ok){$("rel").textContent="Não consegui ler o relatório";return}const T=r.resumo;
+  const cor={PERDEU:"#dc2626",GANHOU:"#16a34a",ANDAMENTO:"#d97706"},rt={PERDEU:"perdeu",GANHOU:"ganhou",ANDAMENTO:"em análise"};
+  $("rel").innerHTML=`<div class="res"><div><b>${T.total}</b>mudaram no dia</div><div><b style="color:#16a34a">${T.ganhas}</b>ganhas (${brl(T.valor_ganho)})</div><div><b style="color:#dc2626">${T.perdidas}</b>aceitas/perdidas (${brl(T.valor_perdido)})</div><div><b>${T.em_analise}</b>em análise</div>
+   <div><b>${T.contestadas}</b>contestadas</div><div><b>${T.com_foto}</b>com foto</div><div><b>${T.com_video}</b>com vídeo</div><div><b>${T.pela_central}</b>enviadas pela Central</div></div>
+   <div class="mini" style="margin:6px 0">Das perdidas: <b>${T.perdidas_por_prazo}</b> por prazo vencido sem resposta · <b>${T.perdidas_contestadas}</b> contestadas e mesmo assim aceitas · <b>${T.so_reembolso}</b> reembolso sem devolver. Fotos/vídeos: só aparecem as tiradas pela Central (as anexadas direto no Seller Center a Shopee não informa).</div>
+   <div class="tbl"><table><tr><th>Hora</th><th>Pedido</th><th>Loja</th><th>Motivo</th><th>Valor</th><th>Resultado</th><th>Contestou?</th><th>Fotos</th><th>Vídeo</th><th>Por quê</th></tr>${r.itens.map(x=>`<tr><td>${esc(x.hora)}</td><td>${esc(x.pedido)}</td><td>${esc(x.loja)}</td><td>${esc(x.motivo)}${x.cliente?`<div class="mini">“${esc(x.cliente)}”</div>`:""}</td><td>${brl(x.valor)}</td>
+   <td><b style="color:${cor[x.resultado]}">${rt[x.resultado]||x.resultado}</b></td><td>${x.contestou?"sim"+(x.enviado_pela_central?" (Central)":""):"não"}</td><td>${x.fotos||"—"}</td><td>${x.videos||"—"}</td><td class="mini">${esc(x.porque)}</td></tr>`).join("")||'<tr><td colspan="10">Nada mudou nesse dia.</td></tr>'}</table></div>`}
 async function ligar(){const r=await post("/api/devolucoes/ligar",{id:OQ.id,ref:$("oqRef").value});
   $("msg").textContent=r.ok?`✅ Ligada à devolução da Shopee (pedido ${r.pedido})`:"❌ "+r.erro;if(r.ok)oque(OQ.id)}
 function usar(i){$("oqTxt").value=$("oqW"+i).value;$("msg").textContent="Texto trocado — confira antes de enviar"}

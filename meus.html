@@ -20,6 +20,7 @@ button{background:#1d4ed8;color:#fff;font-weight:bold;cursor:pointer}
 </style></head><body>
 <header><b>🔵 Meus bipes</b><span id="quem"></span><button id="troca" style="display:none;background:#374151">Trocar pessoa</button><span id="st"></span></header>
 <div id="ini"><h2>De quem são os bipes desta tela?</h2><p>Aparecem aqui só os bipes da pessoa escolhida, na hora, com o som dela. O computador central continua mostrando todos.</p>
+<div id="ch" style="display:none;margin:10px 0"><p>Digite a <b>chave do posto</b> (a mesma do Bipe Boni) <i>ou</i> entre no painel neste navegador:</p><input id="chv" style="font-size:20px;padding:8px;width:60%"> <button onclick="salvarChave()">OK</button></div>
 <select id="sel"><option value="">carregando…</option></select><button id="ok">Começar</button><p id="err" style="color:#f87171"></p></div>
 <div id="pilha" style="display:none"></div><div id="vazio" style="display:none">Esperando o primeiro bipe…</div>
 <script>
@@ -45,10 +46,11 @@ function som(ev,voz,tipo){const a=audio();if(!a)return;let t=a.currentTime+.02;
   g.gain.setValueAtTime(.0001,t);const vol=ev==="erro"?1:(pv&&o.type==="sawtooth"?.3:.45);g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
  t+=d}}
 const SETOR={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",DEVOLUCAO:"DEVOLUÇÃO"};
-function api(u){return fetch(u,{headers:{"X-Chave":chave||""}}).then(async r=>{if(r.status===403){SV("chave","");chave=null;throw new Error("chave")}return r.json()})}
-async function pessoas(){if(!chave){chave=prompt("Chave do posto (fornecida pelo Lucas):")||"";SV("chave",chave)}
- try{const d=await api("/api/bipes/pessoas");$("sel").innerHTML='<option value="">— escolha o seu nome —</option>'+d.pessoas.map(p=>`<option value="${esc(p.codigo)}">${esc(p.nome)}</option>`).join("");if(meu)$("sel").value=meu}
- catch(e){$("err").textContent=e.message==="chave"?"Chave do posto inválida. Recarregue a página e digite de novo.":"Sem internet. Tentando de novo…";setTimeout(pessoas,3000)}}
+function api(u){return fetch(u,{headers:chave?{"X-Chave":chave}:{}}).then(async r=>{if(r.status===403||r.status===401){throw new Error("chave")}return r.json()})}
+async function pessoas(){$("err").textContent="";
+ try{const d=await api("/api/bipes/pessoas");$("ch").style.display="none";$("sel").innerHTML='<option value="">— escolha o seu nome —</option>'+d.pessoas.map(p=>`<option value="${esc(p.codigo)}">${esc(p.nome)}</option>`).join("");if(meu)$("sel").value=meu}
+ catch(e){if(e.message==="chave"){$("ch").style.display="block";$("sel").innerHTML='<option value="">digite a chave do posto acima</option>'}else{$("err").textContent="Sem internet. Tentando de novo…";setTimeout(pessoas,5000)}}}
+function salvarChave(){chave=$("chv").value.trim();SV("chave",chave);pessoas()}
 function comecar(cod,nome){meu=cod;meuNome=nome;SV("meu_op",cod);SV("meu_nome",nome);desde=null;audio();
  $("ini").style.display="none";$("pilha").style.display="flex";$("vazio").style.display=qtd?"none":"block";$("troca").style.display="";$("quem").textContent="· "+nome;document.title="Bipes de "+nome}
 $("ok").onclick=()=>{const s=$("sel");if(!s.value){$("err").textContent="Escolha o seu nome.";return}comecar(s.value,s.options[s.selectedIndex].text)};
@@ -64,8 +66,8 @@ function mostra(b){qtd++;$("vazio").style.display="none";const it=b.item;
 async function ler(){if(!meu||lendo)return;lendo=true;
  try{const d=await api(`/api/bipes/meus?op=${encodeURIComponent(meu)}${desde==null?"":"&desde="+desde}`);
   if(desde!=null)(d.bipes||[]).forEach(mostra);desde=d.ultimo;$("st").textContent=(!ctx||ctx.state!=="running"?"🔇 clique na tela para ligar o som · ":"")+"ligado · "+new Date().toLocaleTimeString("pt-BR")}
- catch(e){$("st").textContent=e.message==="chave"?"chave do posto inválida (recarregue)":"sem internet…"}finally{lendo=false}}
+ catch(e){$("st").textContent=e.message==="chave"?"⚠️ sem acesso: clique em Trocar pessoa e digite a chave do posto":"sem internet…"}finally{lendo=false}}
 setInterval(ler,1000);
 document.addEventListener("click",audio);document.addEventListener("keydown",audio);
-if(meu&&meuNome&&chave){comecar(meu,meuNome)}else pessoas();
+if(meu&&meuNome){comecar(meu,meuNome)}else pessoas();
 </script></body></html>

@@ -17,7 +17,16 @@ tr.c{cursor:pointer}tr.c:hover{background:#8881}
 input,select,button{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:14px}
 button{cursor:pointer}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 dialog{border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);max-width:640px;width:95vw}
-dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{width:100%;min-height:140px;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font:13px monospace}
+dialog.largo{max-width:1100px}
+dialog.tela{max-width:1600px;width:98vw;max-height:94vh;padding:0 18px 18px;overflow:auto}
+dialog.tela .topo{position:sticky;top:0;left:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--card);padding:12px 0 10px;border-bottom:1px solid var(--bd);margin-bottom:8px;box-shadow:0 6px 8px -8px #0004}
+dialog.tela .lupa{display:flex;align-items:center;gap:6px;flex:1;min-width:220px;border:2px solid #1d4ed8;border-radius:10px;padding:2px 10px;background:var(--card)}
+dialog.tela .lupa input{border:0;outline:0;flex:1;font-size:16px;padding:7px 2px;background:transparent;color:var(--fg)}
+dialog.tela .estab table{width:100%;font-size:13px}
+dialog.tela .estab th{position:sticky;top:var(--topo,64px);z-index:4;background:var(--card);box-shadow:0 1px 0 var(--bd);white-space:nowrap;font-size:12px}
+dialog.tela .estab td,dialog.tela .estab th{padding:5px 6px}
+dialog.tela #esTab{scroll-margin-top:var(--topo,64px)}
+dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-radius:10px;padding:9px 16px;font-weight:bold;cursor:pointer}.dbody{max-height:65vh;overflow:auto}textarea{width:100%;min-height:140px;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font:13px monospace}
 .mut{color:var(--mut);font-size:13px}
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;max-width:min(380px,90vw)}
 .toast{background:var(--card);border:1px solid var(--bd);border-left:5px solid var(--az);border-radius:8px;padding:10px 12px;box-shadow:0 4px 14px #0003;font-size:14px;animation:ent .25s ease}
@@ -63,19 +72,21 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <textarea id="cTxt" placeholder="06016B;12,90&#10;09824;8,50"></textarea><div class="row" style="margin:8px 0"><button onclick="importCus()">Importar lista</button> ou um só: <input id="cSku" placeholder="SKU" size="12"><input id="cVal" placeholder="Custo (ex.: 12,90)" size="10"><button onclick="addCus()">Salvar</button><span id="cMsg" class="mut"></span></div>
 <div class="dbody"><table id="cus"></table></div><p><button onclick="dlgCus.close()">Fechar</button></p></dialog>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
-<dialog id="dlgEst" class="largo"><h2>Estoque</h2>
+<dialog id="dlgEst" class="largo tela"><div class="topo"><h2 style="margin:0">📦 Estoque</h2>
+<span class="lupa">🔍<input id="esBusca" placeholder="Pesquisar SKU, cor ou nome" oninput="renderEst()" onkeydown="if(event.key==='Enter'){topoEst();$('esTab').scrollIntoView({behavior:'smooth',block:'start'})}" type="search"></span>
+<label style="white-space:nowrap"><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só comprar / alerta</label><b id="esTotal"></b>
+<button class="fx" onclick="dlgEst.close()">✕ Fechar</button></div>
 <p class="mut">Entra: notas da XBZ (contas da Beatriz e Lucmarix). Sai: quando a etiqueta é bipada na separação (uma vez só). Etiqueta que chegou e ainda não foi separada fica "reservada". Comprar = <span id="esDias"></span> dias de vendas (média dos últimos 15 dias) menos o que tem.</p>
 <p id="esXbz"></p>
 <div id="esRet" style="background:#eef6ff;border-radius:10px;padding:8px 12px;margin:6px 0"></div>
 <div id="esCores" style="background:#fff7ed;border-radius:10px;padding:8px 12px;margin:6px 0;display:none"></div>
-<div class="row"><input id="esBusca" placeholder="Filtrar SKU, cor ou nome" oninput="renderEst()"><label><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só o que precisa comprar / alerta</label><b id="esTotal" style="margin-left:auto"></b></div>
 <div class="row" style="margin:8px 0"><button onclick="folhaCont(0)"><b>📄 Folha de contagem (PDF)</b></button><button onclick="folhaCont(1)">📄 Contagem às cegas (sem o saldo)</button><button onclick="window.open('/contagem','_blank')"><b>📱 Contar pelo celular</b></button><span class="mut">Por prateleira → SKU → cor, 2 colunas por folha. Usa o filtro acima se preenchido. Na tela que abrir, clique em "Imprimir / Salvar em PDF".</span></div>
 <details style="margin:6px 0"><summary><b>Prateleiras</b> <span id="prQtd" class="mut"></span></summary>
 <p class="mut">Escolha o arquivo <b>prateleiras.csv</b> (colunas SKU e Prateleira) ou cole linhas <b>SKU;PRATELEIRA</b> — ex.: <code>18726I;A3</code>. O que já existe é atualizado.</p>
 <input type="file" id="prArq" accept=".csv,.txt" onchange="lerPrArq()"><textarea id="prTxt" rows="4" style="width:100%" placeholder="SKU;Prateleira&#10;18726I;A3&#10;09824;B1"></textarea>
 <button onclick="salvarPrat()">Salvar prateleiras</button> <span id="prMsg"></span></details>
 <div id="esAlXbz"></div><div id="esSemCor"></div>
-<div style="overflow-x:auto"><table id="esTab"></table></div>
+<div class="estab"><table id="esTab"></table></div>
 <div class="box" style="margin-top:14px;border:2px solid #1d4ed8"><h3 style="margin-top:0">🧾 Pedido sugerido para a XBZ — projeção para <input id="sgDias" type="number" min="1" max="60" placeholder="auto" style="width:70px"> dias <button onclick="carregarSug()">Calcular</button></h3>
 <p class="mut">Calculado pela venda recente (mais peso na última semana), de quantos em quantos dias vocês costumam comprar cada produto, o prazo da XBZ (<span id="sgPrazo"></span> dias), o que já está na prateleira e o que está reservado nas etiquetas. Arredonda no múltiplo que vocês costumam pedir. Mude as quantidades à vontade e clique em <b>Confirmar</b>: o sistema aprende como vocês compram e sugere mais parecido da próxima vez.</p>
 <div style="overflow-x:auto"><table id="sgTab"></table></div><p id="sgTot" style="font-size:18px"></p>
@@ -178,7 +189,9 @@ async function addPau(){if(!pHora.value)return alert("Informe a hora");await fet
 async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,duracao:+v||15})});carregarPau()}
 const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number(v).toFixed(2).replace(".",",");
 let MT=null,ES=null;
-function abrirEst(){dlgEst.showModal();carregarEst();contarPrat();carregarRet();carregarCores()}
+function topoEst(){const t=dlgEst.querySelector(".topo");if(t)dlgEst.style.setProperty("--topo",t.offsetHeight+"px")}
+window.addEventListener("resize",()=>{if(dlgEst.open)topoEst()});
+function abrirEst(){dlgEst.showModal();setTimeout(topoEst,50);carregarEst();contarPrat();carregarRet();carregarCores()}
 async function carregarCores(){try{const r=await (await fetch("/api/estoque/cores")).json(),b=$("esCores");
  const fora=r.fora||[];if(!r.itens.length&&!fora.length){b.style.display="none";return}b.style.display="block";
  const opt=(x,o)=>`<option value="${esc(o.cor)}" ${x.sugestao===o.cor?"selected":""}>${esc(o.cor)}${o.nosso?` (nosso: ${o.saldo})`:""}</option>`;
@@ -241,7 +254,7 @@ function renderEst(){if(!ES)return;const f=(esBusca.value||"").toUpperCase(),so=
  const sc=ES.itens.filter(i=>i.sem_cor&&i.saldo>0);
  $("esSemCor").innerHTML=sc.length?`<div class="al"><b>Entrou da XBZ sem cor (a nota não informa a cor) — diga quanto é de cada cor:</b>`+sc.map(i=>`<div class="row" style="margin-top:6px"><b>${esc(i.sku)}</b> ${esc(i.nome)} — <b>${i.saldo}</b> un. <input id="dc_${esc(i.sku)}" placeholder="Preto=20, Azul=30" style="width:240px"><button onclick="distribuir('${esc(i.sku)}')">Distribuir</button></div>`).join("")+"</div>":"";
  const dd=v=>v==null?"—":v;
- $("esTab").innerHTML="<tr><th>Prat.</th><th>SKU</th><th>Produto</th><th>Cor</th><th>Na prateleira</th><th>Reservado (etiquetas)</th><th>Disponível</th><th>Separado 7 dias</th><th>Média/dia</th><th>Dá para</th><th>Comprar</th><th>Custo XBZ</th><th>Valor</th><th>Estoque XBZ</th><th>Alerta</th></tr>"+
+ $("esTab").innerHTML="<tr><th>Prat.</th><th>SKU</th><th>Produto</th><th>Cor</th><th title='Na prateleira'>Prateleira</th><th title='Reservado pelas etiquetas ainda não separadas'>Reserv.</th><th>Disponível</th><th title='Separado nos últimos 7 dias'>Sep. 7d</th><th>Média/dia</th><th>Dá para</th><th>Comprar</th><th>Custo</th><th>Valor</th><th title='Estoque na XBZ'>XBZ</th><th>Alerta</th></tr>"+
   L.map(i=>`<tr><td>${esc(i.prateleira||"")}</td><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${i.fisico}</td><td>${i.pendente_hoje}</td><td style="color:${i.saldo<=0?"#d7263d":"inherit"}"><b>${i.saldo}</b></td><td>${i.saidas_7d}</td><td>${i.media_dia}</td><td>${i.dias==null?"—":i.dias+" dias"}</td><td><b>${i.comprar||""}</b></td><td>${R$(i.custo)}</td><td>${i.comprar?R$(i.valor_compra):""}</td><td>${dd(i.xbz_estoque)}${i.xbz_reposicao?" <span class=mut>repõe "+esc(i.xbz_reposicao.split("-").reverse().join("/"))+"</span>":""}</td><td style="color:#d7263d"><b>${esc(i.alerta)}</b></td></tr>`).join("");
  $("esTotal").textContent="Compra sugerida: "+R$(ES.total_compra).replace(/<[^>]+>/g,"")}
 function folhaCont(cego){const f=(esBusca.value||"").trim();window.open("/estoque/folha?cego="+cego+(f?"&filtro="+encodeURIComponent(f):""),"_blank")}
