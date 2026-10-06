@@ -1345,6 +1345,38 @@ def dev_aprendizado(c=None):
             c.close()
 
 
+def dev_ligar_shopee(dev_id, ref):
+    """Liga a devolucao bipada a devolucao da Shopee pelo nº do pedido ou da solicitacao (quando a etiqueta
+    da devolucao nao bateu sozinha). Se ainda nao tiver lido essa devolucao, le a Shopee de novo (60 dias)."""
+    ref = norm(ref)
+    if len(ref) < 8:
+        return {"ok": False, "erro": "Digite o nº do pedido Shopee (ex.: 260918ABCD1234) ou o nº da solicitação de devolução."}
+    def achar():
+        with conn() as c:
+            return c.execute("""SELECT * FROM shopee_devolucoes WHERE order_sn=? OR return_sn=? OR (rastreio<>'' AND rastreio=?)
+                                ORDER BY criado DESC LIMIT 1""", (ref, ref, ref)).fetchone()
+    sr = achar()
+    if not sr:
+        try:
+            shopee_devolucoes_sincronizar(60)
+        except Exception:
+            pass
+        sr = achar()
+    if not sr:
+        return {"ok": False, "erro": f"Não achei devolução na Shopee com o nº {ref}. Confira o número no Seller Center "
+                                     "(Devoluções → nº do pedido)."}
+    with _lock, conn() as c:
+        d = c.execute("SELECT * FROM devolucoes WHERE id=?", (int(dev_id),)).fetchone()
+        if not d:
+            return {"ok": False, "erro": "devolucao nao encontrada"}
+        c.execute("UPDATE devolucoes SET return_sn=?, loja=COALESCE(NULLIF(loja,''),?), motivo=COALESCE(NULLIF(motivo,''),?) WHERE id=?",
+                  (sr["return_sn"], sr["loja"] or "", sr["motivo"] or "", int(dev_id)))
+        cod = norm(d["pedido"])
+        if cod and cod != sr["order_sn"] and not sr["rastreio"]:   # proxima vez a etiqueta ja bate sozinha
+            c.execute("UPDATE shopee_devolucoes SET rastreio=? WHERE return_sn=?", (cod, sr["return_sn"]))
+    return {"ok": True, "return_sn": sr["return_sn"], "pedido": sr["order_sn"], "loja": sr["loja"]}
+
+
 def dev_orientacao(dev_id):
     """O que fazer com esta devolucao: contestar ou nao, prazo, fotos/video e o texto pronto para a Shopee."""
     with conn() as c:
@@ -1966,6 +1998,10 @@ class H(BaseHTTPRequestHandler):
                 por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
                 nt = c.execute("SELECT COUNT(*) FROM itens WHERE falta_material=1").fetchone()[0]
                 pode_voltar = c.execute("SELECT COUNT(DISTINCT item_id) FROM eventos WHERE desfeito=2").fetchone()[0]
+                ini_h, _ = dia_utc(datetime.now(BR).strftime("%Y-%m-%d"))
+                n_hoje = c.execute("""SELECT COUNT(*) FROM itens WHERE (status IN ('SEPARADO','EM_GRAVACAO','GRAVADO','EXPEDIDO') OR falta_material=1)
+                                      AND (criado_em>=? OR id IN (SELECT item_id FROM eventos WHERE em>=? AND desfeito=0))""",
+                                   (ini_h, ini_h)).fetchone()[0]
             n = sum(por.get(k, 0) for k in ("SEPARADO", "EM_GRAVACAO", "GRAVADO", "EXPEDIDO"))
             h = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Reiniciar bipagem</title>
 <body style="font:18px Arial;max-width:640px;margin:20px auto;padding:0 16px">
@@ -1973,11 +2009,12 @@ class H(BaseHTTPRequestHandler):
 <p>Agora: <b>{por.get('AGUARDANDO',0)}</b> aguardando · <b>{por.get('SEPARADO',0)}</b> separados · <b>{por.get('EM_GRAVACAO',0) + por.get('GRAVADO',0)}</b> em gravação/gravados · <b>{por.get('EXPEDIDO',0)}</b> expedidos · <b>{nt}</b> NÃO TEM · {por.get('DEVOLVIDO',0)} devolvidos</p>
 <p>Os <b>{n}</b> separados, em gravação e expedidos voltam para <b>AGUARDANDO</b> e os <b>{nt}</b> NÃO TEM são limpos, para bipar tudo de novo. Só as devoluções ficam como estão.
 O estoque não baixa duas vezes. Nada é apagado: dá para desfazer.</p>
-<p><button id=b style="font-size:20px;padding:12px 18px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0)">Limpar tudo e voltar para AGUARDANDO</button></p>
+<p><button style="font-size:20px;padding:12px 18px;background:#7c3aed;color:#fff;border:0;border-radius:8px" onclick="go(0,1)">Só as etiquetas de HOJE ({n_hoje}) voltam para a SEPARAÇÃO</button></p>
+<p><button id=b style="font-size:16px;padding:10px 14px;background:#d7263d;color:#fff;border:0;border-radius:8px" onclick="go(0,0)">TUDO, de todos os dias ({n}), volta para AGUARDANDO</button></p>
 {'<p><button style="font-size:16px;padding:10px 14px" onclick="go(1)">Desfazer o último reinício (' + str(pode_voltar) + ' itens)</button></p>' if pode_voltar else ''}
 <p id=m></p><p><a href="/painel">Voltar ao painel</a></p>
-<script>async function go(d){{if(!confirm(d?"Desfazer o reinício e voltar como estava?":"Voltar TUDO para AGUARDANDO?"))return;
-const r=await fetch("/api/admin/reiniciar-etapas",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{desfazer:!!d}})}});
+<script>async function go(d,h){{if(!confirm(d?"Desfazer o reinício e voltar como estava?":h?"Voltar as etiquetas de HOJE para a separação?":"Voltar TUDO, de todos os dias, para AGUARDANDO?"))return;
+const r=await fetch("/api/admin/reiniciar-etapas",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{desfazer:!!d,so_hoje:!!h}})}});
 const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+j.itens+" itens. Recarregando...":"Erro";setTimeout(()=>location.reload(),1200)}}</script>"""
             return self._envia(200, h, "text/html; charset=utf-8")
         if p in ("/estoque/folha", "/estoque/contagem.pdf"):
@@ -2033,7 +2070,7 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_aplicar(aplicar=False))
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
-
+        if p == "/api/shopee/testar":
             try:
                 return self._envia(200, shopee_testar(q.get("shop_id", "0")))
             except Exception as e:
@@ -2129,6 +2166,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, dev_registrar(str(d.get("codigo") or "")))
             if p == "/api/devolucoes/apagar-midia":
                 return self._envia(200, dev_midia_apagar(d.get("id") or 0, str(d.get("arquivo") or "")))
+            if p == "/api/devolucoes/ligar":
+                return self._envia(200, dev_ligar_shopee(d.get("id") or 0, str(d.get("ref") or "")))
             if p == "/api/devolucoes/email":
                 em = str(d.get("email") or "").strip()[:120]
                 with _lock, conn() as c:
@@ -2206,8 +2245,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_desfazer())
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
-
-            return self._envia(200, reiniciar_etapas(bool(d.get("desfazer"))))
+        if p == "/api/admin/reiniciar-etapas":
+            return self._envia(200, reiniciar_etapas(bool(d.get("desfazer")), bool(d.get("so_hoje"))))
         if p == "/api/estoque/desfazer":
             return self._envia(200, desfazer_contagem(d.get("ref")))
         if p == "/api/estoque/baixa":
@@ -2824,7 +2863,7 @@ def _ja_baixado(c, iid):
     return c.execute("SELECT 1 FROM estoque_mov WHERE ref LIKE ? LIMIT 1", (f"ETQ|{iid}|%",)).fetchone() is not None
 
 
-def reiniciar_etapas(desfazer=False):
+def reiniciar_etapas(desfazer=False, so_hoje=False):
     """Volta TUDO que esta separado / em gravacao / expedido para AGUARDANDO, para refazer a bipagem do zero.
     Nao apaga nada: os bipes ficam marcados (desfeito=2) e da para desfazer o reinicio.
     O estoque nao baixa de novo: a etiqueta que ja deu baixa nao baixa outra vez nem conta como reservada.
@@ -2834,7 +2873,14 @@ def reiniciar_etapas(desfazer=False):
             ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM eventos WHERE desfeito=2")]
             c.execute("UPDATE eventos SET desfeito=0 WHERE desfeito=2")
         else:
-            ids = [r[0] for r in c.execute("SELECT id FROM itens WHERE status IN ('SEPARADO','EM_GRAVACAO','GRAVADO','EXPEDIDO') OR falta_material=1")]
+            c.execute("UPDATE eventos SET desfeito=3 WHERE desfeito=2")   # reinicio antigo nao volta junto no "desfazer"
+            q = "SELECT id FROM itens WHERE (status IN ('SEPARADO','EM_GRAVACAO','GRAVADO','EXPEDIDO') OR falta_material=1)"
+            args = ()
+            if so_hoje:   # so as etiquetas do dia (criadas hoje ou bipadas hoje)
+                ini, _ = dia_utc(datetime.now(BR).strftime("%Y-%m-%d"))
+                q += " AND (criado_em>=? OR id IN (SELECT item_id FROM eventos WHERE em>=? AND desfeito=0))"
+                args = (ini, ini)
+            ids = [r[0] for r in c.execute(q, args)]
             for iid in ids:
                 c.execute("""UPDATE eventos SET desfeito=2 WHERE item_id=? AND desfeito=0
                              AND etapa IN ('SEPARADO','GRAVACAO_INICIO','GRAVACAO_FIM','EXPEDIDO','FALTA_MATERIAL')""", (iid,))
