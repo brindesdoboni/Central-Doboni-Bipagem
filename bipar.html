@@ -39,17 +39,17 @@ const TONS={operador:[[1047,90],[1319,180]],separado:[[660,110],[880,170]],grava
  expedido:[[784,90],[988,90],[1175,90],[1568,240]],devolucao:[[880,140],[660,140],[440,240]],falta:[[330,200],[0,90],[330,200],[0,90],[330,200]],
  desfazer:[[700,120],[500,200]],espera:[[1500,35]],repetido:[[600,140],[0,70],[600,140]],aviso:[[600,140],[0,70],[600,140]],ok:[[880,150]],
  erro:[[440,220],[330,220],[440,220],[330,220],[220,600]]};
-// som de cada colaborador: cada um tem o seu verde (deu certo), amarelo (ja feito/aviso) e vermelho (erro)
-const VBASE=[523,587,659,698,784,880,988,1047];
-function tonsVoz(v,tipo){v=((v|0)%16+16)%16;const b=VBASE[v%8],e=Math.floor(v/8)%2,R=x=>Math.round(x);
- if(tipo==="ok")return e?[[b,140],[0,40],[R(b*1.5),220]]:[[b,90],[R(b*1.26),90],[R(b*1.5),170]];
- if(tipo==="aviso")return e?[[R(b*.84),160],[R(b*.63),220]]:[[R(b*.75),130],[0,60],[R(b*.75),130]];
- return e?[[R(b/2),130],[0,50],[R(b/2),130],[0,50],[R(b/2),130],[0,50],[R(b/4),600]]:[[R(b/2),220],[R(b*.375),220],[R(b/2),220],[R(b*.375),220],[R(b/4),550]]}
+// som de cada colaborador: melodia, timbre e tom proprios; verde = deu certo, amarelo = ja feito/aviso, vermelho = erro
+const VBASE=[523,587,659,698,784,880,988,1047],VOK=[[[0,90],[4,90],[7,170]],[[0,120],[null,40],[12,220]],[[7,80],[4,80],[7,80],[12,200]],[[0,60],[2,60],[4,60],[5,60],[7,200]],[[12,110],[7,110],[12,220]],[[0,90],[7,90],[0,90],[7,200]],[[4,140],[9,260]],[[0,70],[null,30],[0,70],[null,30],[12,220]]],VAV=[[[-5,130],[null,60],[-5,130]],[[-3,160],[-8,220]],[[-5,80],[null,50],[-5,80],[null,50],[-5,80]],[[-8,220],[-5,140]],[[-2,120],[null,50],[-7,200]],[[-5,100],[-4,100],[-5,200]],[[-10,180],[null,60],[-10,180]],[[-7,90],[-3,90],[-7,180]]],VER=[[[-12,220],[-17,220],[-12,220],[-17,220],[-24,550]],[[-12,130],[null,50],[-12,130],[null,50],[-12,130],[null,50],[-24,600]],[[-10,150],[-22,150],[-10,150],[-22,150],[-10,150],[-22,150],[-29,400]],[[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-24,400]],[[-7,300],[-19,600]],[[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120]],[[-12,180],[-15,180],[-18,180],[-24,500]],[[-14,250],[-12,250],[-14,250],[-24,500]]];
+function vozInfo(v){v=((v|0)%16+16)%16;return {m:v%8,t:Math.floor(v/8),b:VBASE[(v+Math.floor(v/8)*4)%8]}}
+function tonsVoz(v,tipo){const i=vozInfo(v),M=(tipo==="ok"?VOK:tipo==="aviso"?VAV:VER)[i.m];
+ return M.map(([s,d])=>[s===null?0:Math.round(i.b*Math.pow(2,s/12)),d])}
+function timbreVoz(v,tipo){return tipo==="erro"?"square":vozInfo(v).t?"sawtooth":"triangle"}
 function som(ev,voz,tipo){const a=audio();if(!a)return;let t=a.currentTime+.02;
  const pv=voz!=null&&["ok","aviso","erro"].includes(tipo)&&!["operador","espera","desfazer"].includes(ev);if(pv)ev=tipo==="erro"?"erro":ev;
  for(const [f,ms] of (pv?tonsVoz(voz,tipo):(TONS[ev]||TONS.erro))){const d=ms/1000;
- if(f){const o=a.createOscillator(),g=a.createGain();o.type=ev==="erro"?"square":"triangle";o.frequency.value=f;o.connect(g);g.connect(a.destination);
-  g.gain.setValueAtTime(.0001,t);const vol=ev==="erro"?1:.45;g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
+ if(f){const o=a.createOscillator(),g=a.createGain();o.type=pv?timbreVoz(voz,tipo):(ev==="erro"?"square":"triangle");o.frequency.value=f;o.connect(g);g.connect(a.destination);
+  g.gain.setValueAtTime(.0001,t);const vol=ev==="erro"?1:(pv&&o.type==="sawtooth"?.3:.45);g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
  t+=d}}
 // cartoes grandes empilhados: o novo entra embaixo, os anteriores sobem, cada um some em 5 segundos (ate metade da tela)
 function cartao(tipo,msg,det,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8",espera:"#3a3d48"}[tipo]||"var(--er)";

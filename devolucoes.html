@@ -175,10 +175,14 @@ function desenharOq(){const o=OQ,el=$("oq");
    <div class="bloco"><b>📤 4. Enviar para a Shopee</b>
      ${o.enviado_em?`<p class="vid">✅ Enviado em ${esc(new Date(o.enviado_em).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}))}<br>${esc((o.envio.passos||[]).join(" · "))}</p>${(o.envio.avisos||[]).length?`<p style="color:#b45309">⚠️ ${esc(o.envio.avisos.join(" · "))}</p>`:""}`:
       `<input id="oqMail" placeholder="E-mail da loja para a Shopee responder" value="${esc(o.email)}" style="width:100%;box-sizing:border-box;font-size:16px;padding:8px;border:1px solid #bbb;border-radius:8px">
+       ${!o.shopee?`<div style="background:#fef3c7;border-radius:10px;padding:10px;margin:8px 0"><span style="font-weight:bold">⚠️ Não achei esta devolução na Shopee pela etiqueta.</span><br>Digite o nº do <span style="font-weight:bold">pedido Shopee</span> (ou da solicitação de devolução) que aparece no Seller Center:
+         <div style="display:flex;gap:6px;margin-top:6px"><input id="oqRef" placeholder="Ex.: 260918ABCD1234" autocapitalize="characters" style="flex:1;min-width:0;font-size:16px;padding:8px;border:1px solid #bbb;border-radius:8px"><button onclick="ligar()" style="background:#7c3aed;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:bold;font-size:16px">Ligar</button></div></div>`:""}
        <button class="env" onclick="enviar()" ${o.shopee&&nFotos?"":"disabled"}>🚀 Enviar para a Shopee</button>
-       <div class="mini">${!o.shopee?"Só dá para enviar quando a devolução aparecer na Shopee.":!nFotos?"Tire as fotos antes de enviar.":"Confira o texto: ele vai exatamente como está acima, com as fotos e o vídeo. Envie SÓ o que é verdade."}</div>
+       <div class="mini">${!o.shopee?"O botão libera depois de ligar com o pedido da Shopee.":!nFotos?"Tire as fotos antes de enviar.":"Confira o texto: ele vai exatamente como está acima, com as fotos e o vídeo. Envie SÓ o que é verdade."}</div>
        <details style="margin-top:6px"><summary>Prefere enviar pelo Seller Center?</summary>${o.como_enviar.map((x,i)=>`<div>${i+1}. ${esc(x)}</div>`).join("")}</details>`}</div>`;
 }
+async function ligar(){const r=await post("/api/devolucoes/ligar",{id:OQ.id,ref:$("oqRef").value});
+  $("msg").textContent=r.ok?`✅ Ligada à devolução da Shopee (pedido ${r.pedido})`:"❌ "+r.erro;if(r.ok)oque(OQ.id)}
 function usar(i){$("oqTxt").value=$("oqW"+i).value;$("msg").textContent="Texto trocado — confira antes de enviar"}
 let TIRAR=null;
 function tirar(tipo,rotulo){TIRAR={tipo,rotulo};const inp=$(tipo=="video"?"arqVideo":"arqFoto");inp.value="";inp.click()}

@@ -67,6 +67,9 @@ def iniciar_db():
             c.execute("ALTER TABLE itens ADD COLUMN impresso TEXT DEFAULT ''")
         if "pecas" not in cols_it:
             c.execute("ALTER TABLE itens ADD COLUMN pecas TEXT DEFAULT ''")
+        if "oculto" not in cols_it:   # 1 = duplicada (juntada em outra), 2 = encerrada (saiu/cancelada/antiga sem movimento)
+            c.execute("ALTER TABLE itens ADD COLUMN oculto INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE itens ADD COLUMN oculto_motivo TEXT DEFAULT ''")
         if "despachado_em" not in cols_it:   # saiu daqui com a transportadora (bipe no DESPACHO ou Shopee "enviado")
             c.execute("ALTER TABLE itens ADD COLUMN despachado_em TEXT")
             c.execute("ALTER TABLE itens ADD COLUMN despachado_por TEXT DEFAULT ''")
@@ -296,6 +299,7 @@ def importar_lote(dados):
             tocados.append(iid)
         corr = _corrigir_personalizados(c, list(dict.fromkeys(tocados)))
         sem = sum(checar_falta(c, iid) for iid in dict.fromkeys(tocados))
+    threading.Thread(target=lambda: _tenta_limpar(), daemon=True).start()   # junta duplicadas que este lote criou
     return {"ok": True, "lote": lote, "novos": n_novo, "atualizados": n_atual, "sem_estoque": sem,
             "virou_personalizado": len(corr)}
 
@@ -523,6 +527,11 @@ def _bipar(posto, codigo, operador, modo):
             return {"tipo": "ok", "msg": f"Desfeito: {ev['etapa']} do pedido {ev['pedido']}", "evento": "desfazer"}
         itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
                           "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
+        if any(i["oculto"] == 2 for i in itens):   # foi encerrada sozinha, mas esta aqui de verdade: volta
+            c.execute(f"UPDATE itens SET oculto=0, oculto_motivo='' WHERE oculto=2 AND id IN ({','.join('?' * len(itens))})",
+                      [i["id"] for i in itens])
+            itens = c.execute("SELECT i.* FROM itens i JOIN codigos k ON k.item_id=i.id WHERE k.codigo=? "
+                              "ORDER BY i.etiqueta, i.id", (cod,)).fetchall()
         if not itens and posto == "DEVOLUCAO":
             itens = _itens_devolucao(c, cod)
         if not itens and posto == "DEVOLUCAO":
@@ -654,6 +663,120 @@ def _bipar(posto, codigo, operador, modo):
         return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição ou Devolução) e bipe de novo."}
 
 
+ANTIGO_DIAS = int(os.environ.get("ANTIGO_DIAS", "4"))
+
+
+def _tenta_limpar():
+    try:
+        limpar_etiquetas()
+    except Exception as e:
+        print("limpeza:", e, flush=True)
+
+
+def limpar_etiquetas(aplicar=True):
+    """Deixa a operacao com o que existe de verdade:
+    1) DUPLICADAS: a mesma etiqueta (mesmo pedido, SKU, cor e nomes) que entrou por fontes diferentes
+       (lote + PDF + e-mail + bipe) vira uma so (os codigos vao para a que ficou).
+    2) ENCERRADAS: nao expedidas que ja sairam (Shopee: enviado), foram canceladas, ou estao paradas ha mais de
+       ANTIGO_DIAS dias sem nenhum bipe. NAO mexe no estoque (ele ja esta certo).
+    Nada e apagado: aparecem no painel e voltam sozinhas se forem bipadas."""
+    hoje = datetime.now(timezone.utc)
+    lim = (hoje - timedelta(days=ANTIGO_DIAS)).isoformat()
+    with conn() as c:   # procura sem travar os bipes
+        vivos = [dict(r) for r in c.execute("SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND COALESCE(lote,'')<>'DEVOLUCAO'")]
+        nev = {r[0]: (r[1], r[2]) for r in c.execute("SELECT item_id, COUNT(*), MAX(em) FROM eventos WHERE desfeito=0 GROUP BY item_id")}
+        canc = _ids_cancelados(c)
+        saiu = {r[0] for r in c.execute("""SELECT k.item_id FROM codigos k JOIN shopee_pedidos s ON s.order_sn=k.codigo
+                                           WHERE s.status IN ('SHIPPED','TO_CONFIRM_RECEIVE','COMPLETED')""")}
+    ordem = {e: n for n, e in enumerate(ETAPAS)}
+    grupos = {}
+    for i in vivos:
+        k = (norm(i["pedido"]), (i["sku"] or "").upper().strip(), (i["cor"] or "").upper().strip(),
+             re.sub(r"\s+", " ", (i["nomes"] or "").upper()).strip())
+        if k[0]:
+            grupos.setdefault(k, []).append(i)
+    dup = []   # (manter, juntar)
+    for k, L in grupos.items():
+        if len(L) < 2 or len({x["lote"] for x in L}) < 2:   # 2 iguais no MESMO lote = 2 etiquetas de verdade
+            continue
+        L.sort(key=lambda x: (-ordem.get(x["status"], 0), -(nev.get(x["id"], (0, ""))[0]), x["id"]))
+        manter = L[0]
+        lotes_usados = {manter["lote"]}
+        for x in L[1:]:
+            if x["lote"] in lotes_usados:   # outra etiqueta do mesmo lote: e outra peca, nao duplicata
+                continue
+            dup.append((manter["id"], x["id"]))
+            lotes_usados.add(x["lote"])
+    # mesma etiqueta com o pedido escrito diferente nas fontes: mesmo codigo de barras, mesmo SKU, nomes iguais ou faltando
+    ja = {b for _, b in dup}
+    por_id = {i["id"]: i for i in vivos}
+    with conn() as c:
+        cods = {}
+        for cod, iid in c.execute("SELECT codigo, item_id FROM codigos"):
+            if iid in por_id:
+                cods.setdefault(cod, []).append(iid)
+    sk = lambda i: re.split(r"[-\s]", (i["sku"] or "").upper().strip())[0]
+    for cod, ids in cods.items():
+        L = [por_id[x] for x in dict.fromkeys(ids) if x not in ja]
+        if len(L) < 2:
+            continue
+        L.sort(key=lambda x: (-ordem.get(x["status"], 0), -(nev.get(x["id"], (0, ""))[0]), x["id"]))
+        manter = L[0]
+        for x in L[1:]:
+            if x["lote"] == manter["lote"] or x["id"] in ja or (sk(x) and sk(manter) and sk(x) != sk(manter)):
+                continue
+            nx, nm = (x["nomes"] or "").strip().upper(), (manter["nomes"] or "").strip().upper()
+            if nx and nm and nx != nm:
+                continue
+            if (x["cor"] or "") and (manter["cor"] or "") and x["cor"].upper() != manter["cor"].upper():
+                continue
+            dup.append((manter["id"], x["id"])); ja.add(x["id"])
+    juntadas = {b for _, b in dup}
+    enc = []
+    for i in vivos:
+        if i["id"] in juntadas or i["status"] in ("EXPEDIDO", "DEVOLVIDO"):
+            continue
+        if i["id"] in canc:
+            enc.append((i["id"], "cancelado na Shopee", False))
+        elif i["id"] in saiu or i["despachado_em"]:
+            enc.append((i["id"], "Shopee: ja enviado (saiu sem o bipe da expedicao)", True))
+        elif (i["criado_em"] or "") < lim and (nev.get(i["id"], (0, ""))[1] or "") < lim and not i["falta_material"]:
+            enc.append((i["id"], f"parada ha mais de {ANTIGO_DIAS} dias sem bipe", True))
+    res = {"duplicadas": len(dup), "encerradas": len(enc),
+           "motivos": {m: sum(1 for _, mm, _ in enc if mm == m) for m in {m for _, m, _ in enc}}}
+    if not aplicar or not (dup or enc):
+        return res
+    with _lock, conn() as c:
+        for manter, x in dup:
+            for (cod,) in c.execute("SELECT codigo FROM codigos WHERE item_id=?", (x,)).fetchall():
+                c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, manter))
+            c.execute("DELETE FROM codigos WHERE item_id=?", (x,))
+            c.execute("UPDATE itens SET oculto=1, oculto_motivo=?, atualizado_em=? WHERE id=?",
+                      (f"duplicada da etiqueta #{manter}", agora(), x))
+        for iid, motivo, _ in enc:   # o estoque ja esta certo: aqui nao mexe nele
+            c.execute("UPDATE itens SET oculto=2, oculto_motivo=?, atualizado_em=? WHERE id=?", (motivo, agora(), iid))
+        r = c.execute("SELECT valor FROM meta WHERE chave='limpeza_log'").fetchone()
+        log = (json.loads(r[0]) if r and r[0] else [])[-30:] + [{"em": agora(), **res}]
+        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('limpeza_log', ?)", (json.dumps(log, ensure_ascii=False),))
+    _op_cache["v"] = None
+    print(f"Limpeza: {len(dup)} duplicadas juntadas, {len(enc)} encerradas", flush=True)
+    return res
+
+
+def etiquetas_ocultas():
+    with conn() as c:
+        L = [dict(r) for r in c.execute("""SELECT id, pedido, canal, loja, sku, cor, nomes, status, criado_em, oculto, oculto_motivo, atualizado_em
+                                           FROM itens WHERE COALESCE(oculto,0)>0 ORDER BY atualizado_em DESC LIMIT 1500""")]
+    return {"ok": True, "duplicadas": sum(1 for x in L if x["oculto"] == 1), "encerradas": sum(1 for x in L if x["oculto"] == 2), "itens": L}
+
+
+def reabrir_etiqueta(iid):
+    with _lock, conn() as c:
+        c.execute("UPDATE itens SET oculto=0, oculto_motivo='' WHERE id=? AND oculto=2", (int(iid),))
+    _op_cache["v"] = None
+    return {"ok": True}
+
+
 def _contar_hoje(c, o_que, data=None):
     """Contadores do dia (horario de Brasilia): 'despachados' (etiquetas que sairam com a transportadora)
     e 'devolucoes' (pacotes de devolucao bipados/registrados)."""
@@ -730,9 +853,9 @@ def painel(data, leve=False):
     ini, fim = dia_utc(data)
     with conn() as c:
         # itens do dia = criados no dia OU com movimento no dia OU ainda nao expedidos
-        itens = [dict(r) for r in c.execute("""SELECT * FROM itens WHERE (criado_em>=? AND criado_em<?)
+        itens = [dict(r) for r in c.execute("""SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND ((criado_em>=? AND criado_em<?)
             OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0)
-            OR (status NOT IN ('EXPEDIDO','DEVOLVIDO') AND criado_em<?) ORDER BY canal, etiqueta, id""", (ini, fim, ini, fim, fim))]
+            OR (status NOT IN ('EXPEDIDO','DEVOLVIDO') AND criado_em<?)) ORDER BY canal, etiqueta, id""", (ini, fim, ini, fim, fim))]
         cont = {e: 0 for e in ETAPAS}
         for i in itens:
             cont[i["status"]] += 1
@@ -2103,6 +2226,10 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not r["ok"]:
                 return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
             return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/etiquetas/ocultas":
+            return self._envia(200, etiquetas_ocultas())
+        if p == "/api/etiquetas/limpar":
+            return self._envia(200, limpar_etiquetas(aplicar=q.get("aplicar") == "1"))
         if p == "/api/personalizados/corrigidos":
             return self._envia(200, personalizados_corrigidos())
         if p == "/personalizados/corrigidos":
@@ -2318,6 +2445,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_desfazer())
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/etiquetas/reabrir":
+            return self._envia(200, reabrir_etiqueta(d.get("id") or 0))
         if p == "/api/admin/reiniciar-etapas":
             return self._envia(200, reiniciar_etapas(bool(d.get("desfazer")), bool(d.get("so_hoje"))))
         if p == "/api/estoque/desfazer":
@@ -2976,7 +3105,7 @@ def _reservado(c, sku, cn, nivel, antes_de):
     """Unidades de etiquetas que entraram antes desta e ainda nao foram separadas (vao sair da prateleira)."""
     tot = 0
     canc = _ids_cancelados(c)
-    for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO'", (antes_de,)):
+    for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND id<? AND COALESCE(lote,'')<>'DEVOLUCAO' AND COALESCE(oculto,0)=0", (antes_de,)):
         if i["id"] in canc or _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
             continue
         for s_, c_, q in _pecas_do_item(dict(i)):
@@ -3305,7 +3434,7 @@ def estoque():
         pend = {}
         canc = _ids_cancelados(c)
         # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
-        for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO'"):
+        for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO' AND COALESCE(oculto,0)=0"):
             if i["id"] in canc or _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
                 continue
             for sku, cor, q in _pecas_do_item(dict(i)):
@@ -3428,7 +3557,15 @@ def sugestao_compra(dias=None):
             linha = {"sku": sku, "cor": cor, "nome": x.get("nome", e.get("nome", "")), "media_dia": round(media, 1),
                      "na_prateleira": fisico, "reservado": reservado, "ciclo_dias": h["ciclo"], "multiplo": h["multiplo"],
                      "projecao": round(alvo), "fator": round(fatores.get(sku, 1.0), 2), "preco": preco,
-                     "xbz_estoque": x.get("estoque"), "estrategico": sku in ESTRATEGICOS}
+                     "xbz_estoque": x.get("estoque"), "estrategico": sku in ESTRATEGICOS,
+                     "disponivel": round(fisico - reservado), "falta_agora": max(0, round(reservado - fisico))}
+            # quando acaba (no ritmo de venda atual), contando o que ja esta reservado nas etiquetas
+            if media > 0:
+                dd = max(0.0, (fisico - reservado) / media)
+                linha["acaba_dias"] = round(dd, 1)
+                linha["acaba_em"] = (datetime.now(BR) + timedelta(days=dd)).strftime("%d/%m") if dd > 0 else "JÁ FALTA"
+            elif fisico - reservado <= 0 and reservado > 0:
+                linha["acaba_dias"], linha["acaba_em"] = 0, "JÁ FALTA"
             if (sku, cor) in XBZ_INDISPONIVEL or (sku, "") in XBZ_INDISPONIVEL or x.get("estoque") == 0:
                 if precisa > 0:
                     fora.append({**linha, "motivo": "fornecedor sem estoque", "qtd": math.ceil(precisa)})
@@ -3454,9 +3591,10 @@ def sugestao_compra(dias=None):
             linha["total"] = round((preco or 0) * q, 2)
             linha["critico"] = fisico - reservado <= 0 or (media > 0 and (fisico - reservado) / media < 2)
             out.append(linha)
-    out.sort(key=lambda l: (not l.get("critico"), l["sku"], l["cor"]))
+    out.sort(key=lambda l: (not l.get("critico"), l.get("acaba_dias", 999), l["sku"], l["cor"]))
     total = round(sum(l.get("total", 0) for l in out), 2)
     return {"itens": out, "sem_contagem": sem_contagem, "fora": fora, "total": total,
+            "falta_agora": sum(l.get("falta_agora", 0) for l in out),
             "unidades": sum(l["qtd"] for l in out), "criticos": sum(1 for l in out if l.get("critico")),
             "negativos": sum(1 for v in est.values() if v.get("fisico", 0) < 0 and not v.get("sem_cor")),
             "limite_semana": ESTOQUE_LIMITE_SEMANA, "acima_limite": total > ESTOQUE_LIMITE_SEMANA,
@@ -3508,6 +3646,35 @@ def ler_nfe(xml):
             "conta": txt(dest, "xNome") or txt(dest, "CNPJ") or txt(dest, "CPF"), "itens": itens}
 
 
+ESTOQUE_NF_DESDE = os.environ.get("ESTOQUE_NF_DESDE", "2026-10-06")   # contagem de 05/10 a tarde ja inclui o que chegou antes
+
+
+def _nf_entra_no_estoque(data_nf):
+    """So entra no estoque a nota (retirada na XBZ) a partir do dia seguinte a contagem."""
+    return (data_nf or "9999") >= ESTOQUE_NF_DESDE
+
+
+def corrigir_nf_antes_da_contagem():
+    """Uma vez: tira do estoque a entrada de notas ANTERIORES ao corte que foi lancada DEPOIS da contagem daquele
+    produto (a contagem ja tinha contado essas pecas: contaria 2 vezes). Guarda o que fez no log."""
+    with _lock, conn() as c:
+        if c.execute("SELECT 1 FROM meta WHERE chave=?", ("nf_corte_" + ESTOQUE_NF_DESDE,)).fetchone():
+            return []
+        tirados = []
+        for m in c.execute("""SELECT m.id, m.sku, m.qtd, m.em, m.ref, p.data FROM estoque_mov m
+                              JOIN compras p ON 'NF|' || p.chave = m.ref WHERE m.tipo='ENTRADA_NF' AND p.data < ?""",
+                           (ESTOQUE_NF_DESDE,)).fetchall():
+            cont = c.execute("SELECT MAX(em) FROM estoque_mov WHERE sku=? AND tipo='CONTAGEM'", (m["sku"],)).fetchone()[0]
+            if cont and m["em"] >= cont:
+                c.execute("DELETE FROM estoque_mov WHERE id=?", (m["id"],))
+                tirados.append({"sku": m["sku"], "qtd": m["qtd"], "nf_data": m["data"], "lancado": m["em"]})
+        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES(?,?)",
+                  ("nf_corte_" + ESTOQUE_NF_DESDE, json.dumps({"em": agora(), "tirados": tirados}, ensure_ascii=False)))
+    if tirados:
+        print(f"Estoque: {len(tirados)} entrada(s) de nota anterior a contagem retirada(s)", flush=True)
+    return tirados
+
+
 def importar_nfe(xml):
     """Guarda a compra (sem duplicar) e atualiza o custo de cada produto com o ultimo preco pago na XBZ."""
     n = ler_nfe(xml)
@@ -3520,12 +3687,14 @@ def importar_nfe(xml):
                              VALUES(?,?,?,?,?,?,?,?,?,?)""", (f"{n['chave'] or n['nf']}|{it['item']}", n["nf"], n["data"],
                              n["conta"], it["cprod"], it["descricao"], it["qtd"], it["unit"], it["total"], agora()))
             novos += r.rowcount
-            if it["cprod"] and it["qtd"] and not any(x and x in (n["conta"] or "").upper() for x in ESTOQUE_IGNORAR):
+            if it["cprod"] and it["qtd"] and _nf_entra_no_estoque(n["data"]) \
+                    and not any(x and x in (n["conta"] or "").upper() for x in ESTOQUE_IGNORAR):
                 # entrada no estoque proprio (a nota nao traz a cor: entra como "cor a definir")
                 c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
                           (agora(), estoque_chave(codigo_xbz_nf(it["cprod"]))[0], "", it["qtd"], "ENTRADA_NF",
                            f"NF|{n['chave'] or n['nf']}|{it['item']}", f"NF {n['nf']} {n['conta']}"))
     return {"ok": True, "nf": n["nf"], "data": n["data"], "conta": n["conta"], "itens": len(n["itens"]), "novos": novos,
+            "estoque": "entrou no estoque" if _nf_entra_no_estoque(n["data"]) else f"nota antes de {ESTOQUE_NF_DESDE}: so registrada (a contagem ja inclui)",
             "total": round(sum(i["total"] for i in n["itens"]), 2)}
 
 
@@ -3547,7 +3716,7 @@ def materiais(de, ate):
     _, fim = dia_utc(ate)
     hoje = datetime.now(BR).strftime("%Y-%m-%d")
     with conn() as c:
-        q = "SELECT * FROM itens WHERE ((criado_em>=? AND criado_em<?)"
+        q = "SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND ((criado_em>=? AND criado_em<?)"
         if ate >= hoje:
             q += " OR status NOT IN ('EXPEDIDO','DEVOLVIDO')"
         itens = [dict(r) for r in c.execute(q + ") AND COALESCE(lote,'')<>'DEVOLUCAO'", (ini, fim))]
@@ -4273,6 +4442,10 @@ def shopee_sincronizar_todas():
         corrigir_personalizados_todos()
     except Exception as e:
         print("corrigir personalizados:", e, flush=True)
+    try:
+        limpar_etiquetas()
+    except Exception as e:
+        print("limpeza:", e, flush=True)
     return out
 
 
@@ -4657,6 +4830,11 @@ if __name__ == "__main__":
         corrigir_personalizados_todos()
     except Exception as e:
         print("corrigir personalizados:", e, flush=True)
+    _tenta_limpar()
+    try:
+        corrigir_nf_antes_da_contagem()
+    except Exception as e:
+        print("corte NF:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
