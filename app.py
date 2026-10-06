@@ -32,6 +32,13 @@ def conn():
 
 
 def iniciar_db():
+    try:
+        _iniciar_db()
+    finally:
+        _carregar_cor_alias()
+
+
+def _iniciar_db():
     with conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript("""
@@ -91,6 +98,9 @@ def iniciar_db():
                      refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
                      expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
+        # cores: "e a mesma que" (vira uma so) e "sao cores diferentes" (nao pergunta de novo)
+        c.execute("CREATE TABLE IF NOT EXISTS cor_alias(sku TEXT, de TEXT, para TEXT, em TEXT, PRIMARY KEY(sku, de))")
+        c.execute("CREATE TABLE IF NOT EXISTS cor_ok(sku TEXT, cor TEXT, outra TEXT, em TEXT, PRIMARY KEY(sku, cor, outra))")
         c.execute("""CREATE TABLE IF NOT EXISTS devolucoes(id INTEGER PRIMARY KEY, item_id INTEGER UNIQUE, pedido TEXT, canal TEXT,
             loja TEXT, sku TEXT, cor TEXT, personalizado INTEGER, gravado INTEGER, sugestao TEXT, situacao TEXT, motivo TEXT,
             obs TEXT, custo REAL, colaborador_id INTEGER, em TEXT, decidido_em TEXT, return_sn TEXT)""")
@@ -1843,6 +1853,9 @@ def _tenta(etapa, fn, vezes=3):
             raise RuntimeError(f"{etapa}: {e}"[:220])
 
 
+FOTOS_MAX_DISPUTA = 3   # a Shopee aceita no maximo 3 fotos na contestacao (as outras vao nas provas extras)
+
+
 def _motivos_shopee(res):
     """get_return_dispute_reason -> [{id, requisito, modulos:[{module_index, requirement, is_required}]}]"""
     rr = res.get("response") or {}
@@ -1953,7 +1966,7 @@ def _dev_enviar_core(dev_id, texto, email, motivo_id, diag):
         avisos.append("a Shopee não aceita vídeo pela API: anexe o vídeo pelo Seller Center (na contestação já aberta)")
     # 3) as fotos vao em cada bloco de prova que a Shopee pede (obrigatorios; se nenhum for, no primeiro)
     mods = [x for x in motivo["modulos"] if x["is_required"]] or motivo["modulos"][:1]
-    image_list = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:9]} for x in mods]
+    image_list = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:FOTOS_MAX_DISPUTA]} for x in mods]
     corpo = {"return_sn": sn, "email": email, "dispute_reason_id": motivo["id"], "dispute_text_reason": texto[:1000]}
     if image_list:
         corpo["image_list"] = image_list
@@ -1973,7 +1986,7 @@ def _dev_enviar_core(dev_id, texto, email, motivo_id, diag):
     if corpo.get("image_list"):
         variacoes.append({**corpo, "image_list": [{"module_index": x["module_index"], "image_url": x["image_url"]}
                                                   for x in corpo["image_list"]]})
-        todos = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:9]}
+        todos = [{"module_index": x["module_index"], "requirement": x["requirement"], "image_url": urls[:FOTOS_MAX_DISPUTA]}
                  for x in motivo["modulos"]]
         if len(todos) > len(corpo["image_list"]):
             variacoes.append({**corpo, "image_list": todos})
@@ -1990,6 +2003,17 @@ def _dev_enviar_core(dev_id, texto, email, motivo_id, diag):
             if _ja_contestou():          # deu erro, mas entrou: nao manda de novo
                 erro_d = ""
                 break
+            mx = re.search(r"max size is (\d+)", erro_d)
+            if mx and not getattr(cp, "_reduzido", False):   # a Shopee diz quantas fotos aceita: manda so essas
+                k = max(1, int(mx.group(1)))
+                cp2 = {**cp, "image_list": [{**x, "image_url": x["image_url"][:k]} for x in cp.get("image_list") or []]}
+                try:
+                    res_d = _shopee_http("POST", "/api/v2/returns/dispute", loja=loja, corpo=cp2)
+                    erro_d = ""
+                    break
+                except Exception as e2:
+                    erro_d = str(e2)
+                    tent.append(erro_d[:120])
             if not _RX_TEMPORARIO.search(erro_d):
                 break
     bruto["tentativas"] = tent
@@ -2226,6 +2250,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not r["ok"]:
                 return self._envia(200, f"<meta charset=utf-8><h2 style='font-family:Arial'>{r['erro']}</h2>", "text/html; charset=utf-8")
             return self._envia(302, "", extra={"Location": r["url"]})
+        if p == "/api/estoque/cores":
+            return self._envia(200, cores_para_conferir())
         if p == "/api/xbz/retiradas":
             return self._envia(200, xbz_retiradas_log())
         if p == "/api/etiquetas/ocultas":
@@ -2447,6 +2473,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_desfazer())
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
+        if p == "/api/estoque/cor":
+            return self._envia(200, decidir_cor(d.get("sku"), d.get("cor"), d.get("acao"), d.get("para")))
         if p == "/api/xbz/retiradas/ler":
             try:
                 return self._envia(200, xbz_retiradas())
@@ -3023,7 +3051,105 @@ def estoque_chave(sku, cor="", texto=""):
     if s_ == "18691" and cn == "VERMELHO":
         s_ = "18601"
     cn = COR_POR_SKU.get((s_, cn), cn)
+    cn = _COR_ALIAS_DB.get((s_, cn), cn)   # "e a mesma cor" que voce confirmou no painel
     return s_, cn
+
+
+_COR_ALIAS_DB = {}
+
+
+def _carregar_cor_alias():
+    try:
+        with conn() as c:
+            _COR_ALIAS_DB.clear()
+            _COR_ALIAS_DB.update({(r[0], r[1]): r[2] for r in c.execute("SELECT sku, de, para FROM cor_alias")})
+    except Exception:
+        pass
+
+
+def _excluido(c, sku, cor):
+    """Cor (ou produto inteiro) que voce excluiu: nao entra de novo em nada (retirada, compra, lista)."""
+    return c.execute("SELECT 1 FROM sku_status WHERE status='EXCLUIDO' AND sku=? AND (cor=? OR cor='')",
+                     (sku, cor or "")).fetchone() is not None
+
+
+# palavras que costumam ser a mesma cor escrita de outro jeito
+_COR_GRUPOS = [{"ROSA", "PINK", "ROSE"}, {"ROXO", "LILAS", "VIOLETA", "LAVANDA"}, {"CINZA", "CHUMBO", "GRAFITE"},
+               {"BRANCO", "OFF", "GELO"}, {"PRATA", "INOX", "PRATEADO"}, {"MARROM", "CAFE", "CHOCOLATE"},
+               {"BEGE", "CREME", "NUDE", "AREIA"}, {"DOURADO", "OURO"}, {"VERMELHO", "VINHO", "BORDO"},
+               {"AZUL", "MARINHO"}, {"VERDE", "MILITAR", "AGUA"}]
+
+
+def _cores_parecidas(a, b):
+    if not a or not b or a == b:
+        return False
+    wa, wb = a.split(), b.split()
+    if wa[0] == wb[0]:                       # ROSA x ROSA CLARO (AZUL CLARO x AZUL ESCURO sao cores diferentes)
+        return len(wa) == 1 or len(wb) == 1
+    return any(wa[0] in g and wb[0] in g for g in _COR_GRUPOS)
+
+
+def cores_para_conferir():
+    """Cores que eu nao reconheco ou que parecem a mesma (para voce decidir: juntar, manter separadas ou excluir)."""
+    lim = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    with conn() as c:
+        linhas = c.execute("""SELECT sku, cor, SUM(qtd) saldo, MAX(em) ult, GROUP_CONCAT(DISTINCT tipo) tipos FROM estoque_mov
+                              WHERE cor<>'' GROUP BY sku, cor HAVING MAX(em)>=? OR SUM(qtd)<>0""", (lim,)).fetchall()
+        ok = {(r[0], r[1], r[2]) for r in c.execute("SELECT sku, cor, outra FROM cor_ok")}
+        cat = {}
+        for r in c.execute("SELECT codigo, cor FROM xbz WHERE cor<>''"):
+            cat.setdefault(r[0], set()).add(r[1])
+        exc = {(r[0], r[1]) for r in c.execute("SELECT sku, cor FROM sku_status WHERE status='EXCLUIDO'")}
+    por = {}
+    for r in linhas:
+        if (r["sku"], r["cor"]) in exc or (r["sku"], "") in exc:
+            continue
+        por.setdefault(r["sku"], []).append(dict(r))
+    out = []
+    for sku, L in por.items():
+        cores = [x["cor"] for x in L]
+        cat_sku = cat.get(sku_base(sku), set())
+        for x in L:
+            motivos, parecidas = [], []
+            if cat_sku and x["cor"] not in cat_sku and not any(x["cor"].startswith(k) or k.startswith(x["cor"]) for k in cat_sku):
+                motivos.append("a XBZ nao tem essa cor para esse produto")
+            if len(x["cor"]) <= 3 or re.search(r"\d|/", x["cor"]):
+                motivos.append("parece codigo, nao nome de cor")
+            for y in cores:
+                if y != x["cor"] and _cores_parecidas(x["cor"], y) and (sku, x["cor"], y) not in ok and (sku, y, x["cor"]) not in ok:
+                    parecidas.append(y)
+            if parecidas:
+                motivos.append("parecida com " + ", ".join(parecidas))
+            if motivos and (sku, x["cor"], "*") not in ok:
+                out.append({"sku": sku, "cor": x["cor"], "saldo": round(x["saldo"] or 0), "motivos": motivos,
+                            "parecidas": parecidas, "opcoes": sorted((set(cores) | cat_sku) - {x["cor"]})})
+    out.sort(key=lambda d: (d["sku"], d["cor"]))
+    return {"ok": True, "itens": out}
+
+
+def decidir_cor(sku, cor, acao, para=""):
+    """acao: JUNTAR (cor e a mesma que 'para': o saldo vai para la e daqui pra frente entra la),
+    OUTRA (sao cores diferentes: nao pergunta de novo), EXCLUIR (nao trabalha mais: nunca mais entra)."""
+    sku, cor, para = (sku or "").upper().strip(), (cor or "").upper().strip(), (para or "").upper().strip()
+    acao = (acao or "").upper()
+    if not sku or not cor:
+        return {"ok": False, "erro": "dados invalidos"}
+    if acao == "EXCLUIR":
+        return marcar_sku(sku, cor, "EXCLUIDO")
+    with _lock, conn() as c:
+        if acao == "OUTRA":
+            outras = [para] if para else ["*"]
+            for o in outras:
+                c.execute("INSERT OR REPLACE INTO cor_ok VALUES(?,?,?,?)", (sku, cor, o, agora()))
+            return {"ok": True}
+        if acao != "JUNTAR" or not para or para == cor:
+            return {"ok": False, "erro": "escolha a cor certa"}
+        c.execute("INSERT OR REPLACE INTO cor_alias VALUES(?,?,?,?)", (sku, cor, para, agora()))
+        c.execute("UPDATE cor_alias SET para=? WHERE sku=? AND para=?", (para, sku, cor))   # sem corrente A->B->C
+        n = c.execute("UPDATE estoque_mov SET cor=? WHERE sku=? AND cor=?", (para, sku, cor)).rowcount
+        c.execute("DELETE FROM sku_status WHERE sku=? AND cor=?", (sku, cor))
+    _carregar_cor_alias()
+    return {"ok": True, "movidos": n}
 
 
 def _ja_no_snapshot(c, item):
@@ -3485,6 +3611,9 @@ def xbz_retiradas(aplicar=True):
             if c.execute("SELECT 1 FROM estoque_mov WHERE ref=?", (ref,)).fetchone():
                 continue
             sku, cn = _xbz_item_para_estoque(c, x)
+            if _excluido(c, sku, cn):
+                ignorados += 1
+                continue
             try:
                 em = datetime.fromisoformat(quando).replace(tzinfo=BR).astimezone(timezone.utc).isoformat()
             except Exception:
@@ -3663,7 +3792,10 @@ def sugestao_compra(dias=None):
         habitos = {}
         chaves = set(vendas) | {k for k, v in est.items() if v["pendente_hoje"]} | \
             {k for k, v in est.items() if k[0] in ESTRATEGICOS and v.get("conhecido")}
+        exc = {(r[0], r[1]) for r in c.execute("SELECT sku, cor FROM sku_status WHERE status='EXCLUIDO'")}
         for sku, cor in sorted(chaves):
+            if (sku, cor) in exc or (sku, "") in exc:
+                continue
             if not cor and (est.get((sku, ""), {}).get("sem_cor") or not est.get((sku, ""), {}).get("conhecido")):
                 continue
             v7, v30 = vendas.get((sku, cor), (0, 0))

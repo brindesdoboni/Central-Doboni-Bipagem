@@ -67,6 +67,7 @@ dialog.largo{max-width:1100px}.dbody{max-height:65vh;overflow:auto}textarea{widt
 <p class="mut">Entra: notas da XBZ (contas da Beatriz e Lucmarix). Sai: quando a etiqueta é bipada na separação (uma vez só). Etiqueta que chegou e ainda não foi separada fica "reservada". Comprar = <span id="esDias"></span> dias de vendas (média dos últimos 15 dias) menos o que tem.</p>
 <p id="esXbz"></p>
 <div id="esRet" style="background:#eef6ff;border-radius:10px;padding:8px 12px;margin:6px 0"></div>
+<div id="esCores" style="background:#fff7ed;border-radius:10px;padding:8px 12px;margin:6px 0;display:none"></div>
 <div class="row"><input id="esBusca" placeholder="Filtrar SKU, cor ou nome" oninput="renderEst()"><label><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só o que precisa comprar / alerta</label><b id="esTotal" style="margin-left:auto"></b></div>
 <div class="row" style="margin:8px 0"><button onclick="folhaCont(0)"><b>📄 Folha de contagem (PDF)</b></button><button onclick="folhaCont(1)">📄 Contagem às cegas (sem o saldo)</button><button onclick="window.open('/contagem','_blank')"><b>📱 Contar pelo celular</b></button><span class="mut">Por prateleira → SKU → cor, 2 colunas por folha. Usa o filtro acima se preenchido. Na tela que abrir, clique em "Imprimir / Salvar em PDF".</span></div>
 <details style="margin:6px 0"><summary><b>Prateleiras</b> <span id="prQtd" class="mut"></span></summary>
@@ -175,7 +176,20 @@ async function addPau(){if(!pHora.value)return alert("Informe a hora");await fet
 async function durPau(id,v){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,duracao:+v||15})});carregarPau()}
 const R$=v=>v==null?"<span style='color:#d7263d'>sem preço</span>":"R$ "+Number(v).toFixed(2).replace(".",",");
 let MT=null,ES=null;
-function abrirEst(){dlgEst.showModal();carregarEst();contarPrat();carregarRet()}
+function abrirEst(){dlgEst.showModal();carregarEst();contarPrat();carregarRet();carregarCores()}
+async function carregarCores(){try{const r=await (await fetch("/api/estoque/cores")).json(),b=$("esCores");
+ if(!r.itens.length){b.style.display="none";return}b.style.display="block";
+ b.innerHTML=`<details open><summary><b>🎨 Cores para conferir (${r.itens.length})</b> — cores que não reconheci ou que parecem a mesma. Decida uma vez e eu não pergunto mais.</summary>
+ <div style="overflow-x:auto"><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Por quê</th><th>É a mesma que…</th><th></th></tr>`+
+ r.itens.map((x,i)=>`<tr><td><b>${esc(x.sku)}</b></td><td>${esc(x.cor)}</td><td>${x.saldo}</td><td class="mut">${esc(x.motivos.join(" · "))}</td>
+  <td><select id="cj${i}"><option value="">— escolha —</option>${x.opcoes.map(o=>`<option ${x.parecidas[0]===o?"selected":""}>${esc(o)}</option>`).join("")}</select> <button onclick="decCor(${i},'JUNTAR')">Juntar</button></td>
+  <td style="white-space:nowrap"><button onclick="decCor(${i},'OUTRA')">É outra cor</button> <button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d">Excluir</button></td></tr>`).join("")+`</table></div></details>`;
+ window.__CORES=r.itens}catch(e){}}
+async function decCor(i,acao){const x=__CORES[i],para=acao==="JUNTAR"?$("cj"+i).value:(acao==="OUTRA"?"":"");
+ if(acao==="JUNTAR"&&!para)return alert("Escolha com qual cor juntar");
+ if(acao==="JUNTAR"&&!confirm(`Juntar ${x.sku} ${x.cor} em ${para}? O saldo vai para ${para} e daqui pra frente entra em ${para}.`))return;
+ if(acao==="EXCLUIR"&&!confirm(`Excluir ${x.sku} ${x.cor}? Ela não entra mais em nada (retirada, compra, lista).`))return;
+ const r=await POST("/api/estoque/cor",{sku:x.sku,cor:x.cor,acao,para});if(!r.ok)return alert(r.erro||"erro");carregarCores();carregarEst()}
 async function carregarRet(){try{const r=await (await fetch("/api/xbz/retiradas")).json(),s=r.status||{};
  $("esRet").innerHTML=`<b>📥 Retiradas da XBZ → estoque</b> (Minha XBZ, com cor, a partir de ${esc(r.desde.split("-").reverse().join("/"))}) `+
   (r.configurado?`· última leitura: ${s.ultima?hora(s.ultima):"ainda não leu"} ${s.ok===false?`<b style="color:#d7263d">${esc(s.erro)}</b>`:""} <button onclick="lerRet()">Ler agora</button>`:
