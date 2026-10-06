@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Central Boni - Bipagem da producao. Python puro (sem dependencias). SQLite em volume."""
 import csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -483,7 +484,49 @@ def _voz_de(codigo):
         return c.execute("SELECT voz FROM colaboradores WHERE id=?", (r["id"],)).fetchone()[0]
 
 
+# ---- "meus bipes": o computador da mesa de cada operador mostra so o que ELE bipou (o leitor sem fio manda para o PC
+# central). Fica so na memoria: os ultimos bipes, com a mesma resposta que o PC central recebeu.
+_feed = deque(maxlen=3000)
+_feed_id = [0]
+_feed_lock = threading.Lock()
+
+
+def _feed_add(posto, codigo, operador, leitor, r):
+    quem = norm(codigo) if r.get("tipo") == "operador" else norm(operador)
+    if not quem:
+        return
+    it = r.get("item") or {}
+    with _feed_lock:
+        _feed_id[0] += 1
+        _feed.append({"id": _feed_id[0], "em": datetime.now(BR).strftime("%H:%M:%S"), "op": quem,
+                      "posto": (posto or "").upper(), "leitor": leitor or "", "codigo": norm(codigo),
+                      "tipo": r.get("tipo"), "msg": r.get("msg"), "fazer": r.get("fazer"), "evento": r.get("evento"),
+                      "voz": r.get("voz"), "colaborador": r.get("colaborador"),
+                      "item": {k: it.get(k) for k in ("sku", "cor", "nomes", "fonte", "etiqueta", "pedido", "canal")} if it else None})
+
+
+def meus_bipes(op, desde=None):
+    """Bipes do operador depois do id 'desde'. Sem 'desde': so devolve onde a fila esta (nao mostra bipe antigo)."""
+    op = norm(op)
+    with conn() as c:
+        col = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
+    with _feed_lock:
+        ultimo = _feed_id[0]
+        L = [dict(x) for x in _feed if x["id"] > desde and x["op"] == op] if desde is not None and desde <= ultimo else []
+    return {"ok": bool(col), "nome": col[0] if col else "", "ultimo": ultimo, "bipes": L[-30:]}
+
+
 def bipar(posto, codigo, operador, modo, leitor=""):
+    r = _bipar_resp(posto, codigo, operador, modo, leitor)
+    if r.get("tipo") != "ignorado":
+        try:
+            _feed_add(posto, codigo, operador, leitor, r)
+        except Exception as e:
+            print("feed:", e, flush=True)
+    return r
+
+
+def _bipar_resp(posto, codigo, operador, modo, leitor=""):
     """Devolve tambem 'colaborador' (nome de quem bipou) e 'evento' (para cada coisa tocar um som diferente)."""
     if norm(codigo) and _leitura_repetida(posto, codigo, operador, leitor):
         return {"tipo": "ignorado", "evento": "ignorado", "msg": "Leitura repetida ignorada", "ignorado": True}
@@ -2362,6 +2405,22 @@ class H(BaseHTTPRequestHandler):
                 return self._envia(200, dev_orientacao(q.get("id") or 0))
             if p == "/api/devolucoes/aprendizado":
                 return self._envia(200, {"ok": True, "motivos": dev_aprendizado()})
+        if p == "/meus":
+            return self._pagina("meus.html")
+        if p == "/api/bipes/pessoas":
+            if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
+                return self._envia(403, {"ok": False, "erro": "chave do posto invalida"})
+            with conn() as c:
+                return self._envia(200, {"ok": True, "pessoas": [{"nome": r[0], "codigo": r[1]} for r in
+                                         c.execute("SELECT nome, codigo FROM colaboradores WHERE ativo=1 ORDER BY nome")]})
+        if p == "/api/bipes/meus":
+            if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
+                return self._envia(403, {"ok": False, "erro": "chave do posto invalida"})
+            try:
+                desde = int(q["desde"]) if q.get("desde", "") != "" else None
+            except ValueError:
+                desde = None
+            return self._envia(200, meus_bipes(q.get("op") or "", desde))
         if p == "/api/pausas":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
                 return self._envia(403, {"erro": "sem acesso"})

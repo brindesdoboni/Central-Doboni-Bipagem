@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meus bipes - Central Boni</title>
+<style>
+:root{--ok:#168c46;--av:#d68c00;--er:#cd1e32}
+body{margin:0;background:#111;color:#fff;font:16px "Segoe UI",Arial,sans-serif}
+header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 16px;background:#1d1f27}
+header b{font-size:20px}select,button{font:inherit;padding:8px 12px;border-radius:8px;border:0}
+button{background:#1d4ed8;color:#fff;font-weight:bold;cursor:pointer}
+#st{margin-left:auto;font-size:14px;color:#9ca3af}
+#ini{max-width:520px;margin:40px auto;padding:0 16px;text-align:center}
+#ini select{width:100%;font-size:22px;margin:14px 0}#ini button{font-size:22px;width:100%;padding:14px}
+#pilha{padding:12px 16px;display:flex;flex-direction:column;gap:8px}
+.c{border-radius:12px;padding:10px 16px;border-left:12px solid #0003}
+.c .cab{font-size:14px;font-weight:bold;opacity:.9}.c .m{font-size:24px;font-weight:bold;margin:2px 0}
+.c .d{font-size:15px;white-space:pre-line}.c .f{margin-top:6px;background:#78000f;color:#ffeb3b;font-weight:bold;padding:6px 10px;border-radius:8px}
+.c.velho{opacity:.55}.c.velho .m{font-size:18px}
+.c.erro .m{font-size:30px}
+#vazio{color:#9ca3af;padding:20px 16px}
+</style></head><body>
+<header><b>🔵 Meus bipes</b><span id="quem"></span><button id="troca" style="display:none;background:#374151">Trocar pessoa</button><span id="st"></span></header>
+<div id="ini"><h2>De quem são os bipes desta tela?</h2><p>Aparecem aqui só os bipes da pessoa escolhida, na hora, com o som dela. O computador central continua mostrando todos.</p>
+<select id="sel"><option value="">carregando…</option></select><button id="ok">Começar</button><p id="err" style="color:#f87171"></p></div>
+<div id="pilha" style="display:none"></div><div id="vazio" style="display:none">Esperando o primeiro bipe…</div>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},SV=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+let chave=L("chave"),meu=L("meu_op"),meuNome=L("meu_nome"),desde=null,ctx=null,lendo=false,qtd=0;
+function audio(){try{ctx=ctx||new AudioContext();if(ctx.state==="suspended")ctx.resume()}catch(e){}return ctx}
+// um som diferente para cada coisa: [frequencia, ms] (0 = silencio)
+const TONS={operador:[[1047,90],[1319,180]],separado:[[660,110],[880,170]],gravacao:[[523,100],[659,100],[784,190]],
+ expedido:[[784,90],[988,90],[1175,90],[1568,240]],devolucao:[[880,140],[660,140],[440,240]],falta:[[330,200],[0,90],[330,200],[0,90],[330,200]],
+ desfazer:[[700,120],[500,200]],espera:[[1500,35]],repetido:[[600,140],[0,70],[600,140]],aviso:[[600,140],[0,70],[600,140]],ok:[[880,150]],
+ erro:[[440,220],[330,220],[440,220],[330,220],[220,600]]};
+// som de cada colaborador: melodia, timbre e tom proprios; verde = deu certo, amarelo = ja feito/aviso, vermelho = erro
+const VBASE=[523,587,659,698,784,880,988,1047],VOK=[[[0,90],[4,90],[7,170]],[[0,120],[null,40],[12,220]],[[7,80],[4,80],[7,80],[12,200]],[[0,60],[2,60],[4,60],[5,60],[7,200]],[[12,110],[7,110],[12,220]],[[0,90],[7,90],[0,90],[7,200]],[[4,140],[9,260]],[[0,70],[null,30],[0,70],[null,30],[12,220]]],VAV=[[[-5,130],[null,60],[-5,130]],[[-3,160],[-8,220]],[[-5,80],[null,50],[-5,80],[null,50],[-5,80]],[[-8,220],[-5,140]],[[-2,120],[null,50],[-7,200]],[[-5,100],[-4,100],[-5,200]],[[-10,180],[null,60],[-10,180]],[[-7,90],[-3,90],[-7,180]]],VER=[[[-12,220],[-17,220],[-12,220],[-17,220],[-24,550]],[[-12,130],[null,50],[-12,130],[null,50],[-12,130],[null,50],[-24,600]],[[-10,150],[-22,150],[-10,150],[-22,150],[-10,150],[-22,150],[-29,400]],[[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-24,400]],[[-7,300],[-19,600]],[[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120]],[[-12,180],[-15,180],[-18,180],[-24,500]],[[-14,250],[-12,250],[-14,250],[-24,500]]];
+function vozInfo(v){v=((v|0)%16+16)%16;return {m:v%8,t:Math.floor(v/8),b:VBASE[(v+Math.floor(v/8)*4)%8]}}
+function tonsVoz(v,tipo){const i=vozInfo(v),M=(tipo==="ok"?VOK:tipo==="aviso"?VAV:VER)[i.m];
+ return M.map(([s,d])=>[s===null?0:Math.round(i.b*Math.pow(2,s/12)),d])}
+function timbreVoz(v,tipo){return tipo==="erro"?"square":vozInfo(v).t?"sawtooth":"triangle"}
+function som(ev,voz,tipo){const a=audio();if(!a)return;let t=a.currentTime+.02;
+ const pv=voz!=null&&["ok","aviso","erro"].includes(tipo)&&!["operador","espera","desfazer"].includes(ev);if(pv)ev=tipo==="erro"?"erro":ev;
+ for(const [f,ms] of (pv?tonsVoz(voz,tipo):(TONS[ev]||TONS.erro))){const d=ms/1000;
+ if(f){const o=a.createOscillator(),g=a.createGain();o.type=pv?timbreVoz(voz,tipo):(ev==="erro"?"square":"triangle");o.frequency.value=f;o.connect(g);g.connect(a.destination);
+  g.gain.setValueAtTime(.0001,t);const vol=ev==="erro"?1:(pv&&o.type==="sawtooth"?.3:.45);g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
+ t+=d}}
+const SETOR={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",DEVOLUCAO:"DEVOLUÇÃO"};
+function api(u){return fetch(u,{headers:{"X-Chave":chave||""}}).then(async r=>{if(r.status===403){SV("chave","");chave=null;throw new Error("chave")}return r.json()})}
+async function pessoas(){if(!chave){chave=prompt("Chave do posto (fornecida pelo Lucas):")||"";SV("chave",chave)}
+ try{const d=await api("/api/bipes/pessoas");$("sel").innerHTML='<option value="">— escolha o seu nome —</option>'+d.pessoas.map(p=>`<option value="${esc(p.codigo)}">${esc(p.nome)}</option>`).join("");if(meu)$("sel").value=meu}
+ catch(e){$("err").textContent=e.message==="chave"?"Chave do posto inválida. Recarregue a página e digite de novo.":"Sem internet. Tentando de novo…";setTimeout(pessoas,3000)}}
+function comecar(cod,nome){meu=cod;meuNome=nome;SV("meu_op",cod);SV("meu_nome",nome);desde=null;audio();
+ $("ini").style.display="none";$("pilha").style.display="flex";$("vazio").style.display=qtd?"none":"block";$("troca").style.display="";$("quem").textContent="· "+nome;document.title="Bipes de "+nome}
+$("ok").onclick=()=>{const s=$("sel");if(!s.value){$("err").textContent="Escolha o seu nome.";return}comecar(s.value,s.options[s.selectedIndex].text)};
+$("troca").onclick=()=>{meu=null;$("ini").style.display="";$("pilha").style.display="none";$("vazio").style.display="none";$("troca").style.display="none";$("quem").textContent="";pessoas()};
+function mostra(b){qtd++;$("vazio").style.display="none";const it=b.item;
+ let det=it?`SKU ${it.sku||""}${it.cor?"  ·  "+it.cor:""}`+(it.nomes?`\nNome: ${it.nomes}${it.fonte?"  ·  Fonte: "+it.fonte:""}`:"")+`\nEtiqueta ${it.etiqueta||"-"}  ·  Pedido ${it.pedido||""}  ·  ${it.canal||""}`:(b.tipo==="erro"&&b.codigo?"Código "+b.codigo:"");
+ const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[b.tipo]||"var(--er)";
+ const el=document.createElement("div");el.className="c "+(b.tipo||"erro");el.style.background=cor;
+ el.innerHTML=`<div class="cab">${b.leitor?"LEITOR "+esc(b.leitor)+"  ·  ":""}${esc((b.colaborador||meuNome||"").toUpperCase())}  ·  ${esc(SETOR[b.posto]||b.posto||"")}  ·  ${esc(b.em)}</div>
+ <div class="m">${b.tipo==="erro"?"ERRO: ":""}${esc(b.msg)}</div>${det?`<div class="d">${esc(det)}</div>`:""}${b.fazer?`<div class="f">O QUE FAZER: ${esc(b.fazer)}</div>`:""}`;
+ const P=$("pilha");[...P.children].forEach(x=>x.classList.add("velho"));P.prepend(el);while(P.children.length>40)P.lastChild.remove();
+ som(b.tipo==="operador"?"operador":(b.evento||b.tipo),b.voz,b.tipo)}
+async function ler(){if(!meu||lendo)return;lendo=true;
+ try{const d=await api(`/api/bipes/meus?op=${encodeURIComponent(meu)}${desde==null?"":"&desde="+desde}`);
+  if(desde!=null)(d.bipes||[]).forEach(mostra);desde=d.ultimo;$("st").textContent=(!ctx||ctx.state!=="running"?"🔇 clique na tela para ligar o som · ":"")+"ligado · "+new Date().toLocaleTimeString("pt-BR")}
+ catch(e){$("st").textContent=e.message==="chave"?"chave do posto inválida (recarregue)":"sem internet…"}finally{lendo=false}}
+setInterval(ler,1000);
+document.addEventListener("click",audio);document.addEventListener("keydown",audio);
+if(meu&&meuNome&&chave){comecar(meu,meuNome)}else pessoas();
+</script></body></html>
