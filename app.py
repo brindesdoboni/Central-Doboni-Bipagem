@@ -56,6 +56,8 @@ def iniciar_db():
         c.execute("CREATE TABLE IF NOT EXISTS meta(chave TEXT PRIMARY KEY, valor TEXT)")
         if "excluido" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
             c.execute("ALTER TABLE colaboradores ADD COLUMN excluido INTEGER DEFAULT 0")
+        if "voz" not in [r[1] for r in c.execute("PRAGMA table_info(colaboradores)")]:
+            c.execute("ALTER TABLE colaboradores ADD COLUMN voz INTEGER")   # o "som" de cada um (0 a 15)
         if "envio" not in [r[1] for r in c.execute("PRAGMA table_info(itens)")]:
             c.execute("ALTER TABLE itens ADD COLUMN envio TEXT DEFAULT ''")
         cols_it = [r[1] for r in c.execute("PRAGMA table_info(itens)")]
@@ -444,6 +446,28 @@ def _auto_incluir(c, codigo, posto):
     return iid
 
 
+VOZES = 16
+
+
+def _voz_de(codigo):
+    """Cada colaborador tem o seu som (verde, amarelo e vermelho proprios). Numero fixo, escolhido na 1a vez:
+    o menor que ninguem da equipe esteja usando."""
+    cod = norm(codigo)
+    if not cod:
+        return None
+    with conn() as c:
+        r = c.execute("SELECT id, voz FROM colaboradores WHERE codigo=?", (cod,)).fetchone()
+    if not r:
+        return None
+    if r["voz"] is not None:
+        return r["voz"]
+    with _lock, conn() as c:
+        usados = {x[0] for x in c.execute("SELECT voz FROM colaboradores WHERE voz IS NOT NULL AND COALESCE(excluido,0)=0")}
+        livre = next((v for v in range(VOZES) if v not in usados), r["id"] % VOZES)
+        c.execute("UPDATE colaboradores SET voz=? WHERE id=? AND voz IS NULL", (livre, r["id"]))
+        return c.execute("SELECT voz FROM colaboradores WHERE id=?", (r["id"],)).fetchone()[0]
+
+
 def bipar(posto, codigo, operador, modo, leitor=""):
     """Devolve tambem 'colaborador' (nome de quem bipou) e 'evento' (para cada coisa tocar um som diferente)."""
     if norm(codigo) and _leitura_repetida(posto, codigo, operador, leitor):
@@ -460,6 +484,10 @@ def bipar(posto, codigo, operador, modo, leitor=""):
             quem = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1",
                              (norm(codigo) if r.get("tipo") == "operador" else norm(operador),)).fetchone()
         r["colaborador"] = quem[0] if quem else ""
+    try:
+        r["voz"] = _voz_de(codigo if r.get("tipo") == "operador" else operador)
+    except Exception:
+        r["voz"] = None
     return r
 
 
@@ -2152,7 +2180,11 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             return self._envia(200, historico(int(q.get("id", 0))))
         if p == "/api/colaboradores":
             with conn() as c:
-                return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM colaboradores WHERE COALESCE(excluido,0)=0 ORDER BY ativo DESC, nome")])
+                lst = [dict(r) for r in c.execute("SELECT * FROM colaboradores WHERE COALESCE(excluido,0)=0 ORDER BY ativo DESC, nome")]
+            for x in lst:
+                if x.get("voz") is None:
+                    x["voz"] = _voz_de(x["codigo"])
+            return self._envia(200, lst)
         if p == "/exportar.csv":
             return self._envia(200, exportar(q.get("de") or hoje, q.get("ate") or hoje), "text/csv; charset=utf-8",
                                {"Content-Disposition": f"attachment; filename=bipagem_{q.get('de') or hoje}.csv"})

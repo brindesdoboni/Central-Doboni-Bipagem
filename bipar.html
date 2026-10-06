@@ -39,7 +39,15 @@ const TONS={operador:[[1047,90],[1319,180]],separado:[[660,110],[880,170]],grava
  expedido:[[784,90],[988,90],[1175,90],[1568,240]],devolucao:[[880,140],[660,140],[440,240]],falta:[[330,200],[0,90],[330,200],[0,90],[330,200]],
  desfazer:[[700,120],[500,200]],espera:[[1500,35]],repetido:[[600,140],[0,70],[600,140]],aviso:[[600,140],[0,70],[600,140]],ok:[[880,150]],
  erro:[[440,220],[330,220],[440,220],[330,220],[220,600]]};
-function som(ev){const a=audio();if(!a)return;let t=a.currentTime+.02;for(const [f,ms] of (TONS[ev]||TONS.erro)){const d=ms/1000;
+// som de cada colaborador: cada um tem o seu verde (deu certo), amarelo (ja feito/aviso) e vermelho (erro)
+const VBASE=[523,587,659,698,784,880,988,1047];
+function tonsVoz(v,tipo){v=((v|0)%16+16)%16;const b=VBASE[v%8],e=Math.floor(v/8)%2,R=x=>Math.round(x);
+ if(tipo==="ok")return e?[[b,140],[0,40],[R(b*1.5),220]]:[[b,90],[R(b*1.26),90],[R(b*1.5),170]];
+ if(tipo==="aviso")return e?[[R(b*.84),160],[R(b*.63),220]]:[[R(b*.75),130],[0,60],[R(b*.75),130]];
+ return e?[[R(b/2),130],[0,50],[R(b/2),130],[0,50],[R(b/2),130],[0,50],[R(b/4),600]]:[[R(b/2),220],[R(b*.375),220],[R(b/2),220],[R(b*.375),220],[R(b/4),550]]}
+function som(ev,voz,tipo){const a=audio();if(!a)return;let t=a.currentTime+.02;
+ const pv=voz!=null&&["ok","aviso","erro"].includes(tipo)&&!["operador","espera","desfazer"].includes(ev);if(pv)ev=tipo==="erro"?"erro":ev;
+ for(const [f,ms] of (pv?tonsVoz(voz,tipo):(TONS[ev]||TONS.erro))){const d=ms/1000;
  if(f){const o=a.createOscillator(),g=a.createGain();o.type=ev==="erro"?"square":"triangle";o.frequency.value=f;o.connect(g);g.connect(a.destination);
   g.gain.setValueAtTime(.0001,t);const vol=ev==="erro"?1:.45;g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}
  t+=d}}
@@ -50,8 +58,8 @@ function cartao(tipo,msg,det,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var
  el.innerHTML=`<div class="q"><span class="nome">👤 ${esc((quem||"SEM CRACHÁ").toUpperCase())}</span><span class="hr">${esc(POSTOS[posto]||"")} · ${new Date().toLocaleTimeString("pt-BR")}</span></div><div class="m">${tipo==="erro"?"⛔ ":""}${esc(msg)}</div>${fazer?`<div class="f">O QUE FAZER: ${esc(fazer)}</div>`:""}${det?`<div class="d">${det}</div>`:""}`;
  const p=$("pilha");if(novo){p.querySelectorAll(".card.err").forEach(x=>x.classList.add("menor"));p.appendChild(el)}const lim=innerHeight*.62,alt=()=>[...p.children].reduce((t,c)=>t+c.offsetHeight+8,0);while(alt()>lim&&p.children.length>1){const x=[...p.children].find(c=>c!==el&&!c.classList.contains("err"))||p.firstChild;p.removeChild(x)}
  el._t=setTimeout(()=>{el.classList.add("sai");setTimeout(()=>el.remove(),400)},tipo==="erro"?8000:tipo==="espera"?10000:5000);return el}
-function tela(tipo,msg,det,ev,quem,fazer,el){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
- $("tela").style.background=cor;som(ev||(tipo==="erro"?"erro":tipo));
+function tela(tipo,msg,det,ev,quem,fazer,el,voz){const cor={ok:"var(--ok)",aviso:"var(--av)",erro:"var(--er)",operador:"#1d4ed8"}[tipo]||"var(--bg)";
+ $("tela").style.background=cor;if(tipo==="operador"&&voz!=null){som("operador");setTimeout(()=>som("ok",voz,"ok"),350)}else som(ev||(tipo==="erro"?"erro":tipo),voz,tipo);
  cartao(tipo,msg,det,quem||(op&&op.nome),fazer,el);
  clearTimeout(tela.t);tela.t=setTimeout(()=>{$("tela").style.background="var(--bg)"},tipo==="erro"?4000:1500)}
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
@@ -89,7 +97,7 @@ async function enviar(codigo){
   if(i)det=`SKU <b>${esc(i.sku)}</b>${i.cor?" · "+esc(i.cor):""}`+
     (i.nomes?` · Nome: <b>${esc(i.nomes)}</b>`+(i.fonte?` · Fonte: <b>${esc(i.fonte)}</b>`:""):"")+
     ` · Etiqueta <b>${esc(i.etiqueta||"-")}</b> · Pedido ${esc(i.pedido)} · ${esc(i.canal)}`;
-  tela(d.tipo,d.msg,det,d.evento,d.colaborador,d.fazer,el);
+  tela(d.tipo,d.msg,det,d.evento,d.colaborador,d.fazer,el,d.voz);
  }catch(e){tela("erro","SEM INTERNET - bipe NÃO registrado","",null,null,"Confira a internet do computador e bipe a etiqueta de novo.",el)}
  finally{if(fim){fim();crachaPend=null}}}
 let crachaPend=null;
