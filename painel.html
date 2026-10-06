@@ -26,6 +26,11 @@ dialog.tela .estab table{width:100%;font-size:13px}
 dialog.tela .estab th{position:sticky;top:var(--topo,64px);z-index:4;background:var(--card);box-shadow:0 1px 0 var(--bd);white-space:nowrap;font-size:12px}
 dialog.tela .estab td,dialog.tela .estab th{padding:5px 6px}
 dialog.tela #esTab{scroll-margin-top:var(--topo,64px)}
+#esCores .cfl{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+#esCores .cfc{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:8px 10px}
+#esCores .cft{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}#esCores .cfcor{font-weight:bold;color:#b45309}
+#esCores .cfa{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}#esCores .cfa select{max-width:100%;min-width:160px}
+#esCores .cfsep{flex:0 0 12px}
 dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-radius:10px;padding:9px 16px;font-weight:bold;cursor:pointer}.dbody{max-height:65vh;overflow:auto}textarea{width:100%;min-height:140px;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font:13px monospace}
 .mut{color:var(--mut);font-size:13px}
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;max-width:min(380px,90vw)}
@@ -196,15 +201,16 @@ async function carregarCores(){try{const r=await (await fetch("/api/estoque/core
  const fora=r.fora||[];if(!r.itens.length&&!fora.length){b.style.display="none";return}b.style.display="block";
  const opt=(x,o)=>`<option value="${esc(o.cor)}" ${x.sugestao===o.cor?"selected":""}>${esc(o.cor)}${o.nosso?` (nosso: ${o.saldo})`:""}</option>`;
  b.innerHTML=(r.itens.length?`<details open><summary><b>🎨 Cores para conferir (${r.itens.length})</b> — juntar soma o saldo das duas (o que contamos + o que veio da XBZ) na cor escolhida. Use o nome da XBZ (vem marcado).</summary>
- <div style="overflow-x:auto"><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Por quê</th><th>É a mesma que…</th><th></th></tr>`+
+ <div class="cfl">`+
  r.itens.map((x,i)=>{const xb=x.opcoes.filter(o=>o.xbz),ns=x.opcoes.filter(o=>!o.xbz);
-  return `<tr><td><b>${esc(x.sku)}</b></td><td>${esc(x.cor)}${x.nome_xbz?' <span title="nome usado pela XBZ" style="font-size:11px;background:#dbeafe;border-radius:6px;padding:0 4px">XBZ</span>':""}${x.ja_juntou.length?`<br><span class="mut" style="font-size:12px">já juntou aqui: ${esc(x.ja_juntou.join(", "))}</span>`:""}</td><td>${x.saldo}</td>
-  <td class="mut">${esc(x.motivos.join(" · "))}${x.cores_xbz.length?`<br><span style="font-size:12px">XBZ tem: ${esc(x.cores_xbz.join(", "))}</span>`:""}</td>
-  <td style="white-space:nowrap"><select id="cj${i}" onchange="if(this.value==='__outra')digCor(${i})"><option value="">— escolha —</option>`+
+  return `<div class="cfc"><div class="cft"><b>${esc(x.sku)}</b> <span class="cfcor">${esc(x.cor)}</span>${x.nome_xbz?' <span title="nome usado pela XBZ" style="font-size:11px;background:#dbeafe;border-radius:6px;padding:0 4px">XBZ</span>':""}
+   <span class="mut">saldo <b>${x.saldo}</b></span>${x.ja_juntou.length?` <span class="mut">· já juntou aqui: ${esc(x.ja_juntou.join(", "))}</span>`:""}</div>
+  <div class="mut" style="font-size:12px">${esc(x.motivos.join(" · "))}${x.cores_xbz.length?` · <b>XBZ tem:</b> ${esc(x.cores_xbz.join(", "))}`:""}</div>
+  <div class="cfa"><span>É a mesma que</span><select id="cj${i}" onchange="if(this.value==='__outra')digCor(${i})"><option value="">— escolha —</option>`+
   (xb.length?`<optgroup label="Variações da XBZ">${xb.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
   (ns.length?`<optgroup label="Só no nosso estoque">${ns.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
-  `<option value="__outra">✏️ Digitar outra cor…</option></select> <button onclick="decCor(${i},'JUNTAR')">Juntar</button></td>
-  <td style="white-space:nowrap"><button onclick="decCor(${i},'OUTRA')">É outra cor</button> <button onclick="decCor(${i},'ARQUIVAR')" title="Some da lista e da compra; dá para incluir de novo">Arquivar</button> <button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d" title="Não trabalha mais; dá para incluir de novo">Excluir</button></td></tr>`}).join("")+`</table></div></details>`:"")+
+  `<option value="__outra">✏️ Digitar outra cor…</option></select><button onclick="decCor(${i},'JUNTAR')"><b>Juntar</b></button>
+  <span class="cfsep"></span><button onclick="decCor(${i},'OUTRA')">É outra cor</button><button onclick="decCor(${i},'ARQUIVAR')" title="Some da lista e da compra; dá para incluir de novo">Arquivar</button><button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d" title="Não trabalha mais; dá para incluir de novo">Excluir</button></div></div>`}).join("")+`</div></details>`:"")+
  (fora.length?`<details><summary>🗄️ Excluídas / arquivadas (${fora.length}) — se aparecer uma parecida depois, inclua de novo e junte</summary><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Como</th><th>Desde</th><th></th></tr>`+
   fora.map((f,i)=>`<tr><td><b>${esc(f.sku)}</b></td><td>${esc(f.cor||"(produto inteiro)")}</td><td>${Math.round(f.saldo)}</td><td>${f.status==="EXCLUIDO"?"excluída":"arquivada"}</td><td class="mut">${esc((f.em||"").slice(0,10).split("-").reverse().join("/"))}</td><td><button onclick="inclCor(${i})">Incluir de novo</button></td></tr>`).join("")+`</table></details>`:"");
  window.__CORES=r.itens;window.__FORA=fora}catch(e){}}
