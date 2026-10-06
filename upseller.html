@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UpSeller → Central</title>
+<style>
+body{font:16px Arial,sans-serif;margin:0;background:#f4f5f7;color:#1f2937}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:8px 0 4px}
+.box{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 3px #0001}
+.bm{display:inline-block;background:#ea580c;color:#fff;font-weight:bold;padding:12px 18px;border-radius:10px;text-decoration:none;cursor:grab}
+button{font:inherit;font-weight:bold;padding:12px 18px;border:0;border-radius:10px;background:#16a34a;color:#fff;cursor:pointer}
+button.cinza{background:#6b7280}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid #e5e7eb;padding:5px;text-align:left}
+.n{font-size:28px;font-weight:bold}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.g div{background:#f9fafb;border-radius:10px;padding:10px}.g span{display:block;font-size:13px;color:#6b7280}
+.err{color:#b91c1c;font-weight:bold}.ok{color:#15803d;font-weight:bold}
+ol li{margin:6px 0}
+</style></head><body><main>
+<h1>🔄 UpSeller → Operação</h1>
+<p>Deixa a operação igual ao UpSeller. Mexe só no que está <b>Aguardando</b> (sem bipe): tira o que não está mais no UpSeller e coloca o que falta. Separado, gravando, gravado e expedido ficam como estão.</p>
+
+<div class="box" id="estado">Carregando…</div>
+
+<div class="box" id="res" style="display:none"></div>
+
+<div class="box">
+<b>Como usar (todo dia, 1 clique)</b>
+<ol>
+<li>Arraste este botão para a barra de favoritos do Chrome: <a class="bm" id="bm" href="#">📥 UpSeller → Central</a></li>
+<li>Abra o UpSeller (já logado) e clique no favorito <b>📥 UpSeller → Central</b>.</li>
+<li>Esta página abre sozinha, mostra o que vai mudar e você confirma.</li>
+</ol>
+<label><input type="checkbox" id="auto"> Aplicar sozinho, sem perguntar (só se a conferência de segurança passar)</label>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hora=s=>s?new Date(s).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):"-";
+try{$("auto").checked=localStorage.getItem("ups_auto")==="1"}catch(e){}
+$("auto").onchange=()=>{try{localStorage.setItem("ups_auto",$("auto").checked?"1":"0")}catch(e){}};
+
+// favorito: roda no UpSeller, busca Em processo + Para enviar + Para retirada e manda para esta pagina
+const BM=`(async()=>{const C=${JSON.stringify(location.origin)};
+const av=t=>{let d=document.getElementById("__cb");if(!d){d=document.createElement("div");d.id="__cb";d.style.cssText="position:fixed;z-index:999999;top:12px;right:12px;background:#111;color:#fff;font:16px Arial;padding:14px 18px;border-radius:10px";document.body.appendChild(d)}d.textContent=t};
+if(!/(^|\\.)upseller\\.com$/.test(location.hostname)){av("Abra o UpSeller e clique de novo");return}
+const w=window.open(C+"/upseller#receber","central_upseller");let pronto=false,dados=null;
+addEventListener("message",e=>{if(e.origin!==C||!e.data)return;if(e.data.tipo==="pronto"){pronto=true;if(dados)w.postMessage(dados,C)}if(e.data.tipo==="recebido")av("✅ Enviado para a Central ("+dados.pedidos.length+" pedidos)")});
+av("Lendo pedidos do UpSeller…");
+async function todos(extra){let out=[],tot=0;for(let n=1;n<=40;n++){const r=await fetch("/api/order/index",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},credentials:"include",body:new URLSearchParams({timeType:"0",searchType:"0",searchValue:"",sortName:"1",sortValue:"1",isVoided:"0",pageNum:String(n),pageSize:"200",...extra}).toString()});const j=await r.json();if(j.code!==0||!j.data)throw new Error(j.msg||"UpSeller recusou");const l=j.data.list||[];tot=j.data.total||0;out=out.concat(l);if(!l.length||out.length>=tot)break}if(out.length<tot)throw new Error("veio incompleto");return out}
+try{const L=[];for(const s of ["in_process","to_ship","to_pickup"])for(const o of await todos({orderState:s}))L.push({e:s,id:o.orderId,n:o.orderNumber,t:o.trackingNumber||"",p:o.platform,l:o.shopName,i:(o.orderItemList||[]).map(x=>[x.productSku,x.variationSku,x.productAttr,x.productCount])});
+dados={tipo:"upseller",pedidos:L,em:new Date().toISOString()};av("Mandando "+L.length+" pedidos para a Central…");if(pronto)w.postMessage(dados,C)}catch(err){av("❌ "+err.message)}})()`;
+$("bm").href="javascript:"+encodeURIComponent(BM);
+$("bm").onclick=e=>{e.preventDefault();alert("Arraste o botão para a barra de favoritos. Depois clique nele com o UpSeller aberto.")};
+
+let PED=null;
+async function estado(){try{const r=await fetch("/api/painel?data="+new Date(Date.now()-3*3600e3).toISOString().slice(0,10));const d=await r.json();const u=d.upseller;
+ $("estado").innerHTML=u?`Última leitura do UpSeller: <b>${hora(u.em)}</b> — ${u.pedidos} pedidos em aberto ${u.fresco?"":'<span class="err">(desatualizado: clique no favorito no UpSeller)</span>'}<br>`+Object.entries(u.por_estado||{}).map(([k,v])=>`${esc(k)}: <b>${v}</b>`).join(" · "):"Ainda não leu o UpSeller. Use o favorito abaixo."}catch(e){$("estado").textContent="Não consegui ler o painel."}}
+estado();
+
+async function mandar(aplicar,forcar){const r=await fetch("/api/upseller/espelho",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pedidos:PED,aplicar,forcar:!!forcar})});return r.json()}
+function mostra(d,aplicado){const R=$("res");R.style.display="block";
+ if(!d.ok&&d.sair==null){R.innerHTML=`<p class="err">❌ ${esc(d.erro)}</p>`;return}
+ R.innerHTML=(d.ok?"":`<p class="err">⚠️ ${esc(d.erro)}</p>`)+(aplicado?`<p class="ok">✅ Operação atualizada com o UpSeller.</p>`:"<p><b>O que vai mudar:</b></p>")+
+ `<div class="g"><div><span>Pedidos no UpSeller</span><b class="n">${d.pedidos_upseller}</b></div><div><span>Aguardando (antes)</span><b class="n">${d.aguardando_antes}</b></div>
+ <div><span>Saem da conta (não estão mais no UpSeller)</span><b class="n">${d.sair}</b></div><div><span>Entram (pedidos que faltavam)</span><b class="n">${d.novos_pedidos}</b></div>
+ <div><span>Voltam (estavam escondidas, mas ainda estão no UpSeller)</span><b class="n">${d.voltar}</b></div></div>`+
+ (d.exemplos_sair&&d.exemplos_sair.length?`<p><b>Exemplos que saem:</b></p><table><tr><th>Pedido</th><th>Loja</th><th>Produto</th></tr>${d.exemplos_sair.map(x=>`<tr><td>${esc(x.pedido)}</td><td>${esc(x.loja)}</td><td>${esc(x.sku)} ${esc(x.cor)}</td></tr>`).join("")}</table>`:"")+
+ (d.exemplos_novos&&d.exemplos_novos.length?`<p><b>Exemplos que entram:</b></p><table><tr><th>Pedido</th><th>Loja</th><th>No UpSeller</th></tr>${d.exemplos_novos.map(x=>`<tr><td>${esc(x.pedido)}</td><td>${esc(x.loja)}</td><td>${esc(x.estado)}</td></tr>`).join("")}</table>`:"")+
+ (aplicado?`<p><a href="/painel">Voltar ao painel</a></p>`:`<p style="margin-top:14px"><button id="ap">Aplicar na operação</button> ${d.ok?"":'<button class="cinza" id="apf">Aplicar mesmo assim</button>'}</p>`);
+ if(!aplicado){const b=$("ap");if(b){b.disabled=!d.ok;b.onclick=async()=>{b.disabled=true;mostra(await mandar(true),true);estado()}}
+  const f=$("apf");if(f)f.onclick=async()=>{if(!confirm("A lista parece incompleta. Aplicar mesmo assim?"))return;f.disabled=true;mostra(await mandar(true,true),true);estado()}}}
+
+addEventListener("message",async e=>{if(!/^https:\/\/([a-z0-9-]+\.)*upseller\.com$/.test(e.origin)||!e.data||e.data.tipo!=="upseller")return;
+ PED=e.data.pedidos||[];try{e.source.postMessage({tipo:"recebido"},e.origin)}catch(_){}
+ $("res").style.display="block";$("res").textContent="Conferindo "+PED.length+" pedidos…";
+ const d=await mandar(false);
+ if(d.ok&&$("auto").checked){mostra(await mandar(true),true);estado()}else mostra(d,false)});
+if(window.opener){let n=0;const t=setInterval(()=>{if(PED||n++>120)return clearInterval(t);try{window.opener.postMessage({tipo:"pronto"},"*")}catch(_){}},1000)}
+</script></body></html>

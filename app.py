@@ -97,6 +97,7 @@ def _iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS shopee_lojas(shop_id INTEGER PRIMARY KEY, nome TEXT, access_token TEXT,
                      refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
                      expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
+        c.execute("CREATE TABLE IF NOT EXISTS upseller_pedidos(codigo TEXT PRIMARY KEY, pedido TEXT, estado TEXT, loja TEXT, em TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
         # cores: "e a mesma que" (vira uma so) e "sao cores diferentes" (nao pergunta de novo)
         c.execute("CREATE TABLE IF NOT EXISTS cor_alias(sku TEXT, de TEXT, para TEXT, em TEXT, PRIMARY KEY(sku, de))")
@@ -696,6 +697,7 @@ def limpar_etiquetas(aplicar=True):
         vivos = [dict(r) for r in c.execute("SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND COALESCE(lote,'')<>'DEVOLUCAO'")]
         nev = {r[0]: (r[1], r[2]) for r in c.execute("SELECT item_id, COUNT(*), MAX(em) FROM eventos WHERE desfeito=0 GROUP BY item_id")}
         canc = _ids_cancelados(c)
+        no_ups = _codigos_upseller_frescos(c)
         saiu = {r[0] for r in c.execute("""SELECT k.item_id FROM codigos k JOIN shopee_pedidos s ON s.order_sn=k.codigo
                                            WHERE s.status IN ('SHIPPED','TO_CONFIRM_RECEIVE','COMPLETED')""")}
     ordem = {e: n for n, e in enumerate(ETAPAS)}
@@ -750,7 +752,8 @@ def limpar_etiquetas(aplicar=True):
             enc.append((i["id"], "cancelado na Shopee", False))
         elif i["id"] in saiu or i["despachado_em"]:
             enc.append((i["id"], "Shopee: ja enviado (saiu sem o bipe da expedicao)", True))
-        elif (i["criado_em"] or "") < lim and (nev.get(i["id"], (0, ""))[1] or "") < lim and not i["falta_material"]:
+        elif (i["criado_em"] or "") < lim and (nev.get(i["id"], (0, ""))[1] or "") < lim and not i["falta_material"] \
+                and i["id"] not in no_ups:
             enc.append((i["id"], f"parada ha mais de {ANTIGO_DIAS} dias sem bipe", True))
     res = {"duplicadas": len(dup), "encerradas": len(enc),
            "motivos": {m: sum(1 for _, mm, _ in enc if mm == m) for m in {m for _, m, _ in enc}}}
@@ -771,6 +774,152 @@ def limpar_etiquetas(aplicar=True):
     _op_cache["v"] = None
     print(f"Limpeza: {len(dup)} duplicadas juntadas, {len(enc)} encerradas", flush=True)
     return res
+
+
+# ------------------------------------------------------------------ espelho do UpSeller
+# O UpSeller e a verdade do que ainda esta para sair (Em processo + Para enviar + Para retirada).
+# A Central so mexe no que esta AGUARDANDO (sem nenhum bipe):
+#   - AGUARDANDO que nao esta mais no UpSeller (ja saiu, cancelou) -> sai da conta (encerrada, volta se bipar);
+#   - pedido do UpSeller que a Central nao tem -> entra como AGUARDANDO;
+#   - AGUARDANDO que tinha saido da conta (antiga) mas ainda esta no UpSeller -> volta.
+# Separado, gravando, gravado e expedido ficam como estao.
+UPSELLER_ESTADOS = {"in_process": "Em processo", "to_ship": "Para enviar", "to_pickup": "Para retirada", "pickup_exception": "Para retirada"}
+UPSELLER_FRESCO_H = 36
+_RX_UPS_SEMPERS = re.compile(r"SEM\s+PERSONALIZ", re.I)
+_RX_UPS_PERS = re.compile(r"PERSONALIZ|NOME|PZD", re.I)
+_RX_UPS_NAOCOR = re.compile(r"PERSONALIZ|NOME|PZD|\bUND\b|UNIDADE|\b\d+\s*UN\b|^[PMGX]{1,2}\s*-", re.I)
+
+
+def _ups_canal(p):
+    p = (p or "").lower()
+    return "TIKTOK" if "tiktok" in p else "SHOPEE" if "shopee" in p else p.upper()
+
+
+def _ups_linha(x):
+    """[productSku, variationSku, productAttr, qtd] -> sku, cor, personalizado (None = nao diz)."""
+    sku_p, var, attr, qtd = (list(x) + [None] * 4)[:4]
+    sku = re.split(r"[-\s]", str(sku_p or var or "").strip())[0].upper()
+    partes = [a.strip() for a in str(attr or "").split(",") if a.strip()]
+    cor = partes[0].upper() if partes and not _RX_UPS_NAOCOR.search(partes[0]) else ""
+    t = f"{var or ''} {attr or ''}"
+    pers = False if _RX_UPS_SEMPERS.search(t) else True if _RX_UPS_PERS.search(t) else None
+    try:
+        q = max(1, int(qtd or 1))
+    except Exception:
+        q = 1
+    return sku, cor, pers, q, t.strip()
+
+
+def _ups_codigos(o):
+    return {norm(str(o.get(k) or "")) for k in ("id", "t", "n")} - {""}
+
+
+def upseller_espelho(pedidos, aplicar=False, forcar=False):
+    pedidos = [o for o in (pedidos or []) if isinstance(o, dict) and norm(str(o.get("id") or ""))]
+    if len(pedidos) < 20 and not forcar:
+        return {"ok": False, "erro": f"so vieram {len(pedidos)} pedidos do UpSeller; parece incompleto (nada foi mudado)"}
+    cod_ped = {}
+    for o in pedidos:
+        for k in _ups_codigos(o):
+            cod_ped[k] = o
+    canais = {_ups_canal(o.get("p")) for o in pedidos}
+    margem = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()   # etiqueta que acabou de chegar: deixa
+    with conn() as c:
+        cods = {}
+        for cod, iid in c.execute("SELECT codigo, item_id FROM codigos"):
+            cods.setdefault(iid, set()).add(cod)
+        itens = {r["id"]: dict(r) for r in c.execute("""SELECT id, pedido, rastreio, canal, loja, sku, cor, status, oculto, oculto_motivo,
+                                                         criado_em, lote FROM itens WHERE COALESCE(lote,'')<>'DEVOLUCAO'""")}
+    tem = set()        # pedidos do UpSeller que a Central ja tem (qualquer etapa)
+    vivos_ped = set()  # pedidos com etiqueta viva na Central
+    for iid, it in itens.items():
+        cs = cods.get(iid, set()) | {norm(it["pedido"]), norm(it["rastreio"])}
+        ped = next((cod_ped[k]["id"] for k in cs if k in cod_ped), None)
+        it["_ups"] = ped
+        if ped:
+            tem.add(ped)
+            if not it["oculto"]:
+                vivos_ped.add(ped)
+    sair, voltar = [], []
+    for iid, it in itens.items():
+        if it["status"] != "AGUARDANDO":
+            continue
+        canal = (it["canal"] or "").upper() or canal_por_codigo(it["pedido"], it["rastreio"])[0]
+        canal = "TIKTOK" if "TIKTOK" in canal else "SHOPEE" if "SHOPEE" in canal else canal
+        if not it["oculto"] and not it["_ups"] and canal in canais and (it["criado_em"] or "") < margem:
+            sair.append(it)
+        elif it["oculto"] == 2 and it["_ups"] and it["_ups"] not in vivos_ped and "cancel" not in (it["oculto_motivo"] or "").lower():
+            voltar.append(it)
+            vivos_ped.add(it["_ups"])
+    novos = [o for o in pedidos if o["id"] not in tem]
+    vivos_ag = sum(1 for it in itens.values() if it["status"] == "AGUARDANDO" and not it["oculto"])
+    est = {}
+    for o in pedidos:
+        e = UPSELLER_ESTADOS.get(o.get("e"), o.get("e") or "?")
+        est[e] = est.get(e, 0) + 1
+    res = {"ok": True, "pedidos_upseller": len(pedidos), "por_estado": est, "aguardando_antes": vivos_ag,
+           "sair": len(sair), "voltar": len(voltar), "novos_pedidos": len(novos),
+           "novas_etiquetas": sum(max(1, len(o.get("i") or [])) for o in novos),
+           "exemplos_sair": [{"pedido": i["pedido"], "loja": i["loja"], "sku": i["sku"], "cor": i["cor"]} for i in sair[:15]],
+           "exemplos_novos": [{"pedido": o["id"], "loja": o.get("l"), "estado": UPSELLER_ESTADOS.get(o.get("e"), o.get("e"))} for o in novos[:15]]}
+    if vivos_ag >= 30 and len(sair) > 0.5 * vivos_ag and not forcar:
+        res.update(ok=False, erro=f"ia tirar {len(sair)} de {vivos_ag} aguardando; parece lista incompleta (nada foi mudado)")
+        return res
+    if not aplicar:
+        return res
+    agora_ = agora()
+    with _lock, conn() as c:
+        for it in sair:
+            c.execute("UPDATE itens SET oculto=2, oculto_motivo=?, atualizado_em=? WHERE id=? AND status='AGUARDANDO' AND COALESCE(oculto,0)=0",
+                      ("nao esta mais no UpSeller (ja saiu ou foi cancelado)", agora_, it["id"]))
+        for it in voltar:
+            c.execute("UPDATE itens SET oculto=0, oculto_motivo='' WHERE id=? AND oculto=2", (it["id"],))
+        c.execute("DELETE FROM upseller_pedidos")
+        c.executemany("INSERT OR REPLACE INTO upseller_pedidos VALUES(?,?,?,?,?)",
+                      [(k, o["id"], o.get("e") or "", o.get("l") or "", agora_) for k, o in cod_ped.items()])
+        resumo = {"em": agora_, "pedidos": len(pedidos), "por_estado": est, "sair": len(sair), "voltar": len(voltar),
+                  "novos_pedidos": len(novos)}
+        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('upseller_resumo', ?)", (json.dumps(resumo, ensure_ascii=False),))
+    if novos:
+        lst = []
+        for o in novos:
+            canal = _ups_canal(o.get("p"))
+            linhas = o.get("i") or [[None, None, None, 1]]
+            for n, x in enumerate(linhas, 1):
+                sku, cor, pers, q, txt = _ups_linha(x)
+                it = {"pedido": o["id"], "rastreio": o.get("t") or "", "canal": canal, "loja": o.get("l") or "",
+                      "sku": sku, "cor": cor, "fonte": "upseller", "seq": f"ups{n}",
+                      "obs": ("UpSeller: " + txt)[:200], "codigos": [o.get("n") or ""],
+                      "envio": "TIKTOK" if canal == "TIKTOK" else "",
+                      "pecas": [{"sku": sku, "cor": cor, "qtd": q}] if sku else []}
+                if pers is False:
+                    it["tipo"] = "N"
+                lst.append(it)
+        r = importar_lote({"lote": "UPSELLER " + datetime.now(BR).strftime("%d/%m %H:%M"), "itens": lst})
+        res["criadas"] = r.get("novos", 0)
+    _op_cache["v"] = None
+    print(f"UpSeller: {len(pedidos)} pedidos; {len(sair)} sairam da conta, {len(voltar)} voltaram, {len(novos)} pedidos novos", flush=True)
+    return res
+
+
+def upseller_resumo():
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='upseller_resumo'").fetchone()
+    d = json.loads(r[0]) if r and r[0] else None
+    if d:
+        idade = (datetime.now(timezone.utc) - datetime.fromisoformat(d["em"])).total_seconds() / 3600
+        d["horas"] = round(idade, 1)
+        d["fresco"] = idade < UPSELLER_FRESCO_H
+    return d
+
+
+def _codigos_upseller_frescos(c):
+    d = c.execute("SELECT valor FROM meta WHERE chave='upseller_resumo'").fetchone()
+    if not d or not d[0]:
+        return set()
+    if (datetime.now(timezone.utc) - datetime.fromisoformat(json.loads(d[0])["em"])).total_seconds() > UPSELLER_FRESCO_H * 3600:
+        return set()
+    return {r[0] for r in c.execute("SELECT k.item_id FROM codigos k JOIN upseller_pedidos u ON u.codigo=k.codigo")}
 
 
 def etiquetas_ocultas():
@@ -809,13 +958,18 @@ def contadores_dia(data=None):
     with conn() as c:
         impressos = "order_sn IN (SELECT codigo FROM codigos)"
         ret = c.execute(f"SELECT loja, COUNT(*) n FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP') AND {impressos} GROUP BY loja").fetchall()
+        # na retirada que vem de dias anteriores (etiqueta entrou na Central antes de hoje)
+        ret_ant = c.execute("""SELECT COUNT(DISTINCT s.order_sn) FROM shopee_pedidos s JOIN codigos k ON k.codigo=s.order_sn
+                               JOIN itens i ON i.id=k.item_id WHERE s.status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP')
+                               AND COALESCE(i.oculto,0)=0 AND i.criado_em<?""", (ini,)).fetchone()[0]
         desp = c.execute(f"""SELECT loja, COUNT(*) n FROM shopee_pedidos WHERE despachado>=? AND despachado<?
                              AND status NOT IN ('CANCELLED','IN_CANCEL') AND {impressos} GROUP BY loja""", (t_ini, t_fim)).fetchall()
         dev = c.execute("""SELECT COALESCE(k.nome,'Painel/celular') quem, COUNT(*) n FROM devolucoes d
                            LEFT JOIN colaboradores k ON k.id=d.colaborador_id WHERE d.em>=? AND d.em<? GROUP BY 1""", (ini, fim)).fetchall()
     return {"data": data,
             "despachados": sum(r["n"] for r in desp), "despachados_por_loja": {r["loja"]: r["n"] for r in desp},
-            "na_retirada": sum(r["n"] for r in ret), "na_retirada_por_loja": {r["loja"]: r["n"] for r in ret},
+            "na_retirada": sum(r["n"] for r in ret) - ret_ant, "na_retirada_anteriores": ret_ant,
+            "na_retirada_por_loja": {r["loja"]: r["n"] for r in ret},
             "devolucoes": sum(r["n"] for r in dev), "devolucoes_por_pessoa": {r["quem"]: r["n"] for r in dev}}
 
 
@@ -863,9 +1017,14 @@ def painel(data, leve=False):
     ini, fim = dia_utc(data)
     with conn() as c:
         # itens do dia = criados no dia OU com movimento no dia OU ainda nao expedidos
+        # o painel "zera" todo dia: so as etiquetas que entraram HOJE ou que foram bipadas HOJE.
+        # As que ficaram de dias anteriores sem bipe aparecem a parte ("de dias anteriores"), sem misturar na conta do dia.
         itens = [dict(r) for r in c.execute("""SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND ((criado_em>=? AND criado_em<?)
-            OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0)
-            OR (status NOT IN ('EXPEDIDO','DEVOLVIDO') AND criado_em<?)) ORDER BY canal, etiqueta, id""", (ini, fim, ini, fim, fim))]
+            OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0)) ORDER BY canal, etiqueta, id""",
+            (ini, fim, ini, fim))]
+        anteriores = [dict(r) for r in c.execute("""SELECT id, pedido, canal, loja, sku, cor, status, criado_em, falta_material FROM itens
+            WHERE COALESCE(oculto,0)=0 AND status NOT IN ('EXPEDIDO','DEVOLVIDO') AND COALESCE(lote,'')<>'DEVOLUCAO' AND criado_em<?
+            AND id NOT IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0) ORDER BY criado_em""", (ini, ini, fim))]
         cont = {e: 0 for e in ETAPAS}
         for i in itens:
             cont[i["status"]] += 1
@@ -909,6 +1068,11 @@ def painel(data, leve=False):
                 q["despachados"] = q.get("despachados", 0) + (e["etapa"] == "DESPACHADO")
                 q["devolucoes"] = q.get("devolucoes", 0) + (e["etapa"] == "DEVOLVIDO")
     return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
+            "pedidos": len({norm(i["pedido"]) for i in itens if i.get("lote") != "DEVOLUCAO"}),
+            "anteriores": len(anteriores), "anteriores_lista": anteriores[:300],
+            "anteriores_por": {**{e: sum(1 for a in anteriores if a["status"] == e) for e in ETAPAS},
+                               "FALTA": sum(1 for a in anteriores if a["falta_material"])},
+            "upseller": upseller_resumo(),
             "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens,
             "dia": contadores_dia(data), "espera_expedicao": espera}
 
@@ -973,7 +1137,8 @@ def _operacao():
     elif previsoes:
         prev = (agora_ + timedelta(hours=max(previsoes))).astimezone(BR).strftime("%H:%M")
     return {"contagem": cont, "total": len(itens), "por_canal": por_canal, "ritmo": ritmo,
-            "plataformas": d["plataformas"],
+            "pedidos": d.get("pedidos"), "anteriores": d.get("anteriores"), "anteriores_por": d.get("anteriores_por"),
+            "plataformas": d["plataformas"], "upseller": d.get("upseller"),
             "previsao": prev, "falta_material": sum(1 for i in itens if i["falta_material"]), "dia": d["dia"],
             "espera_expedicao": d.get("espera_expedicao"), "gravado_mais_antigo_min": _gravado_mais_antigo()}
 
@@ -2161,6 +2326,8 @@ class H(BaseHTTPRequestHandler):
                 msg = "❌ Não autorizou: " + str(e)[:150]
             import html as _h
             return self._envia(200, f"<meta charset=utf-8><meta name=viewport content='width=device-width'><h2 style='font-family:Arial'>{_h.escape(msg)}</h2><p style='font-family:Arial'><a href='/painel'>Voltar ao painel</a></p>", "text/html; charset=utf-8")
+        if p == "/upseller":
+            return self._pagina("upseller.html" if self._admin() else "login.html")
         if p == "/contagem":
             return self._pagina("contagem.html" if self._admin() else "login.html")
         if p in ("/operacao", "/tv"):
@@ -2423,6 +2590,13 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": False, "erro": f"nao consegui ler o PDF ({e})"})
             r = importar_lote({"lote": "PDF " + str(d.get("nome") or "")[:60], "itens": itens}) if itens else {"novos": 0, "atualizados": 0}
             return self._envia(200, {"ok": True, "etiquetas": len(itens), "ignoradas": ign, "novos": r["novos"], "atualizados": r["atualizados"]})
+        if p == "/api/upseller/espelho":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"ok": False, "erro": "entre no painel da Central neste navegador"})
+            try:
+                return self._envia(200, upseller_espelho(d.get("pedidos") or [], bool(d.get("aplicar")), bool(d.get("forcar"))))
+            except Exception as e:
+                return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/lotes":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "token invalido"})
