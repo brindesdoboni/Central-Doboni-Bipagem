@@ -114,6 +114,9 @@ def _iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS shopee_lojas(shop_id INTEGER PRIMARY KEY, nome TEXT, access_token TEXT,
                      refresh_token TEXT, expira INTEGER, autorizada_em TEXT, atualizado_em TEXT, status_loja TEXT DEFAULT '',
                      expira_autorizacao INTEGER DEFAULT 0, erro TEXT DEFAULT '')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS vendas_hist(order_sn TEXT PRIMARY KEY, shop_id INTEGER, loja TEXT,
+            criado INTEGER, status TEXT, itens TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_vh_criado ON vendas_hist(criado)")
         c.execute("""CREATE TABLE IF NOT EXISTS bipes_log(id INTEGER PRIMARY KEY AUTOINCREMENT, em TEXT, op TEXT, dados TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_bl_op ON bipes_log(op, id)")
         c.execute("CREATE TABLE IF NOT EXISTS upseller_pedidos(codigo TEXT PRIMARY KEY, pedido TEXT, estado TEXT, loja TEXT, em TEXT)")
@@ -3124,6 +3127,16 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
         if p == "/api/estoque/garantir-baixas":
             _conhecidos_cache["v"] = None
             return self._envia(200, {"linha_certa": corrigir_baixas_erradas(), "separadas": garantir_baixas(q.get("desde"))})
+        if p == "/api/previsao":
+            pv = previsao(int(q["dias"]) if (q.get("dias") or "").isdigit() else None)
+            sku = estoque_chave(q.get("sku") or "")[0]
+            itens = {f"{k[0]}|{k[1]}": v for k, v in pv.get("itens", {}).items() if not sku or k[0] == sku}
+            return self._envia(200, {**{k: v for k, v in pv.items() if k != "itens"}, "itens": itens})
+        if p == "/api/previsao/teste":
+            return self._envia(200, previsao_teste())
+        if p == "/api/previsao/ler-historico":
+            threading.Thread(target=shopee_historico_vendas, daemon=True).start()
+            return self._envia(200, {"ok": True, "msg": "lendo o historico da Shopee em segundo plano"})
         if p == "/api/estoque/zerar-faltas":
             return self._envia(200, zerar_faltas_bipadas(q.get("desde")))
         if p == "/api/estoque/corrigir-baixas":
@@ -5216,6 +5229,12 @@ def estoque():
         prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
         st = {(r[0], r[1]): (r[2], r[3]) for r in c.execute("SELECT sku, cor, status, em FROM sku_status")}
         out, ocultos = [], []
+        try:
+            PV = previsao()
+            PV = PV["itens"] if PV.get("ok") and PV.get("historico_dias", 0) >= 14 else {}
+        except Exception as e:
+            print("previsao:", e, flush=True)
+            PV = {}
         for (sku, cor), r in linhas.items():
             sem_cor = cor == "" and sku in com_cor  # produto com cores: entrada sem cor ainda precisa ser distribuida
             stt = st.get((sku, cor))
@@ -5230,11 +5249,21 @@ def estoque():
             cu = preco_xbz(c, sku, cor)
             conhecido = bool(r["conhecido"])
             comprar = max(0, round(media * ESTOQUE_DIAS_COMPRA - saldo)) if not sem_cor and conhecido else 0
+            pv_ = PV.get((sku, cor))
+            prev6 = None
+            if pv_:   # previsao pelos pedidos (todas as lojas) e pelo dia da semana
+                prev6 = previsao_dias(pv_, ESTOQUE_DIAS_COMPRA)
+                media = prev6 / ESTOQUE_DIAS_COMPRA
+                comprar = max(0, round(prev6 - saldo)) if not sem_cor and conhecido else 0
             out.append({"sku": sku, "cor": cor or ("(cor a definir)" if sem_cor else "PADRAO"), "sem_cor": sem_cor,
+                        "previsao": round(prev6) if prev6 is not None else None,
+                        "vendido_7d": pv_["ultimos_7d"] if pv_ else None,
                         "saldo": round(saldo, 2),
                         "fisico": round(fisico, 2), "prateleira": prat.get(sku) or prat.get(re.sub(r"[PMG]$", "", sku), ""),
                         "pendente_hoje": pend.get((sku, cor), 0), "saidas_7d": r["s7"] or 0, "saidas_15d": r["s15"] or 0,
-                        "media_dia": round(media, 1), "dias": round(saldo / media, 1) if media > 0 and saldo > 0 else (0 if saldo <= 0 else None),
+                        "media_dia": round(media, 1),
+                        "dias": (previsao_cobertura(pv_, saldo) if pv_ else
+                                 (round(saldo / media, 1) if media > 0 and saldo > 0 else (0 if saldo <= 0 else None))),
                         "comprar": comprar, "custo": cu, "valor_compra": round((cu or 0) * comprar, 2),
                         "contado": r["contado"], "xbz_estoque": x.get("estoque"), "xbz_cor": x.get("cor_xbz", ""),
                         "xbz_reposicao": x.get("reposicao", ""), "nome": x.get("nome", ""),
@@ -5286,6 +5315,315 @@ def preco_xbz(c, sku, cor=""):
     return PRECOS_REF.get(base) or custo_de(c, sku)
 
 
+
+# ================================================================== PREVISAO DE VENDAS (para estoque e compra)
+# Historico dos pedidos de TODAS as lojas da Shopee (lido pela API, so leitura) + TikTok (etiquetas da Central).
+# Previsao por produto/cor = ritmo recente (mais peso nos ultimos dias) x o jeito de cada DIA DA SEMANA vender.
+VENDAS_HIST_DIAS = int(os.environ.get("VENDAS_HIST_DIAS", "120"))
+VENDAS_JANELA = 56            # 8 semanas para o dia da semana e o ritmo
+VENDAS_CANCEL = ("CANCELLED", "IN_CANCEL", "UNPAID")
+_vendas_status = {"rodando": False, "em": "", "erro": "", "pedidos": 0}
+_prev_cache = {"em": 0, "v": None}
+DIAS_PT = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+
+
+def shopee_historico_vendas(dias=None):
+    """Le os pedidos criados nos ultimos 'dias' de cada loja (so os itens: SKU, variacao, quantidade e status).
+    Continua de onde parou; os ultimos 3 dias sao sempre relidos (status muda: cancelado etc.)."""
+    import time
+    if _vendas_status["rodando"]:
+        return {"ok": False, "erro": "ja esta lendo"}
+    _vendas_status.update(rodando=True, erro="")
+    dias = dias or VENDAS_HIST_DIAS
+    total, erros = 0, []
+    try:
+        with conn() as c:
+            lojas = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas ORDER BY shop_id")]
+        agora_s = int(time.time())
+        alvo = agora_s - dias * 86400
+        for sid in lojas:
+            try:
+                loja = _shopee_token_ok(sid)
+                if not loja:
+                    continue
+                chave = f"vendas_hist_ate_{sid}"
+                with conn() as c:
+                    r = c.execute("SELECT valor FROM meta WHERE chave=?", (chave,)).fetchone()
+                feito_ate = int(r[0]) if r and str(r[0]).isdigit() else agora_s
+                janelas = [(agora_s - 3 * 86400, agora_s)]
+                t1 = min(feito_ate, agora_s - 3 * 86400)
+                while t1 > alvo:
+                    t0 = max(alvo, t1 - 15 * 86400 + 60)
+                    janelas.append((t0, t1))
+                    t1 = t0
+                for t0, t1 in janelas:
+                    sns, cursor = [], ""
+                    for _ in range(200):
+                        res = _shopee_http("GET", "/api/v2/order/get_order_list", loja=loja,
+                                           params={"time_range_field": "create_time", "time_from": t0, "time_to": t1,
+                                                   "page_size": 100, "cursor": cursor})
+                        rr = res.get("response") or {}
+                        sns += [o["order_sn"] for o in (rr.get("order_list") or []) if o.get("order_sn")]
+                        if not rr.get("more"):
+                            break
+                        cursor = rr.get("next_cursor") or ""
+                        time.sleep(0.1)
+                    linhas = []
+                    for k in range(0, len(sns), 50):
+                        res = _shopee_http("GET", "/api/v2/order/get_order_detail", loja=loja,
+                                           params={"order_sn_list": ",".join(sns[k:k + 50]), "response_optional_fields": "item_list"})
+                        for o in (res.get("response") or {}).get("order_list") or []:
+                            itens = [{"sku": (i.get("model_sku") or i.get("item_sku") or "").strip(), "nome": (i.get("item_name") or "")[:80],
+                                      "var": (i.get("model_name") or "")[:60], "qtd": int(i.get("model_quantity_purchased") or 1)}
+                                     for i in (o.get("item_list") or [])]
+                            linhas.append((norm(o.get("order_sn")), int(sid), loja.get("nome") or str(sid), int(o.get("create_time") or 0),
+                                           o.get("order_status") or "", json.dumps(itens, ensure_ascii=False)))
+                        time.sleep(0.1)
+                    with _lock, conn() as c:
+                        c.executemany("""INSERT INTO vendas_hist(order_sn, shop_id, loja, criado, status, itens) VALUES(?,?,?,?,?,?)
+                                         ON CONFLICT(order_sn) DO UPDATE SET status=excluded.status, itens=excluded.itens""", linhas)
+                        if t0 < feito_ate and t1 <= agora_s - 3 * 86400 + 1:
+                            c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES(?,?)", (chave, str(t0)))
+                    total += len(linhas)
+            except Exception as e:
+                erros.append(f"{sid}: {e}"[:200])
+    finally:
+        _vendas_status.update(rodando=False, em=datetime.now(BR).strftime("%d/%m %H:%M"), erro=" | ".join(erros), pedidos=total)
+        _prev_cache["v"] = None
+    return {"ok": not erros, "pedidos_lidos": total, "erros": erros}
+
+
+def _vendas_loop():
+    import time
+    time.sleep(240)
+    while True:
+        try:
+            shopee_historico_vendas()
+        except Exception as e:
+            _vendas_status["erro"] = str(e)[:200]
+        time.sleep(6 * 3600)
+
+
+def _dia_br(ts):
+    return datetime.fromtimestamp(ts, BR).date()
+
+
+def _vendas_diarias(c, dias=VENDAS_JANELA + 7):
+    """{(sku, cor): {data: qtd}}, total por dia, primeiro dia com dado e o que nao deu para ligar ao estoque."""
+    hoje = datetime.now(BR).date()
+    t0 = int(datetime.combine(hoje - timedelta(days=dias), datetime.min.time(), BR).timestamp())
+    _conhecidos_cache["v"] = None   # le de novo a lista de produtos/cores do estoque
+    conhecidos = _estoque_conhecido(c)
+    pedidos = {}
+    for r in c.execute("SELECT order_sn, criado, status, itens FROM shopee_pedidos WHERE criado>=?", (t0,)):
+        pedidos[r[0]] = (r[1], r[2], r[3])
+    for r in c.execute("SELECT order_sn, criado, status, itens FROM vendas_hist WHERE criado>=?", (t0,)):
+        pedidos[r[0]] = (r[1], r[2], r[3])
+    cache, daily, total, sem_par = {}, {}, {}, {}
+    primeiro = None
+    for sn, (criado, st, itens) in pedidos.items():
+        if not criado or (st or "") in VENDAS_CANCEL:
+            continue
+        d = _dia_br(criado)
+        primeiro = d if primeiro is None or d < primeiro else primeiro
+        for i in json.loads(itens or "[]"):
+            ck = (i.get("sku") or "", i.get("var") or "", i.get("nome") or "")
+            if ck not in cache:
+                st_, var, nome = ck
+                sku = _sku_do_texto(st_, conhecidos, f"{var} {nome}") or _sku_do_texto(nome, conhecidos, var)
+                if not sku or sku not in conhecidos:
+                    cache[ck] = None
+                else:
+                    cor = _cor_do_modelo(sku, [var, st_.split("-", 1)[1] if "-" in st_ else ""], conhecidos)
+                    cache[ck] = None if cor is None else (sku, cor, _kit_mult(st_, var))
+            m = cache[ck]
+            q = int(i.get("qtd") or 1)
+            if not m:
+                sem_par[ck[0] or ck[2]] = sem_par.get(ck[0] or ck[2], 0) + q
+                continue
+            k = (m[0], m[1])
+            daily.setdefault(k, {})
+            daily[k][d] = daily[k].get(d, 0) + q * m[2]
+            total[d] = total.get(d, 0) + q * m[2]
+    # TikTok: ainda sem API -> etiquetas da Central (dia em que a etiqueta entrou)
+    vistos = set()
+    ini_iso = datetime.combine(hoje - timedelta(days=dias), datetime.min.time(), BR).astimezone(timezone.utc).isoformat()
+    for it in c.execute("""SELECT * FROM itens WHERE criado_em>=? AND COALESCE(lote,'')<>'DEVOLUCAO' AND COALESCE(oculto,0)<>1
+                           AND (UPPER(COALESCE(canal,'')) LIKE '%TIKTOK%')""", (ini_iso,)):
+        if norm(it["pedido"]) in pedidos or it["id"] in vistos:
+            continue
+        vistos.add(it["id"])
+        d = datetime.fromisoformat(it["criado_em"]).astimezone(BR).date()
+        for s_, c_, q in _pecas_do_item(dict(it)):
+            if not s_ or s_.startswith("("):
+                continue
+            k = _peca_no_estoque(c, dict(it), s_, c_)
+            daily.setdefault(k, {})
+            daily[k][d] = daily[k].get(d, 0) + q
+            total[d] = total.get(d, 0) + q
+    return daily, total, primeiro, sem_par
+
+
+def _fatores_semana(serie, dias_validos):
+    """Peso de cada dia da semana (seg..dom) = media do dia / media geral."""
+    soma, n = [0.0] * 7, [0] * 7
+    for d in dias_validos:
+        soma[d.weekday()] += serie.get(d, 0)
+        n[d.weekday()] += 1
+    medias = [soma[w] / n[w] if n[w] else None for w in range(7)]
+    validas = [m for m in medias if m is not None]
+    geral = sum(validas) / len(validas) if validas else 0
+    if not geral:
+        return [1.0] * 7
+    return [min(1.8, max(0.4, (m / geral) if m is not None else 1.0)) for m in medias]
+
+
+def _nivel(serie, dias_validos, f, ate):
+    """(ritmo, tendencia por dia) 'sem o efeito do dia da semana'. Ritmo: mais peso nos dias recentes (meia-vida de
+    5 dias, ate 21 dias). Tendencia: ultimos 7 dias contra os 14 anteriores (subindo ou caindo), com freio."""
+    num = den = 0.0
+    rec, ant = [], []
+    for d in dias_validos:
+        if d >= ate:
+            continue
+        idade = (ate - d).days
+        x = serie.get(d, 0) / f[d.weekday()]
+        if idade <= 21:
+            w = 0.5 ** (idade / 5)
+            num += w * x
+            den += w
+        if idade <= 7:
+            rec.append(x)
+        elif idade <= 21:
+            ant.append(x)
+    L = num / den if den else 0.0
+    t = 0.0
+    if len(rec) >= 5 and len(ant) >= 7:
+        t = (sum(rec) / len(rec) - sum(ant) / len(ant)) / 10.5
+    return L, t
+
+
+def _prev_dia(L, t, f, d, j):
+    """Venda prevista no dia d (j dias a frente): ritmo + tendencia amortecida, vezes o peso do dia da semana."""
+    amort = sum(0.9 ** k for k in range(1, j + 1))
+    base = min(max(L + t * amort, 0.6 * L), 1.6 * L) if L > 0 else max(0.0, t * amort)
+    return max(0.0, base) * f[d.weekday()]
+
+
+def previsao(dias=None):
+    """Previsao de venda de cada produto/cor para os proximos 'dias' (a partir de amanha) + o que ainda vende hoje."""
+    import time
+    dias = int(dias or ESTOQUE_DIAS_COMPRA)
+    if _prev_cache["v"] is not None and time.time() - _prev_cache["em"] < 600 and _prev_cache["v"]["dias"] == dias:
+        return _prev_cache["v"]
+    with conn() as c:
+        daily, total, primeiro, sem_par = _vendas_diarias(c)
+    hoje = datetime.now(BR).date()
+    if not primeiro:
+        v = {"ok": False, "dias": dias, "itens": {}, "historico_dias": 0, "erro": "sem historico de vendas ainda"}
+        _prev_cache.update(v=v, em=time.time())
+        return v
+    ini = max(primeiro, hoje - timedelta(days=VENDAS_JANELA))
+    dias_validos = [ini + timedelta(days=k) for k in range((hoje - ini).days)]   # dias completos (ate ontem)
+    fg = _fatores_semana(total, dias_validos) if len(dias_validos) >= 14 else [1.0] * 7
+    itens = {}
+    for k, serie in daily.items():
+        prim_k = min(serie)
+        dv = [d for d in dias_validos if d >= prim_k]
+        if not dv:
+            dv = []
+        vol = sum(serie.get(d, 0) for d in dv)
+        if len(dv) >= 21 and vol >= 60:   # produto com bastante venda: usa o proprio jeito de vender na semana
+            fp = _fatores_semana(serie, dv)
+            a = min(1.0, vol / 300)
+            f = [a * fp[w] + (1 - a) * fg[w] for w in range(7)]
+        else:
+            f = fg
+        L, t = _nivel(serie, dv, f, hoje)
+        vendido_hoje = serie.get(hoje, 0)
+        resto_hoje = max(0.0, _prev_dia(L, t, f, hoje, 0) - vendido_hoje)
+        prox = [(hoje + timedelta(days=j), _prev_dia(L, t, f, hoje + timedelta(days=j), j)) for j in range(1, dias + 1)]
+        tot = resto_hoje + sum(q for _, q in prox)
+        u7 = sum(serie.get(hoje - timedelta(days=j), 0) for j in range(1, 8))
+        itens[k] = {"nivel": L, "tendencia": t, "fatores": f, "resto_hoje": resto_hoje, "vendido_hoje": vendido_hoje,
+                    "proximos": [(d.isoformat(), round(q, 1)) for d, q in prox], "total": tot, "media_dia": tot / max(1, dias),
+                    "ultimos_7d": u7, "dias_hist": len(dv)}
+    v = {"ok": True, "dias": dias, "itens": itens, "fatores_gerais": fg, "historico_dias": len(dias_validos),
+         "desde": ini.isoformat(), "sem_par": sorted(sem_par.items(), key=lambda x: -x[1])[:30],
+         "status": dict(_vendas_status)}
+    _prev_cache.update(v=v, em=time.time())
+    return v
+
+
+def previsao_dias(p, dias_a_frente):
+    """Quanto vende nos proximos N dias (inclui o resto de hoje), usando o ritmo e o dia da semana."""
+    hoje = datetime.now(BR).date()
+    return p["resto_hoje"] + sum(_prev_dia(p["nivel"], p.get("tendencia", 0), p["fatores"], hoje + timedelta(days=j), j)
+                                 for j in range(1, int(dias_a_frente) + 1))
+
+
+def previsao_cobertura(p, disponivel, max_dias=90):
+    """Em quantos dias o disponivel acaba, no ritmo previsto (dia a dia, respeitando o dia da semana)."""
+    if disponivel <= 0:
+        return 0.0
+    hoje = datetime.now(BR).date()
+    resto = disponivel - p["resto_hoje"]
+    if resto <= 0:
+        return 0.0
+    for j in range(1, max_dias + 1):
+        q = _prev_dia(p["nivel"], p.get("tendencia", 0), p["fatores"], hoje + timedelta(days=j), j)
+        if q <= 0:
+            continue
+        if resto <= q:
+            return round(j - 1 + resto / q, 1)
+        resto -= q
+    return None
+
+
+def previsao_teste(semanas=3, dias=6):
+    """Confere a previsao no passado: para cada dia das ultimas 'semanas', preve os 'dias' seguintes so com o que se
+    sabia ate ali e compara com o que vendeu. Mostra o erro da previsao nova e da media simples (15 dias)."""
+    with conn() as c:
+        daily, total, primeiro, _ = _vendas_diarias(c, dias=VENDAS_JANELA + semanas * 7 + dias + 7)
+    hoje = datetime.now(BR).date()
+    if not primeiro:
+        return {"ok": False, "erro": "sem historico"}
+    top = sorted(daily, key=lambda k: -sum(daily[k].values()))[:40]
+    err_n = err_v = real_t = 0.0
+    dia_n = dia_v = dia_real = 0.0
+    casos = 0
+    for a in range(semanas * 7 + dias, dias, -1):
+        ancora = hoje - timedelta(days=a)
+        ini = max(primeiro, ancora - timedelta(days=VENDAS_JANELA))
+        dv = [ini + timedelta(days=k) for k in range((ancora - ini).days)]
+        if len(dv) < 14:
+            continue
+        fg = _fatores_semana(total, dv)
+        for k in top:
+            s = daily[k]
+            dvk = [d for d in dv if d >= min(s)]
+            if len(dvk) < 7:
+                continue
+            L, t = _nivel(s, dvk, fg, ancora)
+            pd_ = [_prev_dia(L, t, fg, ancora + timedelta(days=j), j) for j in range(dias)]
+            m15 = sum(s.get(ancora - timedelta(days=j), 0) for j in range(1, 16)) / 15
+            rd = [s.get(ancora + timedelta(days=j), 0) for j in range(dias)]
+            err_n += abs(sum(pd_) - sum(rd))
+            err_v += abs(m15 * dias - sum(rd))
+            real_t += sum(rd)
+            dia_n += sum(abs(a - b) for a, b in zip(pd_, rd))
+            dia_v += sum(abs(m15 - b) for b in rd)
+            dia_real += sum(rd)
+            casos += 1
+    if not real_t:
+        return {"ok": False, "erro": "pouco historico para testar"}
+    return {"ok": True, "casos": casos, "erro_previsao_nova_%": round(100 * err_n / real_t, 1),
+            "erro_media_simples_%": round(100 * err_v / real_t, 1),
+            "erro_por_dia_nova_%": round(100 * dia_n / dia_real, 1), "erro_por_dia_media_simples_%": round(100 * dia_v / dia_real, 1),
+            "explicacao": f"Para cada um dos ultimos {semanas * 7} dias, previ os {dias} dias seguintes so com o que se sabia ate ali, "
+                          f"nos {len(top)} produtos que mais vendem, e comparei com o que vendeu de verdade."}
+
+
 def sugestao_compra(dias=None):
     """Projecao de compra para a XBZ: venda dos ultimos 30 dias com mais peso na ultima semana (sem extrapolar pico),
     estoque fisico, reservado nas etiquetas, prazo da XBZ, estoque e preco da XBZ; arredonda no multiplo que voces
@@ -5303,6 +5641,12 @@ def sugestao_compra(dias=None):
                               WHERE tipo='ETIQUETA' AND em>=? GROUP BY sku, cor""", (d7, d30)):
             vendas[(r["sku"], r["cor"])] = (r["v7"] or 0, r["v30"] or 0)
         fatores = {r["sku"]: r["fator"] for r in c.execute("SELECT sku, fator FROM compra_aprendizado")}
+        try:
+            PV = previsao()
+            PV = PV["itens"] if PV.get("ok") and PV.get("historico_dias", 0) >= 14 else {}
+        except Exception:
+            PV = {}
+        vendas.update({k: vendas.get(k, (0, 0)) for k in PV})
         habitos = {}
         chaves = set(vendas) | {k for k, v in est.items() if v["pendente_hoje"]} | \
             {k for k, v in est.items() if k[0] in ESTRATEGICOS and v.get("conhecido")}
@@ -5321,7 +5665,12 @@ def sugestao_compra(dias=None):
             e = est.get((sku, cor), {})
             reservado = e.get("pendente_hoje", 0)
             fisico = e.get("fisico", 0)
-            alvo = media * horizonte * fatores.get(sku, 1.0)
+            pv_ = PV.get((sku, cor))
+            if pv_:   # previsao pelos pedidos de todas as lojas, respeitando o dia da semana
+                media = previsao_dias(pv_, horizonte) / max(1, horizonte)
+                alvo = previsao_dias(pv_, horizonte) * fatores.get(sku, 1.0)
+            else:
+                alvo = media * horizonte * fatores.get(sku, 1.0)
             precisa = alvo + reservado - fisico  # estoque negativo aumenta a compra (falta fisica)
             x = xbz_de(c, sku, cor) or {}
             preco = preco_xbz(c, sku, cor)
@@ -5331,7 +5680,12 @@ def sugestao_compra(dias=None):
                      "xbz_estoque": x.get("estoque"), "estrategico": sku in ESTRATEGICOS,
                      "disponivel": round(fisico - reservado), "falta_agora": max(0, round(reservado - fisico))}
             # quando acaba (no ritmo de venda atual), contando o que ja esta reservado nas etiquetas
-            if media > 0:
+            if pv_ and fisico - reservado > 0:
+                dd = previsao_cobertura(pv_, fisico - reservado)
+                dd = 90.0 if dd is None else dd
+                linha["acaba_dias"] = round(dd, 1)
+                linha["acaba_em"] = (datetime.now(BR) + timedelta(days=dd)).strftime("%d/%m") if dd > 0 else "JÁ FALTA"
+            elif media > 0:
                 dd = max(0.0, (fisico - reservado) / media)
                 linha["acaba_dias"] = round(dd, 1)
                 linha["acaba_em"] = (datetime.now(BR) + timedelta(days=dd)).strftime("%d/%m") if dd > 0 else "JÁ FALTA"
@@ -6661,6 +7015,7 @@ if __name__ == "__main__":
     if os.environ.get("XBZ_TOKEN"):
         threading.Thread(target=_xbz_loop, daemon=True).start()
     threading.Thread(target=_shopee_loop, daemon=True).start()
+    threading.Thread(target=_vendas_loop, daemon=True).start()   # historico de vendas (previsao por dia da semana)
     if xbz_api_configurada():
         threading.Thread(target=_xbz_compras_loop, daemon=True).start()   # API oficial (substitui a leitura do site)
     elif xbz_site_configurado():
