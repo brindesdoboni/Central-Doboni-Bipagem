@@ -553,6 +553,24 @@ def _voz_de(codigo):
         return c.execute("SELECT voz FROM colaboradores WHERE id=?", (r["id"],)).fetchone()[0]
 
 
+def vozes_unicas():
+    """Cada colaborador ativo com um som so dele: se dois tiverem o mesmo numero, o mais novo ganha um livre."""
+    with _lock, conn() as c:
+        L = c.execute("""SELECT id, voz FROM colaboradores WHERE COALESCE(excluido,0)=0 AND ativo=1 AND voz IS NOT NULL
+                         ORDER BY id""").fetchall()
+        vistos = set()
+        usados = {r[1] for r in L}
+        for i, v in L:
+            if v in vistos:
+                livre = next((x for x in range(VOZES) if x not in usados), None)
+                if livre is None:
+                    continue
+                c.execute("UPDATE colaboradores SET voz=? WHERE id=?", (livre, i))
+                usados.add(livre); vistos.add(livre)
+            else:
+                vistos.add(v)
+
+
 # ---- "meus bipes": o computador da mesa de cada operador mostra so o que ELE bipou (o leitor sem fio manda para o PC
 # central). Fica so na memoria: os ultimos bipes, com a mesma resposta que o PC central recebeu.
 def _feed_add(posto, codigo, operador, leitor, r, quem=None, origem=""):
@@ -3342,6 +3360,7 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
         if p == "/api/historico":
             return self._envia(200, historico(int(q.get("id", 0))))
         if p == "/api/colaboradores":
+            vozes_unicas()
             with conn() as c:
                 lst = [dict(r) for r in c.execute("SELECT * FROM colaboradores WHERE COALESCE(excluido,0)=0 ORDER BY ativo DESC, nome")]
             for x in lst:
@@ -3619,6 +3638,13 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 if d.get("excluir"):
                     # sai da lista e o cracha para de funcionar; o historico continua com o nome
                     c.execute("UPDATE colaboradores SET excluido=1, ativo=0 WHERE id=?", (d["id"],))
+                elif d.get("id") and "voz" in d and "nome" not in d:
+                    # trocar o som da pessoa; se outra ativa tinha esse som, as duas trocam (ninguem fica com som igual)
+                    v = int(d["voz"]) % VOZES
+                    antes = c.execute("SELECT voz FROM colaboradores WHERE id=?", (d["id"],)).fetchone()
+                    c.execute("UPDATE colaboradores SET voz=? WHERE voz=? AND id<>? AND COALESCE(excluido,0)=0",
+                              (antes[0] if antes else None, v, d["id"]))
+                    c.execute("UPDATE colaboradores SET voz=? WHERE id=?", (v, d["id"]))
                 elif d.get("id"):
                     c.execute("UPDATE colaboradores SET nome=?, funcao=?, ativo=? WHERE id=?",
                               (d["nome"], d.get("funcao", ""), 1 if d.get("ativo", True) else 0, d["id"]))
