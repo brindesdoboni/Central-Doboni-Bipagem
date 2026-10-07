@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Central Boni - Bipagem da producao. Python puro (sem dependencias). SQLite em volume."""
-import csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading
+import csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading, time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -571,12 +571,17 @@ def _feed_add(posto, codigo, operador, leitor, r, quem=None):
             c.execute("DELETE FROM bipes_log WHERE em<?", ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),))
 
 
+_todos_visto = {"t": 0.0}   # ultima vez que o computador central (Bipe Boni em TODOS) pediu os bipes
+
+
 def meus_bipes(op, desde=None):
     """Bipes do operador depois do id 'desde'. Sem 'desde': so devolve onde a fila esta (nao mostra bipe antigo)."""
     op = norm(op)
     todos = op == "TODOS"   # computador central: mostra os bipes de todo mundo (inclusive os feitos nos PCs dos colaboradores)
     if not op:
         return {"ok": False, "nome": "", "ultimo": 0, "bipes": []}
+    if todos:
+        _todos_visto["t"] = time.time()
     with conn() as c:
         col = ("Todos",) if todos else c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
         ultimo = c.execute("SELECT COALESCE(MAX(id),0) FROM bipes_log").fetchone()[0]
@@ -3119,7 +3124,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/operacao":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
                 return self._envia(403, {"erro": "sem acesso"})
-            return self._envia(200, operacao())
+            return self._envia(200, {**operacao(), "central_ouvindo": time.time() - _todos_visto["t"] < 15})
         if p == "/sair":
             return self._envia(302, "", extra={"Location": "/painel",
                                "Set-Cookie": "cb_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})

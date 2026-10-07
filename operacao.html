@@ -31,6 +31,7 @@ td.nt{color:#f87171;font-weight:800}
  <div><table id="canais"></table><p style="font-size:22px" id="falta"></p></div>
 </main>
 <div id="emPausa"></div>
+<div id="surdo" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:50;background:#b45309;color:#fff;font-size:24px;font-weight:bold;padding:12px 20px;text-align:center">🔇 Os bipes dos computadores dos colaboradores NÃO estão aparecendo/tocando nesta central.<br><span style="font-size:20px;font-weight:normal">No ícone azul <b>B</b> perto do relógio: <b>Mostrar os bipes de...</b> → <b>TODOS (computador central)</b> → OK</span></div>
 <div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alN" style="font-size:56px;margin-top:16px"></div></div>
 <script>
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
@@ -48,6 +49,7 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+`<td class="${v.FALTA?"nt":""}">${v.FALTA||0}</td></tr>`).join("");
 const CP={"SHOPEE ENTREGA RÁPIDA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
  $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><div class="lin"><b>${p.total&&!p.faltam?"✓":p.faltam}</b>${p.faltam?`<div class="tipos"><i class="p">✏️ ${p.personalizados||0} personalizados</i><i class="s">📦 ${p.sem_personalizar||0} sem personalizar</i></div>`:""}</div><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
+ $("surdo").style.display=d.central_ouvindo===false?"block":"none";
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
 }catch(e){}}
 // café
