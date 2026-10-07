@@ -117,6 +117,8 @@ def _iniciar_db():
         c.execute("""CREATE TABLE IF NOT EXISTS bipes_log(id INTEGER PRIMARY KEY AUTOINCREMENT, em TEXT, op TEXT, dados TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_bl_op ON bipes_log(op, id)")
         c.execute("CREATE TABLE IF NOT EXISTS upseller_pedidos(codigo TEXT PRIMARY KEY, pedido TEXT, estado TEXT, loja TEXT, em TEXT)")
+        if "itens" not in {r[1] for r in c.execute("PRAGMA table_info(upseller_pedidos)")}:
+            c.execute("ALTER TABLE upseller_pedidos ADD COLUMN itens TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS sku_status(sku TEXT, cor TEXT, status TEXT, em TEXT, PRIMARY KEY(sku, cor))")
         # cores: "e a mesma que" (vira uma so) e "sao cores diferentes" (nao pergunta de novo)
         c.execute("CREATE TABLE IF NOT EXISTS cor_alias(sku TEXT, de TEXT, para TEXT, em TEXT, PRIMARY KEY(sku, de))")
@@ -441,6 +443,8 @@ def _codigo_de_etiqueta(cod):
         return False
     if cod.isdigit() and len(cod) in (12, 13) or cod.isdigit() and len(cod) == 14 and not cod.startswith("9"):
         return False   # codigo de barras de produto (EAN/GTIN)
+    if cod.isdigit() and len(cod) == 44:
+        return False   # chave da nota fiscal (DANFE), nao e a etiqueta
     return True
 
 
@@ -454,7 +458,7 @@ def _auto_incluir(c, codigo, posto):
     if re.fullmatch(r"9\d{13,15}", cod) and canal != "TIKTOK":
         canal, envio = "SHOPEE", "ENTREGA DIRETA"
     sku = cor = loja = ""
-    pecas, pers = [], None
+    pecas, pers, sem = [], None, []
     sp = c.execute("SELECT * FROM shopee_pedidos WHERE order_sn=?", (cod,)).fetchone()
     if sp:
         loja = sp["loja"] or ""
@@ -462,22 +466,66 @@ def _auto_incluir(c, codigo, posto):
         for i in json.loads(sp["itens"] or "[]"):
             cr = (i.get("var") or "").split(",")[0].strip()
             pecas.append({"sku": estoque_chave(i.get("sku") or "")[0] or (i.get("sku") or ""), "cor": cr, "qtd": int(i.get("qtd") or 1)})
-            t = ((i.get("nome") or "") + " " + (i.get("var") or "")).upper()
-            if "PERSONALIZ" in t and "SEM PERSONALIZ" not in t:
+            t = f"{i.get('sku') or ''} {i.get('var') or ''}".upper()
+            sem.append(bool(re.search(r"SEM\s+PERSONALIZ", t)))
+            if _texto_personalizado(t):
                 pers = 1
-        sku = " + ".join(dict.fromkeys(p["sku"] for p in pecas if p["sku"]))
-        cor = " + ".join(dict.fromkeys(p["cor"] for p in pecas if p["cor"]))
+    else:   # pedido que veio no espelho do UpSeller (tem SKU, cor e se e personalizado)
+        up = c.execute("SELECT * FROM upseller_pedidos WHERE codigo=?", (cod,)).fetchone()
+        if up and up["itens"]:
+            loja = up["loja"] or ""
+            for x in json.loads(up["itens"] or "[]"):
+                s_, cr, p_, q, _t = _ups_linha(x)
+                pecas.append({"sku": s_, "cor": cr, "qtd": q})
+                sem.append(p_ is False)
+                if p_:
+                    pers = 1
+    sku = " + ".join(dict.fromkeys(p["sku"] for p in pecas if p["sku"]))
+    cor = " + ".join(dict.fromkeys(p["cor"] for p in pecas if p["cor"]))
+    if pers is None:   # regra: na duvida passa pela GRAVACAO; so pula se TODOS os itens dizem "sem personalizacao"
+        pers = 0 if sem and all(sem) else 1
     if posto == "GRAVACAO":
         pers = 1
     iid = c.execute("""INSERT INTO itens(chave,lote,pedido,rastreio,canal,envio,loja,sku,cor,personalizado,status,obs,pecas,qtd,criado_em,atualizado_em)
                        VALUES(?,?,?,?,?,?,?,?,?,?,'AGUARDANDO',?,?,?,?,?)""",
                     (f"AUTO|{cod}", "AUTO", codigo.strip(), cod if cod.startswith("BR") else "", canal, envio, loja, sku, cor,
-                     pers or 0, "incluida no 1o bipe" + ("" if sku else " - completar SKU no painel"),
+                     pers, "incluida no 1o bipe" + ("" if sku else " - completar SKU no painel") + ("" if not pers or any(sem) else " - conferir se e personalizada"),
                      json.dumps(pecas, ensure_ascii=False) if pecas else "", sum(p["qtd"] for p in pecas) or 1, agora(), agora())).lastrowid
     c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (cod, iid))
     if sp and sp["order_sn"] != cod:
         c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (sp["order_sn"], iid))
     return iid
+
+
+def _prova_sem_pers(c, it):
+    """Ha prova de que a etiqueta e SEM personalizacao? (etiqueta 'N', ou a variacao do pedido diz 'sem personalizacao')."""
+    if (it.get("tipo") or "").upper() == "N":
+        return True
+    t = f"{it.get('sku') or ''} {it.get('cor') or ''} {it.get('obs') or ''}"
+    sp = c.execute("SELECT itens FROM shopee_pedidos WHERE order_sn=?", (norm(it.get("pedido")),)).fetchone()
+    if sp:
+        t += " " + " ".join(f"{x.get('sku', '')} {x.get('var', '')}" for x in json.loads(sp[0] or "[]"))
+    up = c.execute("SELECT itens FROM upseller_pedidos WHERE codigo=?", (norm(it.get("pedido")),)).fetchone()
+    if up and up[0]:
+        t += " " + " ".join(f"{x[1] if len(x) > 1 else ''} {x[2] if len(x) > 2 else ''}" for x in json.loads(up[0] or "[]"))
+    return bool(re.search(r"SEM\s+PERSONALIZ", t, re.I))
+
+
+def corrigir_auto_sem_prova():
+    """Etiquetas incluidas no 1o bipe que ficaram como 'sem personalizacao' sem nenhuma prova (pulavam a gravacao):
+    voltam a ser personalizadas se ainda nao foram expedidas."""
+    with _lock, conn() as c:
+        ids = []
+        for it in c.execute("""SELECT * FROM itens WHERE lote='AUTO' AND personalizado=0 AND status NOT IN ('EXPEDIDO','DEVOLVIDO')""").fetchall():
+            if not _prova_sem_pers(c, dict(it)):
+                ids.append(it["id"])
+        for iid in ids:
+            c.execute("UPDATE itens SET personalizado=1, obs=COALESCE(obs,'')||' - conferir se e personalizada', atualizado_em=? WHERE id=?",
+                      (agora(), iid))
+    if ids:
+        _op_cache["v"] = None
+        print(f"{len(ids)} etiqueta(s) incluida(s) no bipe voltaram a passar pela gravacao", flush=True)
+    return len(ids)
 
 
 VOZES = 16
@@ -620,6 +668,9 @@ def _bipar(posto, codigo, operador, modo):
                 _ctx.auto = True
                 auto_sep = posto in ("GRAVACAO", "EXPEDICAO")   # chegou na gravacao/expedicao: ja foi separada
                 itens = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchall()
+        if not itens and cod.isdigit() and len(cod) == 44:
+            return {"tipo": "erro", "msg": "ESSE É O CÓDIGO DA NOTA FISCAL",
+                    "fazer": "Bipe o código de barras da ETIQUETA de envio (nº do pedido ou rastreio), não o da nota fiscal."}
         if not itens:
             return {"tipo": "erro", "msg": f"ETIQUETA NÃO ENCONTRADA ({codigo})",
                     "fazer": "Separe esta etiqueta e leve para o Lucas incluir no painel (+ Incluir etiquetas). Depois bipe de novo."}
@@ -664,6 +715,11 @@ def _bipar(posto, codigo, operador, modo):
             return {"tipo": "ok", "msg": "SEPARADO  →  SEM PERSONALIZAR: direto para a EXPEDIÇÃO", "evento": "separado", "item": r}
 
         if posto == "GRAVACAO":
+            # trouxeram para gravar uma etiqueta marcada "sem personalizacao" sem prova nenhuma: vale como personalizada
+            for i in itens:
+                if not i["personalizado"] and not _prova_sem_pers(c, dict(i)):
+                    c.execute("UPDATE itens SET personalizado=1, atualizado_em=? WHERE id=?", (agora(), i["id"]))
+            itens = c.execute(f"SELECT * FROM itens WHERE id IN ({','.join('?' * len(itens))})", [i["id"] for i in itens]).fetchall()
             pers = [i for i in itens if i["personalizado"]]
             if not pers:
                 return {"tipo": "erro", "msg": "NÃO GRAVAR: produto SEM PERSONALIZAR",
@@ -937,8 +993,9 @@ def upseller_espelho(pedidos, aplicar=False, forcar=False):
         for it in voltar:
             c.execute("UPDATE itens SET oculto=0, oculto_motivo='' WHERE id=? AND oculto=2", (it["id"],))
         c.execute("DELETE FROM upseller_pedidos")
-        c.executemany("INSERT OR REPLACE INTO upseller_pedidos VALUES(?,?,?,?,?)",
-                      [(k, o["id"], o.get("e") or "", o.get("l") or "", agora_) for k, o in cod_ped.items()])
+        c.executemany("INSERT OR REPLACE INTO upseller_pedidos(codigo, pedido, estado, loja, em, itens) VALUES(?,?,?,?,?,?)",
+                      [(k, o["id"], o.get("e") or "", o.get("l") or "", agora_, json.dumps(o.get("i") or [], ensure_ascii=False))
+                       for k, o in cod_ped.items()])
         resumo = {"em": agora_, "pedidos": len(pedidos), "por_estado": est, "sair": len(sair), "voltar": len(voltar),
                   "novos_pedidos": len(novos)}
         c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('upseller_resumo', ?)", (json.dumps(resumo, ensure_ascii=False),))
@@ -6463,6 +6520,10 @@ if __name__ == "__main__":
         garantir_baixas()
     except Exception as e:
         print("garantir baixas:", e, flush=True)
+    try:
+        corrigir_auto_sem_prova()
+    except Exception as e:
+        print("auto sem prova:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
