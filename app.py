@@ -3056,6 +3056,12 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, [dict(r) for r in c.execute("SELECT * FROM prateleiras ORDER BY prateleira, sku")])
         if p == "/api/compra/sugestao":
             return self._envia(200, sugestao_compra(int(q["dias"]) if (q.get("dias") or "").isdigit() else None))
+        if p == "/api/estoque/garantir-baixas":
+            _conhecidos_cache["v"] = None
+            return self._envia(200, {"linha_certa": corrigir_baixas_erradas(), "separadas": garantir_baixas(q.get("desde"))})
+        if p == "/api/estoque/corrigir-baixas":
+            _conhecidos_cache["v"] = None
+            return self._envia(200, corrigir_baixas_erradas())
         if p == "/api/estoque/movimentos":
             with conn() as c:
                 return self._envia(200, [dict(r) for r in c.execute(
@@ -3392,6 +3398,8 @@ def _controlado(c, sku, cn):
 
 # ------------------------------------------------------------------ conhecimento do agente de estoque (handoff 02/10/2026)
 ESTOQUE_ABERTURA = "2026-10-02"   # data-base do snapshot: o que foi impresso antes ja esta descontado nele
+# contagem geral feita em 05/10 a tarde: tudo separado a partir de 06/10 sai do estoque, impresso quando for
+ESTOQUE_CONTAGEM_GERAL = os.environ.get("ESTOQUE_CONTAGEM_GERAL", "2026-10-06T03:00:00+00:00")
 ESTOQUE_SNAPSHOT = """## 01093
 Transparente 130
 Cinza -60
@@ -3921,7 +3929,8 @@ def cores_para_conferir():
                             "parecidas": parecidas, "sugestao": sug, "opcoes": opcoes, "nome_xbz": x["cor"] in cat_sku,
                             "cores_xbz": sorted(cat_sku), "ja_juntou": sorted(juntou.get((sku, x["cor"]), []))})
     out.sort(key=lambda d: (d["sku"], d["cor"]))
-    return {"ok": True, "itens": out, "fora": fora}
+    todas = sorted({cor_norm(v) for v in XBZ_COR_COD.values()} | {k for v in cat.values() for k in v} - {""})
+    return {"ok": True, "itens": out, "fora": fora, "cores_xbz_todas": todas}
 
 
 def decidir_cor(sku, cor, acao, para=""):
@@ -3947,7 +3956,10 @@ def decidir_cor(sku, cor, acao, para=""):
             for o in outras:
                 c.execute("INSERT OR REPLACE INTO cor_ok VALUES(?,?,?,?)", (sku, cor, o, agora()))
             return {"ok": True}
-        if acao != "JUNTAR" or not para or para == cor:
+        if acao == "JUNTAR" and para == cor:   # escolheu a propria cor: ela esta certa (nao pergunta mais)
+            c.execute("INSERT OR REPLACE INTO cor_ok VALUES(?,?,?,?)", (sku, cor, "*", agora()))
+            return {"ok": True, "confirmada": True}
+        if acao != "JUNTAR" or not para:
             return {"ok": False, "erro": "escolha a cor certa"}
         c.execute("INSERT OR REPLACE INTO cor_alias VALUES(?,?,?,?)", (sku, cor, para, agora()))
         c.execute("UPDATE cor_alias SET para=? WHERE sku=? AND para=?", (para, sku, cor))   # sem corrente A->B->C
@@ -3985,17 +3997,166 @@ def carregar_abertura():
     return r["feitos"]
 
 
+# ---- a baixa tem que cair na linha CERTA do estoque (senao "nao da baixa": o produto contado nao diminui)
+# A etiqueta as vezes vem com SKU/cor escritos diferente do estoque: "18949" + "ROSA 550ML", "9188", "018552",
+# "10X2356", "LARANJA 100 UN" ou sem a cor. Aqui traduz para a linha que existe no estoque (contada/XBZ).
+_conhecidos_cache = {"em": 0, "v": None}
+
+
+def time_now():
+    import time as _t
+    return _t.time()
+
+
+def _estoque_conhecido(c):
+    import time as _t
+    if _conhecidos_cache["v"] is not None and _t.time() - _conhecidos_cache["em"] < 300:
+        return _conhecidos_cache["v"]
+    cores = {}
+    for sku, cor in c.execute("""SELECT DISTINCT sku, cor FROM estoque_mov
+                                 WHERE tipo IN ('CONTAGEM','DISTRIBUI','ENTRADA_NF','ENTRADA_XBZ','AJUSTE')"""):
+        cores.setdefault(sku, set()).add(cor or "")
+    for cod, cor in c.execute("SELECT codigo, cor FROM xbz WHERE codigo<>''"):
+        k = estoque_chave(cod)[0]
+        cores.setdefault(k, set()).add(cor_norm(cor or ""))
+    _conhecidos_cache.update(v=cores, em=_t.time())
+    return cores
+
+
+_RX_QTD_COR = re.compile(r"\(?\b\d+\s*(?:ML|UN|UND|UNID|UNIDADES|X)\b\.?\)?|\bKIT\b|^\s*\d+\s*", re.I)
+
+
+def _peca_no_estoque(c, item, sku, cor, _de_novo=True):
+    """(sku, cor) da linha do estoque para esta peca."""
+    conhecidos = _estoque_conhecido(c)
+    if _de_novo and _conhecidos_cache["em"] and (time_now() - _conhecidos_cache["em"]) > 5:
+        k0 = estoque_chave(sku, cor)
+        if k0[1] not in conhecidos.get(k0[0], set()):   # produto/cor novo (contado agora ha pouco?): rele a lista
+            _conhecidos_cache["v"] = None
+            conhecidos = _estoque_conhecido(c)
+    texto = f"{cor or ''} {item.get('sku') or ''} {item.get('obs') or ''}"
+    s0 = _sku_do_texto(sku, conhecidos, texto) or sku
+    sku2, cor2 = estoque_chave(s0, cor, texto)
+    if sku2 not in conhecidos:
+        for v in sorted(_skus_parecidos(sku2)):
+            v2 = estoque_chave(v, "", texto)[0]
+            if v2 in conhecidos:
+                sku2 = v2
+                break
+    cs = conhecidos.get(sku2, set())
+    limpa = cor_norm(_RX_QTD_COR.sub(" ", cor or ""))
+    if cor2 not in cs and limpa:
+        c3 = estoque_chave(sku2, limpa)[1]
+        cor2 = c3 if c3 in cs else (_cor_do_modelo(sku2, [limpa], {sku2: cs}) or cor2)
+    if not cor2 and cs - {""}:   # etiqueta sem cor: tenta a variacao do pedido na Shopee
+        sp = c.execute("SELECT itens FROM shopee_pedidos WHERE order_sn=?", (norm(item.get("pedido")),)).fetchone()
+        if sp:
+            try:
+                vs = [f"{x.get('var', '')}" for x in json.loads(sp[0] or "[]") if sku_base(x.get("sku") or "") in _skus_parecidos(sku2)
+                      or not x.get("sku")]
+            except Exception:
+                vs = []
+            achou = _cor_do_modelo(sku2, vs, {sku2: cs}) if vs else None
+            if achou:
+                cor2 = achou
+    return sku2, cor2
+
+
 def baixar_estoque(c, iid):
     """Baixa do estoque as pecas da etiqueta quando o material sai para a separacao (uma vez so por etiqueta)."""
     r = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
-    if not r or r["lote"] == "DEVOLUCAO" or _ja_no_snapshot(c, dict(r)):
+    if not r or r["lote"] == "DEVOLUCAO" or (agora() < ESTOQUE_CONTAGEM_GERAL and _ja_no_snapshot(c, dict(r))):
         return
     for sku, cor, qtd in _pecas_do_item(dict(r)):
-        sku, cn = estoque_chave(sku, cor)
+        if not sku or sku.startswith("("):
+            continue
+        sku, cn = _peca_no_estoque(c, dict(r), sku, cor)
         if not sku or sku.startswith("("):
             continue
         c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
                   (agora(), sku, cn, -qtd, "ETIQUETA", f"ETQ|{iid}|{sku}|{cn}", f"pedido {r['pedido']}"))
+
+
+def corrigir_baixas_erradas():
+    """Baixas de etiqueta que cairam numa linha que o estoque nao conhece (SKU/cor escritos diferente) vao para a
+    linha certa. So mexe quando acha a linha certa com seguranca. Pode rodar quantas vezes quiser."""
+    feitos = []
+    with conn() as c:
+        conhecidos = _estoque_conhecido(c)
+        movs = c.execute("""SELECT m.id, m.sku, m.cor, m.ref FROM estoque_mov m WHERE m.tipo='ETIQUETA'""").fetchall()
+        for m in movs:
+            if m["cor"] in conhecidos.get(m["sku"], set()) and (m["cor"] or not (conhecidos.get(m["sku"], set()) - {""})):
+                continue
+            partes = (m["ref"] or "").split("|")
+            if len(partes) < 2 or not partes[1].isdigit():
+                continue
+            it = c.execute("SELECT * FROM itens WHERE id=?", (int(partes[1]),)).fetchone()
+            if not it:
+                continue
+            sku2, cor2 = _peca_no_estoque(c, dict(it), m["sku"], m["cor"])
+            if (sku2, cor2) != (m["sku"], m["cor"]) and cor2 in conhecidos.get(sku2, set()) and (cor2 or not (conhecidos.get(sku2, set()) - {""})):
+                cont = c.execute("SELECT MAX(em) FROM estoque_mov WHERE tipo='CONTAGEM' AND sku=? AND cor=?", (sku2, cor2)).fetchone()[0]
+                em = c.execute("SELECT em FROM estoque_mov WHERE id=?", (m["id"],)).fetchone()[0]
+                feitos.append((m["id"], sku2, cor2, m["sku"], m["cor"], bool(cont and em and cont > em)))
+    if feitos:
+        with _lock, conn() as c:
+            for mid, sku2, cor2, s0, c0, contada in feitos:
+                if contada:   # a contagem feita depois ja inclui esta saida: nao desconta de novo
+                    c.execute("UPDATE estoque_mov SET sku=?, cor=?, obs=COALESCE(obs,'')||' (era '||?||' '||?||', '||qtd||'; ja estava na contagem)', qtd=0 WHERE id=?",
+                              (sku2, cor2, s0, c0 or "sem cor", mid))
+                else:
+                    c.execute("UPDATE estoque_mov SET sku=?, cor=?, obs=COALESCE(obs,'')||? WHERE id=?",
+                              (sku2, cor2, f" (era {s0} {c0 or 'sem cor'})", mid))
+        print(f"Estoque: {len(feitos)} baixa(s) de etiqueta foram para a linha certa", flush=True)
+    return {"ok": True, "corrigidas": len(feitos), "exemplos": [f"{f[3]} {f[4] or 'sem cor'} -> {f[1]} {f[2] or 'PADRAO'}" for f in feitos[:30]]}
+
+
+def garantir_baixas(desde=None):
+    """Toda etiqueta separada (ou gravada/expedida sem passar pela separacao) desde a contagem geral tem que ter
+    saido do estoque. Da a baixa que faltou, com a hora da separacao. Nao desconta de novo o que uma contagem feita
+    depois ja pegou. Pode rodar quantas vezes quiser (cada etiqueta baixa uma vez so)."""
+    desde = desde or ESTOQUE_CONTAGEM_GERAL
+    with conn() as c:
+        cand = c.execute("""SELECT e.item_id, MIN(e.em) quando FROM eventos e JOIN itens i ON i.id=e.item_id
+                            WHERE e.desfeito=0 AND e.etapa IN ('SEPARADO','GRAVACAO_INICIO','GRAVACAO_FIM','EXPEDIDO')
+                            AND COALESCE(i.lote,'')<>'DEVOLUCAO' AND i.status<>'DEVOLVIDO'
+                            GROUP BY e.item_id HAVING MIN(e.em)>=?""", (desde,)).fetchall()
+        faltam = [(r[0], r[1]) for r in cand if not _ja_baixado(c, r[0])]
+    feitos, pulados, sem_sku = [], 0, 0
+    with _lock, conn() as c:
+        for iid, quando in faltam:
+            if _ja_baixado(c, iid):
+                continue
+            it = c.execute("SELECT * FROM itens WHERE id=?", (iid,)).fetchone()
+            if not it:
+                continue
+            for sku, cor, qtd in _pecas_do_item(dict(it)):
+                if not sku or sku.startswith("("):
+                    sem_sku += 1
+                    continue
+                sku2, cn = _peca_no_estoque(c, dict(it), sku, cor)
+                if not sku2 or sku2.startswith("("):
+                    sem_sku += 1
+                    continue
+                cont = c.execute("SELECT MAX(em) FROM estoque_mov WHERE tipo='CONTAGEM' AND sku=? AND cor=?", (sku2, cn)).fetchone()[0]
+                ref = f"ETQ|{iid}|{sku2}|{cn}"
+                if cont and cont > quando:   # contado depois de separar: a contagem ja tirou; so marca (qtd 0)
+                    c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                              (quando, sku2, cn, 0, "ETIQUETA", ref, f"pedido {it['pedido']} (ja estava na contagem)"))
+                    pulados += 1
+                    continue
+                cur = c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+                                (quando, sku2, cn, -qtd, "ETIQUETA", ref, f"pedido {it['pedido']} (baixa da separacao que faltou)"))
+                if cur.rowcount:
+                    feitos.append((sku2, cn or "PADRAO", qtd))
+    por = {}
+    for sku, cor, q in feitos:
+        por[f"{sku} {cor}"] = por.get(f"{sku} {cor}", 0) + q
+    if feitos:
+        print(f"Estoque: {len(feitos)} baixa(s) de separacao que faltavam foram feitas", flush=True)
+    return {"ok": True, "desde": desde, "etiquetas_sem_baixa": len(faltam), "baixas_feitas": len(feitos),
+            "pecas": sum(q for _, _, q in feitos), "ja_na_contagem": pulados, "sem_sku": sem_sku,
+            "por_produto": sorted(por.items(), key=lambda x: -x[1])[:60]}
 
 
 def _ja_baixado(c, iid):
@@ -4268,13 +4429,22 @@ def xbz_sincronizar():
         return {"ok": False, "erro": "XBZ_CNPJ/XBZ_TOKEN nao configurados no Railway"}
     from urllib.parse import urlencode
     base = os.environ.get("XBZ_URL", "https://api.minhaxbz.com.br:5001/api/clientes/GetListaDeProdutos")
-    url = base + "?" + urlencode({"cnpj": cnpj, "token": tok})
     ini = datetime.now()
-    try:
-        with urllib.request.urlopen(url, timeout=90) as r:
-            dados = json.loads(r.read())
-    except Exception as e:
-        msg = re.sub(r"token=[^&\s]+", "token=***", str(e))
+    # a XBZ passou a recusar (403) alguns pedidos: manda tambem cnpj/token no cabecalho e com cara de navegador;
+    # se ainda der 403, tenta so pelo cabecalho (igual ao PedidosListar)
+    dados, msg = None, ""
+    for url in (base + "?" + urlencode({"cnpj": cnpj, "token": tok}), base):
+        req = urllib.request.Request(url, headers={"cnpj": cnpj, "token": tok, "Accept": "application/json", "User-Agent": XBZ_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                dados = json.loads(r.read())
+            break
+        except urllib.error.HTTPError as e:
+            msg = f"XBZ respondeu {e.code}" + (" (acesso negado: confira XBZ_CNPJ/XBZ_TOKEN no Railway ou peça à XBZ para liberar o token)" if e.code in (401, 403) else "")
+        except Exception as e:
+            msg = _xbz_sem_segredo(str(e), cnpj, tok)
+    if dados is None:
+        msg = _xbz_sem_segredo(re.sub(r"token=[^&\s]+", "token=***", msg), cnpj, tok)
         _xbz_status.update(ok=False, erro=msg[:200], ultima=agora())
         return {"ok": False, "erro": msg[:200]}
     if not isinstance(dados, list) or len(dados) < 500 or any(not x.get("CodigoXbz") for x in dados[:50]):
@@ -4468,6 +4638,7 @@ def _xbz_retiradas_loop():
 #   (XBZ_CNPJ / XBZ_TOKEN do catalogo tambem entram, se estiverem la)
 # Regras: so status que comeca com RETIRADO/ENVIADO/FINALIZADO; cada CNPJ+pedido+SKU XBZ+composto entra UMA vez;
 # SKU que nao da para ligar com certeza ao nosso -> pendencia de mapeamento (o estoque NAO muda).
+XBZ_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 XBZ_API_BASE = os.environ.get("XBZ_API_BASE", "https://api.minhaxbz.com.br:5001/api/clientes").rstrip("/")
 XBZ_API_DIAS = int(os.environ.get("XBZ_API_DIAS", "10"))
 XBZ_STATUS_OK = "RETIRADO/ENVIADO/FINALIZADO"
@@ -4503,7 +4674,7 @@ def _xbz_buscar_pedidos(cnpj, token, dias=None):
     import urllib.request
     url = (f"{XBZ_API_BASE}/PedidosListar?qtd_dias={int(dias or XBZ_API_DIAS)}"
            "&exibir_finalizados=true&exibir_cancelados=false")
-    req = urllib.request.Request(url, headers={"cnpj": cnpj, "token": token, "Accept": "application/json"})
+    req = urllib.request.Request(url, headers={"cnpj": cnpj, "token": token, "Accept": "application/json", "User-Agent": XBZ_UA})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             dados = json.loads(r.read() or b"[]")
@@ -4528,7 +4699,7 @@ def _xbz_buscar_pedidos(cnpj, token, dias=None):
 def _xbz_sem_segredo(t, cnpj, token):
     t = str(t or "")
     for seg in (token, cnpj):
-        if seg:
+        if seg and len(seg) >= 6:
             t = t.replace(seg, "***")
     return t
 
@@ -4849,10 +5020,12 @@ def estoque():
         canc = _ids_cancelados(c)
         # reservado = etiquetas que ainda nao foram para a separacao (o material ainda esta na prateleira)
         for i in c.execute("SELECT * FROM itens WHERE status='AGUARDANDO' AND COALESCE(lote,'')<>'DEVOLUCAO' AND COALESCE(oculto,0)=0"):
-            if i["id"] in canc or _ja_no_snapshot(c, dict(i)) or _ja_baixado(c, i["id"]):
+            if i["id"] in canc or _ja_baixado(c, i["id"]):
                 continue
             for sku, cor, q in _pecas_do_item(dict(i)):
-                k = estoque_chave(sku, cor)
+                if not sku or sku.startswith("("):
+                    continue
+                k = _peca_no_estoque(c, dict(i), sku, cor)
                 if k[0] and not k[0].startswith("("):
                     pend[k] = pend.get(k, 0) + q
         for k in pend:
@@ -5913,6 +6086,9 @@ def shopee_pedidos_resumo():
 # Protecoes: so mexe em variacao com SKU e cor reconhecidos; nao escreve com XBZ desatualizada.
 ANUNCIOS_INTERVALO = int(os.environ.get("ANUNCIOS_INTERVALO", "1800"))
 ANUNCIOS_XBZ_MAX_HORAS = float(os.environ.get("ANUNCIOS_XBZ_MAX_HORAS", "16"))
+# Regra do Lucas (06/10/2026): XBZ com 100 ou menos de um produto/cor = conta como ZERO no anuncio
+# (estoque baixo na XBZ some rapido; a Shopee fica so com o que temos aqui, e zera se nao tivermos).
+ANUNCIOS_XBZ_MIN = int(os.environ.get("ANUNCIOS_XBZ_MIN", "100"))
 _anuncios_status = {"rodando": False, "ultima": "", "lojas": {}, "erro": ""}
 
 
@@ -6099,12 +6275,15 @@ def anuncios_estoque(aplicar=False, so_loja=None):
                         L["sem_par"].append({"item_id": iid, "anuncio": rot, "sku": sku, "motivo": f"{sku} {cor or 'PADRAO'} sem estoque cadastrado"})
                         continue
                     mult = _kit_mult(m["sku_txt"], " ".join(m["ops"]))
-                    alvo = int((max(0, nosso.get(k, 0)) + xbz.get(k, 0)) // mult)
+                    xbz_k = xbz.get(k, 0)
+                    xbz_conta = xbz_k if xbz_k > ANUNCIOS_XBZ_MIN else 0
+                    alvo = int((max(0, nosso.get(k, 0)) + xbz_conta) // mult)
                     if m["atual"] is not None and alvo == m["atual"]:
                         L["igual"] += 1
                         continue
                     L["mudar"].append({"item_id": iid, "model_id": m["model_id"], "anuncio": rot, "sku": sku,
-                                       "cor": cor or "PADRAO", "kit": mult, "nosso": nosso.get(k, 0), "xbz": xbz.get(k, 0),
+                                       "cor": cor or "PADRAO", "kit": mult, "nosso": nosso.get(k, 0), "xbz": xbz_k,
+                                       "xbz_ignorado": bool(xbz_k and not xbz_conta),
                                        "de": m["atual"], "para": alvo, "loc": m["loc"]})
             if aplicar:
                 por_item = {}
@@ -6276,6 +6455,14 @@ if __name__ == "__main__":
         corrigir_nf_antes_da_contagem()
     except Exception as e:
         print("corte NF:", e, flush=True)
+    try:
+        corrigir_baixas_erradas()
+    except Exception as e:
+        print("baixas erradas:", e, flush=True)
+    try:
+        garantir_baixas()
+    except Exception as e:
+        print("garantir baixas:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):

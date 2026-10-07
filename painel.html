@@ -209,6 +209,8 @@ async function carregarCores(){try{const r=await (await fetch("/api/estoque/core
   <div class="cfa"><span>É a mesma que</span><select id="cj${i}" onchange="if(this.value==='__outra')digCor(${i})"><option value="">— escolha —</option>`+
   (xb.length?`<optgroup label="Variações da XBZ">${xb.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
   (ns.length?`<optgroup label="Só no nosso estoque">${ns.map(o=>opt(x,o)).join("")}</optgroup>`:"")+
+  `<optgroup label="${esc(x.cor)} está certa">${`<option value="${esc(x.cor)}">✅ ${esc(x.cor)} (manter esta cor)</option>`}</optgroup>`+
+  `<optgroup label="Todas as cores da XBZ">${(r.cores_xbz_todas||[]).filter(c=>c!==x.cor&&!x.opcoes.some(o=>o.cor===c)).map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}</optgroup>`+
   `<option value="__outra">✏️ Digitar outra cor…</option></select><button onclick="decCor(${i},'JUNTAR')"><b>Juntar</b></button>
   <span class="cfsep"></span><button onclick="decCor(${i},'OUTRA')">É outra cor</button><button onclick="decCor(${i},'ARQUIVAR')" title="Some da lista e da compra; dá para incluir de novo">Arquivar</button><button onclick="decCor(${i},'EXCLUIR')" style="color:#d7263d" title="Não trabalha mais; dá para incluir de novo">Excluir</button></div></div>`}).join("")+`</div></details>`:"")+
  (fora.length?`<details><summary>🗄️ Excluídas / arquivadas (${fora.length}) — se aparecer uma parecida depois, inclua de novo e junte</summary><table><tr><th>SKU</th><th>Cor</th><th>Saldo</th><th>Como</th><th>Desde</th><th></th></tr>`+
@@ -220,7 +222,8 @@ async function inclCor(i){const f=__FORA[i];if(!confirm(`Incluir de novo ${f.sku
  const r=await POST("/api/estoque/cor",{sku:f.sku,cor:f.cor||"PADRAO",acao:"INCLUIR"});if(!r.ok)return alert(r.erro||"erro");carregarCores();carregarEst()}
 async function decCor(i,acao){const x=__CORES[i],para=acao==="JUNTAR"?$("cj"+i).value:"";
  if(acao==="JUNTAR"){if(!para||para==="__outra")return alert("Escolha (ou digite) a cor certa");const alvo=x.opcoes.find(o=>o.cor===para),sa=alvo?alvo.saldo:0;
-  if(!confirm(`Juntar ${x.sku} ${x.cor} em ${para}?\n\nSaldo: ${x.cor} ${x.saldo} + ${para} ${sa} = ${x.saldo+sa} em ${para}.\nDaqui pra frente tudo que vier como ${x.cor} entra em ${para}.`))return}
+  if(para===x.cor){if(!confirm(`Manter ${x.sku} ${x.cor} como está (a cor está certa)? Ela sai desta lista.`))return}
+  else if(!confirm(`Juntar ${x.sku} ${x.cor} em ${para}?\n\nSaldo: ${x.cor} ${x.saldo} + ${para} ${sa} = ${x.saldo+sa} em ${para}.\nDaqui pra frente tudo que vier como ${x.cor} entra em ${para}.`))return}
  if(acao==="EXCLUIR"&&!confirm(`Excluir ${x.sku} ${x.cor}? Some do estoque, da lista e da compra, e a XBZ não lança mais nela. Dá para incluir de novo depois.`))return;
  if(acao==="ARQUIVAR"&&!confirm(`Arquivar ${x.sku} ${x.cor}? Some da lista e da compra. Dá para incluir de novo depois.`))return;
  const r=await POST("/api/estoque/cor",{sku:x.sku,cor:x.cor,acao,para});if(!r.ok)return alert(r.erro||"erro");carregarCores();carregarEst()}

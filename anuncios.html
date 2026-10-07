@@ -62,7 +62,7 @@ function tabela(rel){
   return rel.lojas.map(l=>`<h3>${esc(l.nome||l.shop_id)} — ${l.mudar.length} a mudar · ${l.igual} já certas · ${l.sem_par.length} sem par</h3>
    ${l.erros.length?`<p class="erro">${esc(l.erros.join(" | "))}</p>`:""}
    <div class="tbl"><table><tr><th>Anúncio / variação</th><th>SKU · cor</th><th>Nosso</th><th>XBZ</th><th>Antes</th><th>Depois</th></tr>
-   ${l.mudar.map(x=>`<tr><td>${esc(x.anuncio)}</td><td>${esc(x.sku)} · ${esc(x.cor)}${x.kit>1?" (kit "+x.kit+")":""}</td><td>${x.nosso}</td><td>${x.xbz}</td><td>${x.de??"—"}</td><td class="${(x.para>(x.de||0))?"sobe":"desce"}">${x.para}</td></tr>`).join("")}</table></div>
+   ${l.mudar.map(x=>`<tr><td>${esc(x.anuncio)}</td><td>${esc(x.sku)} · ${esc(x.cor)}${x.kit>1?" (kit "+x.kit+")":""}</td><td>${x.nosso}</td><td>${x.xbz}${x.xbz_ignorado?` <span title="XBZ com 100 ou menos conta como zero" style="color:#b45309">(≤100: não conta)</span>`:""}</td><td>${x.de??"—"}</td><td class="${(x.para>(x.de||0))?"sobe":"desce"}">${x.para}</td></tr>`).join("")}</table></div>
    ${l.sem_par.length?`<details><summary>${l.sem_par.length} variação(ões) que não mexo (SKU/cor não reconhecido)</summary><div class="tbl"><table><tr><th>Anúncio</th><th>SKU</th><th>Motivo</th></tr>${l.sem_par.map(x=>`<tr><td>${esc(x.anuncio)}</td><td>${esc(x.sku)}</td><td>${esc(x.motivo)}</td></tr>`).join("")}</table></div></details>`:""}`).join("");
 }
 async function simular(){$("sim").innerHTML="<p>Lendo os anúncios das lojas (pode levar 1 a 3 minutos)...</p>";$("sim").innerHTML=tabela(await get("/api/anuncios/simular"))}
