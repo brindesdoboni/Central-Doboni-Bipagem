@@ -31,7 +31,8 @@ td.nt{color:#f87171;font-weight:800}
  <div><table id="canais"></table><p style="font-size:22px" id="falta"></p></div>
 </main>
 <div id="emPausa"></div>
-<div id="surdo" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:50;background:#b45309;color:#fff;font-size:24px;font-weight:bold;padding:12px 20px;text-align:center">🔇 Os bipes dos computadores dos colaboradores NÃO estão aparecendo/tocando nesta central.<br><span style="font-size:20px;font-weight:normal">No ícone azul <b>B</b> perto do relógio: <b>Mostrar os bipes de...</b> → <b>TODOS (computador central)</b> → OK.<br>Não tem essa opção no menu? O Bipe Boni desta central é antigo: rode o <b>instalar.bat</b> do BipeBoni.zip novo <b>neste computador</b>.</span></div>
+<div id="cards" style="position:fixed;left:16px;bottom:16px;z-index:60;display:flex;flex-direction:column-reverse;gap:10px;width:min(720px,60vw)"></div>
+<div id="somOff" style="display:none;position:fixed;right:16px;bottom:16px;z-index:61;background:#b45309;color:#fff;font-size:22px;font-weight:bold;padding:12px 18px;border-radius:12px;cursor:pointer">🔇 Clique aqui para ligar o som dos bipes</div>
 <div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alN" style="font-size:56px;margin-top:16px"></div></div>
 <script>
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
@@ -49,7 +50,7 @@ async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-C
  $("canais").innerHTML="<tr><th>Canal</th>"+Object.values(NOM).map(n=>`<th>${n}</th>`).join("")+"<th>Não tem</th></tr>"+Object.entries(d.por_canal).map(([k,v])=>`<tr><td><b>${esc(k)}</b></td>`+Object.keys(NOM).map(s=>`<td>${v[s]}</td>`).join("")+`<td class="${v.FALTA?"nt":""}">${v.FALTA||0}</td></tr>`).join("");
 const CP={"SHOPEE ENTREGA RÁPIDA":"#a855f7","SHOPEE EXPRESS":"#f97316","SHOPEE":"#fdba74","TIKTOK":"#22d3ee","OUTROS":"#71717a"};
  $("plats").innerHTML=(d.plataformas||[]).map(p=>`<div class="pl${p.total&&!p.faltam?" ok":""}" style="border-top-color:${CP[p.grupo]||"#555"}"><h3>${esc(p.grupo)}</h3><div class="lin"><b>${p.total&&!p.faltam?"✓":p.faltam}</b>${p.faltam?`<div class="tipos"><i class="p">✏️ ${p.personalizados||0} personalizados</i><i class="s">📦 ${p.sem_personalizar||0} sem personalizar</i></div>`:""}</div><span>${p.total&&!p.faltam?"tudo enviado":"a enviar"} · subiram ${p.total} · saíram ${p.enviados}</span></div>`).join("");
- $("surdo").style.display=d.central_ouvindo===false?"block":"none";
+ OUVE=d.central_ouvindo===true;
  $("falta").textContent=d.falta_material?`⚠ ${d.falta_material} pedido(s) com falta de material`:"";
 }catch(e){}}
 // café
@@ -67,4 +68,28 @@ function tick(){const n=new Date();$("relogio").textContent=n.toLocaleTimeString
  e.textContent=`☕ ${px.nome} — ${px.pessoas} em ${Math.floor(px.f/60)}:${String(px.f%60).padStart(2,"0")}`}
 document.addEventListener("click",()=>{try{ctx=ctx||new AudioContext();ctx.resume()}catch(e){}},{once:true});
 carregar();setInterval(carregar,2000);pausas();setInterval(pausas,300000);setInterval(tick,1000);tick();
+
+// ---- bipes feitos nos computadores dos colaboradores: aparecem e tocam aqui na TV da central
+const VBASE=[523,587,659,698,784,880,988,1047],VOK=[[[0,90],[4,90],[7,170]],[[0,120],[null,40],[12,220]],[[7,80],[4,80],[7,80],[12,200]],[[0,60],[2,60],[4,60],[5,60],[7,200]],[[12,110],[7,110],[12,220]],[[0,90],[7,90],[0,90],[7,200]],[[4,140],[9,260]],[[0,70],[null,30],[0,70],[null,30],[12,220]]],VAV=[[[-5,130],[null,60],[-5,130]],[[-3,160],[-8,220]],[[-5,80],[null,50],[-5,80],[null,50],[-5,80]],[[-8,220],[-5,140]],[[-2,120],[null,50],[-7,200]],[[-5,100],[-4,100],[-5,200]],[[-10,180],[null,60],[-10,180]],[[-7,90],[-3,90],[-7,180]]],VER=[[[-12,220],[-17,220],[-12,220],[-17,220],[-24,550]],[[-12,130],[null,50],[-12,130],[null,50],[-12,130],[null,50],[-24,600]],[[-10,150],[-22,150],[-10,150],[-22,150],[-10,150],[-22,150],[-29,400]],[[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-12,90],[-13,90],[-24,400]],[[-7,300],[-19,600]],[[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120],[null,40],[-17,120]],[[-12,180],[-15,180],[-18,180],[-24,500]],[[-14,250],[-12,250],[-14,250],[-24,500]]];
+function vozInfo(v){v=((v|0)%16+16)%16;return {m:v%8,t:Math.floor(v/8),b:VBASE[(v+Math.floor(v/8)*4)%8]}}
+function tonsVoz(v,tipo){const i=vozInfo(v),M=(tipo==="ok"?VOK:tipo==="aviso"?VAV:VER)[i.m];
+ return M.map(([s,d])=>[s===null?0:Math.round(i.b*Math.pow(2,s/12)),d])}
+function timbreVoz(v,tipo){return tipo==="erro"?"square":vozInfo(v).t?"sawtooth":"triangle"}
+let AC=null;function tocarVoz(v,tipo){try{AC=AC||new AudioContext();AC.resume();let t=AC.currentTime+.02;
+ for(const [f,ms] of tonsVoz(v,tipo)){const d=ms/1000;if(f){const o=AC.createOscillator(),g=AC.createGain();o.type=timbreVoz(v,tipo);o.frequency.value=f;o.connect(g);g.connect(AC.destination);
+  const vol=tipo==="erro"?.6:o.type==="sawtooth"?.25:.4;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}t+=d}}catch(e){}}
+let OUVE=false,FD=null;
+const CORC={ok:"#15803d",aviso:"#b45309",erro:"#b91c1c",operador:"#1d4ed8"};
+function cardBipe(b){const it=b.item||{},tipo=CORC[b.tipo]?b.tipo:"erro";const el=document.createElement("div");
+ el.style.cssText=`background:${CORC[tipo]};color:#fff;border-radius:14px;padding:14px 18px;box-shadow:0 6px 24px #0008;font-size:22px`;
+ el.innerHTML=`<div style="font-size:17px;opacity:.9;font-weight:bold">💻 ${esc((b.colaborador||"SEM OPERADOR").toUpperCase())} · ${esc(b.posto||"")} · ${esc(b.em||"")}</div><div style="font-size:30px;font-weight:900;margin:2px 0">${esc(b.msg||"")}</div>`+
+  (b.item?`<div style="font-size:19px">SKU ${esc(it.sku)}${it.cor?" · "+esc(it.cor):""}${it.nomes?` · Nome: <b>${esc(it.nomes)}</b>`:""}${it.pedido?" · Pedido "+esc(it.pedido):""}</div>`:"")+(b.fazer?`<div style="font-size:19px;margin-top:4px">👉 ${esc(b.fazer)}</div>`:"");
+ const c=$("cards");c.prepend(el);while(c.children.length>4)c.lastChild.remove();setTimeout(()=>el.remove(),b.tipo==="erro"?12000:6000);
+ tocarVoz(b.voz??0,tipo==="operador"?"ok":tipo)}
+async function feed(){try{const r=await fetch("/api/bipes/meus?op=TODOS&tv=1"+(FD!=null?"&desde="+FD:""),{headers:{"X-Chave":chave}});if(!r.ok)return;const d=await r.json();
+ if(FD!=null&&!OUVE)(d.bipes||[]).filter(b=>b.origem==="pc"||(!b.origem&&!b.leitor)).forEach(cardBipe);FD=d.ultimo}catch(e){}
+ try{$("somOff").style.display=(!AC||AC.state!=="running")?"block":"none"}catch(e){}}
+$("somOff").onclick=()=>{try{AC=AC||new AudioContext();AC.resume().then(()=>{$("somOff").style.display="none";tocarVoz(0,"ok")})}catch(e){}};
+document.addEventListener("click",()=>{try{AC=AC||new AudioContext();AC.resume()}catch(e){}});
+setInterval(feed,1000);feed();
 </script></body></html>

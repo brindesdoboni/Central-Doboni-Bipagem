@@ -555,14 +555,14 @@ def _voz_de(codigo):
 
 # ---- "meus bipes": o computador da mesa de cada operador mostra so o que ELE bipou (o leitor sem fio manda para o PC
 # central). Fica so na memoria: os ultimos bipes, com a mesma resposta que o PC central recebeu.
-def _feed_add(posto, codigo, operador, leitor, r, quem=None):
+def _feed_add(posto, codigo, operador, leitor, r, quem=None, origem=""):
     # bipe sem cracha entra com op "" (so o computador central, em TODOS, ve)
     if quem is None:
         quem = norm(codigo) if r.get("tipo") == "operador" else norm(operador)
     it = r.get("item") or {}
     dados = {"em": datetime.now(BR).strftime("%H:%M:%S"), "op": quem, "posto": (posto or "").upper(), "leitor": leitor or "",
              "codigo": norm(codigo), "tipo": r.get("tipo"), "msg": r.get("msg"), "fazer": r.get("fazer"), "evento": r.get("evento"),
-             "voz": r.get("voz"), "colaborador": r.get("colaborador"),
+             "voz": r.get("voz"), "colaborador": r.get("colaborador"), "origem": str(origem or "")[:20],
              "item": {k: it.get(k) for k in ("sku", "cor", "nomes", "fonte", "etiqueta", "pedido", "canal")} if it else None}
     with _lock, conn() as c:   # rapido (1 linha); com a trava para nunca perder um bipe
         iid = c.execute("INSERT INTO bipes_log(em, op, dados) VALUES(?,?,?)",
@@ -574,13 +574,13 @@ def _feed_add(posto, codigo, operador, leitor, r, quem=None):
 _todos_visto = {"t": 0.0}   # ultima vez que o computador central (Bipe Boni em TODOS) pediu os bipes
 
 
-def meus_bipes(op, desde=None):
+def meus_bipes(op, desde=None, marcar=True):
     """Bipes do operador depois do id 'desde'. Sem 'desde': so devolve onde a fila esta (nao mostra bipe antigo)."""
     op = norm(op)
     todos = op == "TODOS"   # computador central: mostra os bipes de todo mundo (inclusive os feitos nos PCs dos colaboradores)
     if not op:
         return {"ok": False, "nome": "", "ultimo": 0, "bipes": []}
-    if todos:
+    if todos and marcar:   # a TV tambem le TODOS, mas quem "ouve" de verdade e o Bipe Boni da central
         _todos_visto["t"] = time.time()
     with conn() as c:
         col = ("Todos",) if todos else c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
@@ -596,11 +596,11 @@ def meus_bipes(op, desde=None):
     return {"ok": bool(col), "nome": col[0] if col else "", "ultimo": ultimo, "bipes": L[::-1]}
 
 
-def bipar(posto, codigo, operador, modo, leitor=""):
+def bipar(posto, codigo, operador, modo, leitor="", origem=""):
     r = _bipar_resp(posto, codigo, operador, modo, leitor)
     if r.get("tipo") != "ignorado":
         try:
-            _feed_add(posto, codigo, operador, leitor, r)
+            _feed_add(posto, codigo, operador, leitor, r, origem=origem)
         except Exception as e:
             print("feed:", e, flush=True)
     return r
@@ -3178,7 +3178,7 @@ class H(BaseHTTPRequestHandler):
                 desde = int(q["desde"]) if q.get("desde", "") != "" else None
             except ValueError:
                 desde = None
-            return self._envia(200, meus_bipes(q.get("op") or "", desde))
+            return self._envia(200, meus_bipes(q.get("op") or "", desde, marcar=not q.get("tv")))
         if p == "/api/pausas":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -3396,12 +3396,13 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 col = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (opr,)).fetchone() if opr else None
             r = {"tipo": "operador", "msg": "Setor: " + posto, "evento": "operador", "colaborador": col[0] if col else "",
                  "fazer": None if col else "Bipe o CRACHA", "voz": _voz_de(opr) if col else None}
-            _feed_add(posto, "CMD" + posto, opr, d.get("leitor") or "", r, quem=opr)
+            _feed_add(posto, "CMD" + posto, opr, d.get("leitor") or "", r, quem=opr, origem=d.get("origem") or "")
             return self._envia(200, {"ok": True})
         if p == "/api/bipe":
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
-            return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo"), d.get("leitor") or ""))
+            return self._envia(200, bipar(d.get("posto"), d.get("codigo"), d.get("operador"), d.get("modo"), d.get("leitor") or "",
+                                             d.get("origem") or ""))
         if p.startswith("/api/devolucoes/"):
             # pagina de devolucoes: senha do painel OU chave da operacao (posto)
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY)):
