@@ -555,10 +555,10 @@ def _voz_de(codigo):
 
 # ---- "meus bipes": o computador da mesa de cada operador mostra so o que ELE bipou (o leitor sem fio manda para o PC
 # central). Fica so na memoria: os ultimos bipes, com a mesma resposta que o PC central recebeu.
-def _feed_add(posto, codigo, operador, leitor, r):
-    quem = norm(codigo) if r.get("tipo") == "operador" else norm(operador)
-    if not quem:
-        return
+def _feed_add(posto, codigo, operador, leitor, r, quem=None):
+    # bipe sem cracha entra com op "" (so o computador central, em TODOS, ve)
+    if quem is None:
+        quem = norm(codigo) if r.get("tipo") == "operador" else norm(operador)
     it = r.get("item") or {}
     dados = {"em": datetime.now(BR).strftime("%H:%M:%S"), "op": quem, "posto": (posto or "").upper(), "leitor": leitor or "",
              "codigo": norm(codigo), "tipo": r.get("tipo"), "msg": r.get("msg"), "fazer": r.get("fazer"), "evento": r.get("evento"),
@@ -575,6 +575,8 @@ def meus_bipes(op, desde=None):
     """Bipes do operador depois do id 'desde'. Sem 'desde': so devolve onde a fila esta (nao mostra bipe antigo)."""
     op = norm(op)
     todos = op == "TODOS"   # computador central: mostra os bipes de todo mundo (inclusive os feitos nos PCs dos colaboradores)
+    if not op:
+        return {"ok": False, "nome": "", "ultimo": 0, "bipes": []}
     with conn() as c:
         col = ("Todos",) if todos else c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
         ultimo = c.execute("SELECT COALESCE(MAX(id),0) FROM bipes_log").fetchone()[0]
@@ -3379,6 +3381,18 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True}, extra={
                     "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
             return self._envia(403, {"erro": "senha incorreta"})
+        if p == "/api/bipes/setor":
+            # o leitor trocou de setor (etiqueta de SETOR): so avisa o computador central, nao muda nada na operacao
+            if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
+                return self._envia(403, {"ok": False})
+            posto = str(d.get("posto") or "").upper()[:20]
+            opr = norm(d.get("operador"))
+            with conn() as c:
+                col = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (opr,)).fetchone() if opr else None
+            r = {"tipo": "operador", "msg": "Setor: " + posto, "evento": "operador", "colaborador": col[0] if col else "",
+                 "fazer": None if col else "Bipe o CRACHA", "voz": _voz_de(opr) if col else None}
+            _feed_add(posto, "CMD" + posto, opr, d.get("leitor") or "", r, quem=opr)
+            return self._envia(200, {"ok": True})
         if p == "/api/bipe":
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
                 return self._envia(403, {"tipo": "erro", "msg": "Chave do posto invalida."})
