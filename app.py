@@ -700,10 +700,14 @@ def _bipar(posto, codigo, operador, modo):
 
         if modo == "FALTA":
             it = itens[0]
-            if it["falta_material"]:
-                return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}", "item": dict(it)}
-            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}", "evento": "falta",
-                    "item": ev(it, "FALTA_MATERIAL", "falta de material")}
+            if it["falta_material"]:   # ja estava NAO TEM (as vezes marcado sozinho): a pessoa confirmou que nao tem -> zera
+                z = _zerar_por_falta(c, dict(it), agora(), op["nome"])
+                return {"tipo": "aviso", "msg": f"Ja estava marcado como NAO TEM - {it['sku']}" + (f"  ·  estoque de {z} zerado" if z else ""),
+                        "item": dict(it)}
+            r_ = ev(it, "FALTA_MATERIAL", "falta de material")
+            z = _zerar_por_falta(c, dict(it), agora(), op["nome"])   # bipou NAO TEM: a prateleira esta vazia -> estoque zera
+            return {"tipo": "aviso", "msg": f"FALTA DE MATERIAL registrada - {it['sku']}" + (f"  ·  estoque de {z} zerado" if z else ""),
+                    "evento": "falta", "item": r_}
 
         if posto == "SEPARACAO":
             alvo = next((i for i in itens if ORDEM[i["status"]] < ORDEM["SEPARADO"]), None)
@@ -1016,6 +1020,10 @@ def upseller_espelho(pedidos, aplicar=False, forcar=False):
                 lst.append(it)
         r = importar_lote({"lote": "UPSELLER " + datetime.now(BR).strftime("%d/%m %H:%M"), "itens": lst})
         res["criadas"] = r.get("novos", 0)
+    try:
+        garantir_baixas()
+    except Exception as e:
+        print("garantir baixas (upseller):", e, flush=True)
     _op_cache["v"] = None
     print(f"UpSeller: {len(pedidos)} pedidos; {len(sair)} sairam da conta, {len(voltar)} voltaram, {len(novos)} pedidos novos", flush=True)
     return res
@@ -3116,6 +3124,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
         if p == "/api/estoque/garantir-baixas":
             _conhecidos_cache["v"] = None
             return self._envia(200, {"linha_certa": corrigir_baixas_erradas(), "separadas": garantir_baixas(q.get("desde"))})
+        if p == "/api/estoque/zerar-faltas":
+            return self._envia(200, zerar_faltas_bipadas(q.get("desde")))
         if p == "/api/estoque/corrigir-baixas":
             _conhecidos_cache["v"] = None
             return self._envia(200, corrigir_baixas_erradas())
@@ -4168,11 +4178,65 @@ def corrigir_baixas_erradas():
     return {"ok": True, "corrigidas": len(feitos), "exemplos": [f"{f[3]} {f[4] or 'sem cor'} -> {f[1]} {f[2] or 'PADRAO'}" for f in feitos[:30]]}
 
 
+def completar_auto_sem_sku():
+    """Etiquetas que entraram no 1o bipe sem SKU (nao estavam na Central) e por isso NAO deram baixa:
+    quando o pedido aparece na Shopee ou no espelho do UpSeller, completa SKU/cor/personalizado. Depois a baixa sai
+    pelo garantir_baixas (com a hora da separacao)."""
+    feitos = 0
+    with _lock, conn() as c:
+        for it in c.execute("SELECT * FROM itens WHERE lote='AUTO' AND COALESCE(sku,'')=''").fetchall():
+            cods = [r[0] for r in c.execute("SELECT codigo FROM codigos WHERE item_id=?", (it["id"],))] + [norm(it["pedido"])]
+            pecas, sem, pers, loja = [], [], None, ""
+            for k in cods:
+                sp = c.execute("SELECT * FROM shopee_pedidos WHERE order_sn=?", (k,)).fetchone()
+                if sp:
+                    loja = sp["loja"] or ""
+                    for i in json.loads(sp["itens"] or "[]"):
+                        cr = (i.get("var") or "").split(",")[0].strip()
+                        pecas.append({"sku": estoque_chave(i.get("sku") or "")[0] or (i.get("sku") or ""), "cor": cr, "qtd": int(i.get("qtd") or 1)})
+                        t = f"{i.get('sku') or ''} {i.get('var') or ''}"
+                        sem.append(bool(re.search(r"SEM\s+PERSONALIZ", t, re.I)))
+                        pers = 1 if _texto_personalizado(t) else pers
+                    break
+                up = c.execute("SELECT * FROM upseller_pedidos WHERE codigo=?", (k,)).fetchone()
+                if up and up["itens"]:
+                    loja = up["loja"] or ""
+                    for x in json.loads(up["itens"] or "[]"):
+                        s_, cr, p_, q, _t = _ups_linha(x)
+                        pecas.append({"sku": s_, "cor": cr, "qtd": q})
+                        sem.append(p_ is False)
+                        pers = 1 if p_ else pers
+                    if up["pedido"]:
+                        c.execute("INSERT OR IGNORE INTO codigos VALUES(?,?)", (norm(up["pedido"]), it["id"]))
+                    break
+            pecas = [p for p in pecas if p["sku"]]
+            if not pecas:
+                continue
+            if pers is None:
+                pers = 0 if sem and all(sem) else 1
+            sku = " + ".join(dict.fromkeys(p["sku"] for p in pecas))
+            cor = " + ".join(dict.fromkeys(p["cor"] for p in pecas if p["cor"]))
+            c.execute("""UPDATE itens SET sku=?, cor=?, pecas=?, qtd=?, loja=COALESCE(NULLIF(loja,''),?),
+                         personalizado=CASE WHEN status IN ('EXPEDIDO','DEVOLVIDO') THEN personalizado ELSE ? END,
+                         obs=REPLACE(COALESCE(obs,''),' - completar SKU no painel',' (SKU completado sozinho)'), atualizado_em=? WHERE id=?""",
+                      (sku, cor, json.dumps(pecas, ensure_ascii=False), sum(p["qtd"] for p in pecas), loja, pers, agora(), it["id"]))
+            feitos += 1
+    if feitos:
+        _op_cache["v"] = None
+        print(f"{feitos} etiqueta(s) incluida(s) no bipe ganharam SKU (vao dar baixa)", flush=True)
+    return feitos
+
+
 def garantir_baixas(desde=None):
     """Toda etiqueta separada (ou gravada/expedida sem passar pela separacao) desde a contagem geral tem que ter
     saido do estoque. Da a baixa que faltou, com a hora da separacao. Nao desconta de novo o que uma contagem feita
     depois ja pegou. Pode rodar quantas vezes quiser (cada etiqueta baixa uma vez so)."""
     desde = desde or ESTOQUE_CONTAGEM_GERAL
+    try:
+        completados = completar_auto_sem_sku()
+    except Exception as e:
+        print("completar auto:", e, flush=True)
+        completados = 0
     with conn() as c:
         cand = c.execute("""SELECT e.item_id, MIN(e.em) quando FROM eventos e JOIN itens i ON i.id=e.item_id
                             WHERE e.desfeito=0 AND e.etapa IN ('SEPARADO','GRAVACAO_INICIO','GRAVACAO_FIM','EXPEDIDO')
@@ -4211,7 +4275,12 @@ def garantir_baixas(desde=None):
         por[f"{sku} {cor}"] = por.get(f"{sku} {cor}", 0) + q
     if feitos:
         print(f"Estoque: {len(feitos)} baixa(s) de separacao que faltavam foram feitas", flush=True)
-    return {"ok": True, "desde": desde, "etiquetas_sem_baixa": len(faltam), "baixas_feitas": len(feitos),
+    with conn() as c:
+        sem_lista = [dict(r) for r in c.execute("""SELECT pedido, status, em FROM (SELECT i.pedido, i.status, MIN(e.em) em FROM itens i
+                     JOIN eventos e ON e.item_id=i.id AND e.desfeito=0 WHERE i.lote='AUTO' AND COALESCE(i.sku,'')='' AND e.em>=?
+                     GROUP BY i.id) ORDER BY em DESC LIMIT 300""", (desde,))]
+    return {"ok": True, "desde": desde, "completadas": completados, "sem_sku_lista": sem_lista,
+            "etiquetas_sem_baixa": len(faltam), "baixas_feitas": len(feitos),
             "pecas": sum(q for _, _, q in feitos), "ja_na_contagem": pulados, "sem_sku": sem_sku,
             "por_produto": sorted(por.items(), key=lambda x: -x[1])[:60]}
 
@@ -4246,6 +4315,61 @@ def reiniciar_etapas(desfazer=False, so_hoje=False):
             recalcular(c, iid)
         por = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM itens GROUP BY status")}
     return {"ok": True, "itens": len(ids), "agora": por}
+
+
+def _zerar_por_falta(c, item, quando, quem=""):
+    """Bipou 'NAO TEM' (falta de material): aquele produto/cor nao esta na prateleira -> o estoque fica ZERO
+    (lancado como contagem 0, com hora e quem bipou). So mexe quando a etiqueta e de um produto/cor so."""
+    chaves = set()
+    for sku, cor, _q in _pecas_do_item(item):
+        if not sku or sku.startswith("("):
+            continue
+        k = _peca_no_estoque(c, item, sku, cor)
+        if k[0] and not k[0].startswith("("):
+            chaves.add(k)
+    if len(chaves) != 1:
+        return ""
+    sku, cn = chaves.pop()
+    saldo = c.execute("SELECT COALESCE(SUM(qtd),0) FROM estoque_mov WHERE sku=? AND cor=?", (sku, cn)).fetchone()[0]
+    if saldo == 0:
+        return f"{sku} {cn or 'PADRAO'}"
+    c.execute("INSERT OR IGNORE INTO estoque_mov(em,sku,cor,qtd,tipo,ref,obs) VALUES(?,?,?,?,?,?,?)",
+              (quando, sku, cn, -saldo, "CONTAGEM", f"FALTA|{item['id']}|{sku}|{cn}|{quando}",
+               f"contagem: 0 (NAO TEM bipado{' por ' + quem if quem else ''}: prateleira vazia; estava {saldo:g})"))
+    return f"{sku} {cn or 'PADRAO'} (estava {saldo:g})"
+
+
+def zerar_faltas_bipadas(desde=None):
+    """'NAO TEM' bipados (por uma pessoa) desde a contagem geral que ainda nao zeraram o estoque: zera agora,
+    se depois do bipe nao entrou material nem houve contagem. Pode rodar quantas vezes quiser."""
+    desde = desde or ESTOQUE_CONTAGEM_GERAL
+    feitos = []
+    with _lock, conn() as c:
+        evs = c.execute("""SELECT e.item_id, MAX(e.em) em, k.nome FROM eventos e LEFT JOIN colaboradores k ON k.id=e.colaborador_id
+                           WHERE e.etapa='FALTA_MATERIAL' AND e.desfeito=0 AND e.colaborador_id IS NOT NULL
+                           AND COALESCE(e.posto,'')<>'ESTOQUE' AND e.em>=? GROUP BY e.item_id""", (desde,)).fetchall()
+        ult = {}
+        for e in evs:
+            it = c.execute("SELECT * FROM itens WHERE id=?", (e["item_id"],)).fetchone()
+            if not it:
+                continue
+            chaves = {_peca_no_estoque(c, dict(it), s_, c_) for s_, c_, _q in _pecas_do_item(dict(it)) if s_ and not s_.startswith("(")}
+            if len(chaves) != 1:
+                continue
+            k = chaves.pop()
+            if k not in ult or e["em"] > ult[k][0]:
+                ult[k] = (e["em"], dict(it), e["nome"] or "")
+        for (sku, cn), (em, it, quem) in ult.items():
+            depois = c.execute("""SELECT 1 FROM estoque_mov WHERE sku=? AND cor=? AND em>=? AND
+                                  tipo IN ('CONTAGEM','ENTRADA_NF','ENTRADA_XBZ','DISTRIBUI','AJUSTE') LIMIT 1""", (sku, cn, em)).fetchone()
+            if depois:
+                continue
+            z = _zerar_por_falta(c, it, agora(), quem)
+            if z and "estava" in z:
+                feitos.append(z)
+    if feitos:
+        print(f"Estoque zerado por NAO TEM bipado: {', '.join(feitos[:20])}", flush=True)
+    return {"ok": True, "zerados": feitos}
 
 
 def _ids_cancelados(c):
@@ -6099,6 +6223,10 @@ def shopee_sincronizar_todas():
         limpar_etiquetas()
     except Exception as e:
         print("limpeza:", e, flush=True)
+    try:   # etiqueta incluida no bipe que agora tem pedido na Shopee: ganha SKU e da a baixa que faltou
+        garantir_baixas()
+    except Exception as e:
+        print("garantir baixas (shopee):", e, flush=True)
     return out
 
 
@@ -6524,6 +6652,10 @@ if __name__ == "__main__":
         corrigir_auto_sem_prova()
     except Exception as e:
         print("auto sem prova:", e, flush=True)
+    try:
+        zerar_faltas_bipadas()
+    except Exception as e:
+        print("zerar faltas:", e, flush=True)
     if _email_status["ativo"] or (XBZ_EMAIL_USUARIO and XBZ_EMAIL_SENHA):
         threading.Thread(target=_email_loop, daemon=True).start()
     if os.environ.get("XBZ_TOKEN"):
