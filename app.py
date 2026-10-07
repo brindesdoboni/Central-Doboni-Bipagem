@@ -574,12 +574,15 @@ def _feed_add(posto, codigo, operador, leitor, r):
 def meus_bipes(op, desde=None):
     """Bipes do operador depois do id 'desde'. Sem 'desde': so devolve onde a fila esta (nao mostra bipe antigo)."""
     op = norm(op)
+    todos = op == "TODOS"   # computador central: mostra os bipes de todo mundo (inclusive os feitos nos PCs dos colaboradores)
     with conn() as c:
-        col = c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
+        col = ("Todos",) if todos else c.execute("SELECT nome FROM colaboradores WHERE codigo=? AND ativo=1", (op,)).fetchone()
         ultimo = c.execute("SELECT COALESCE(MAX(id),0) FROM bipes_log").fetchone()[0]
         L = []
         if desde is not None and desde <= ultimo:
-            for r in c.execute("SELECT id, dados FROM bipes_log WHERE op=? AND id>? ORDER BY id DESC LIMIT 30", (op, desde)):
+            sql, args = (("SELECT id, dados FROM bipes_log WHERE id>? ORDER BY id DESC LIMIT 60", (desde,)) if todos else
+                         ("SELECT id, dados FROM bipes_log WHERE op=? AND id>? ORDER BY id DESC LIMIT 30", (op, desde)))
+            for r in c.execute(sql, args):
                 x = json.loads(r[1])
                 x["id"] = r[0]
                 L.append(x)
