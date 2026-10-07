@@ -47,7 +47,7 @@ dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-r
 <div class="box"><h2>Alertas</h2><div id="alertas"></div></div>
 <div class="box"><h2>Por plataforma (pedidos)</h2><table id="plats"></table></div>
 <div class="box"><h2>Por canal</h2><table id="canais"></table></div>
-<div class="box"><h2>Equipe (dia)</h2><table id="equipe"></table><p class="mut" style="font-size:13px">⏸ Parado = tempo entre o 1º e o último bipe de cada um sem estar separando, gravando (do 1º ao 2º bipe da peça) ou expedindo. Cada bipe conta ~3 min de trabalho; pausas cadastradas não contam como parado. Só aparece aqui no seu painel.</p></div>
+<div class="box"><h2 style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">Equipe <input type="date" id="eqData" title="Escolha o dia para ver a produtividade"> <button onclick="abrirMetas()">🎯 Metas</button></h2><div style="overflow-x:auto"><table id="equipe"></table></div><p class="mut" style="font-size:13px">⏸ Parado = tempo entre o 1º e o último bipe sem estar separando, gravando (do 1º ao 2º bipe da peça) ou expedindo (cada bipe conta ~3 min de trabalho). Não conta como parado: pausas cadastradas (café) e o 🍽 almoço — o maior intervalo dentro do horário de almoço, até o tempo de almoço (o que passar disso conta como parado). ✅ Produtivo = tempo trabalhando ÷ (do 1º ao último bipe − almoço − pausas). Na meta: <b style="color:#15803d">verde</b> bateu, <b style="color:#d97706">amarelo</b> 80–99%, <b style="color:#d7263d">vermelho</b> abaixo de 80%. Só aparece aqui no seu painel.</p></div>
 <div class="box"><div class="row" style="justify-content:space-between"><h2>Pedidos</h2>
 <div class="row"><input id="busca" placeholder="Buscar pedido, nome, SKU…" oninput="tabela()"><select id="fst" onchange="tabela()"><option value="">Todos</option>
 <option>AGUARDANDO</option><option>SEPARADO</option><option>EM_GRAVACAO</option><option>GRAVADO</option><option>EXPEDIDO</option><option>DEVOLVIDO</option><option value="FALTA">Falta material</option></select></div></div>
@@ -128,6 +128,12 @@ dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-r
 <dialog id="dlgMail" class="largo"><h2>Etiquetas por e-mail</h2><p id="mSt"></p>
 <p class="mut">Mande ou encaminhe o PDF de etiquetas do UpSeller para o e-mail da Central. A cada 1 minuto ela lê os e-mails novos e inclui as etiquetas sozinha (reenviar o mesmo PDF não duplica).</p>
 <table id="mLista"></table><p><button onclick="carregarMail()">Atualizar</button> <button onclick="dlgMail.close()">Fechar</button></p></dialog>
+<dialog id="dlgMeta" class="largo"><h2>🎯 Metas da equipe</h2>
+<p class="mut" style="margin-top:0">Linha <b>Geral</b> vale para todos. Na linha de cada pessoa, preencha só o que for diferente para ela (vazio = usa a geral). Deixe vazio/0 para não ter meta naquela coisa.</p>
+<div class="row"><b>🍽 Almoço:</b> <label>dura <input id="mtAlm" type="number" min="0" max="180" style="width:70px"> min</label> <label>entre <input id="mtAlDe" type="time"></label> <label>e <input id="mtAlAte" type="time"></label></div>
+<div style="overflow-x:auto;margin-top:10px"><table id="mtTab"></table></div>
+<p id="mtMsg" class="mut"></p>
+<p><button onclick="sugerirMetas()">💡 Sugerir pelas últimas 3 semanas</button> <button onclick="salvarMetas()" style="background:#16a34a;color:#fff">Salvar</button> <button onclick="dlgMeta.close()">Fechar</button></p></dialog>
 <dialog id="dlgPau"><h2>Pausas (contagem regressiva nos postos)</h2><div class="row"><input id="pNome" placeholder="Ex.: Café da tarde" value="Café da tarde"><input id="pHora" type="time"><input id="pPes" placeholder="Quem (ex.: Rafael, Guilherme)"><label>Duração <input id="pDur" type="number" min="1" max="240" value="15" style="width:70px"> min</label><button onclick="addPau()">Adicionar</button></div>
 <table id="paus" style="margin-top:10px"></table><p style="color:var(--mut);font-size:13px">Na hora, a tela dos postos pisca em vermelho por 30 s com som. A contagem aparece 1 hora antes. Durante a pausa, fica embaixo na tela a contagem regressiva até a volta (pela duração).</p><p><button onclick="dlgPau.close()">Fechar</button></p></dialog>
 <dialog id="dlgCol"><h2>Equipe</h2><div class="row"><input id="nNome" placeholder="Nome"><select id="nFunc"><option>Separação</option><option>Gravação</option><option>Expedição</option><option>Gerência</option><option>Devolução</option></select><button onclick="addCol()">Adicionar</button></div>
@@ -140,8 +146,48 @@ const SEL=new Set();
 let D=null;
 $("data").value=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
 $("data").onchange=carregar;
+
+// ---- equipe: dia escolhido + metas
+const hmE=m=>m==null?"-":m>=60?`${Math.floor(m/60)}h${String(Math.round(m%60)).padStart(2,"0")}`:`${Math.round(m)} min`;
+const corM=p=>p==null?"inherit":p>=100?"#15803d":p>=80?"#d97706":"#d7263d";
+const selo=p=>p==null?"":` <b style="color:${corM(p)};font-size:12px">${p}%</b>`;
+let EQ_DIA=null;
+function renderEquipe(E,M){E=E||{};const L=Object.entries(E);
+ const meta=(p,k,suf="")=>p.metas&&p.metas[k]&&(!["separados","gravados","expedidos"].includes(k)||(p.atingido&&k in p.atingido))?`<span class="mut" style="font-size:12px"> / ${p.metas[k]}${suf}</span>`:"";
+ const cel=(p,k,v,suf="")=>`<td>${v??"-"}${v!=null?suf:""}${meta(p,k,suf)}${selo(p.atingido&&p.atingido[k])}</td>`;
+ const tot={separados:0,gravados:0,expedidos:0,devolucoes:0,faltas:0,parado:0,base:0,trab:0};
+ const linhas=L.map(([n,p])=>{tot.separados+=p.separados;tot.gravados+=p.gravados;tot.expedidos+=p.expedidos;tot.devolucoes+=p.devolucoes||0;tot.faltas+=p.faltas;
+  if(p.parado_min!=null){tot.parado+=p.parado_min;tot.trab+=p.trabalhando_min||0}
+  const al=p.almoco?`${hmE(p.almoco.min)} <span class="mut">${p.almoco.de}–${p.almoco.ate}</span>${p.almoco.passou_min>=5?` <b style="color:#d7263d" title="passou do tempo de almoço (conta como parado)">+${hmE(p.almoco.passou_min)}</b>`:""}`:`<span class="mut">${p.pausas_min?"pausa cadastrada":"—"}</span>`;
+  const pa=p.parado_min!=null?`<b style="color:${p.pct_parado>=30?"#d7263d":p.pct_parado>=15?"#d97706":"inherit"}">${hmE(p.parado_min)}</b> <span class="mut">(${p.pct_parado}%)</span>${meta(p,"parado_max_min"," min")}${selo(p.atingido&&p.atingido.parado_max_min)}`:"-";
+  const pr=p.produtivo_pct!=null?`<b style="color:${corM(p.atingido&&p.atingido.produtivo_pct)}">${p.produtivo_pct}%</b>${meta(p,"produtivo_pct","%")}`:"-";
+  return `<tr><td><b>${esc(n)}</b></td>${cel(p,"separados",p.separados)}${cel(p,"gravados",p.gravados)}${cel(p,"grav_min_peca",p.media_gravacao_min," min")}${cel(p,"expedidos",p.expedidos)}<td>${p.devolucoes||0}</td><td>${p.faltas}</td><td>${hmE(p.no_trabalho_min)}</td><td>${al}</td><td>${pa}</td><td>${pr}</td><td>${p.maior_parada?`${hmE(p.maior_parada.min)} <span class="mut">${p.maior_parada.de}–${p.maior_parada.ate}</span>`:"-"}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}${p.ultimo_bipe_ha_min!=null&&p.ultimo_bipe_ha_min>=10?` <span class="mut">(há ${hmE(p.ultimo_bipe_ha_min)})</span>`:""}</td></tr>`}).join("");
+ const tp=tot.trab+tot.parado>0?Math.round(100*tot.trab/(tot.trab+tot.parado)):null;
+ $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Tempo por peça (gravando)</th><th>Expedidos</th><th>Devol.</th><th>Faltas</th><th title='Do 1º ao último bipe'>No trabalho</th><th>🍽 Almoço</th><th>⏸ Parado</th><th>✅ Produtivo</th><th>Maior parada</th><th>1º bipe</th><th>Último</th></tr>"+
+  (L.length?linhas+`<tr style="border-top:2px solid var(--bd)"><td><b>Equipe</b></td><td><b>${tot.separados}</b></td><td><b>${tot.gravados}</b></td><td></td><td><b>${tot.expedidos}</b></td><td>${tot.devolucoes}</td><td>${tot.faltas}</td><td></td><td></td><td><b>${hmE(tot.parado)}</b></td><td><b>${tp??"-"}${tp!=null?"%":""}</b></td><td colspan="3"></td></tr>`:`<tr><td colspan="14" class="mut">Ninguém bipou neste dia.</td></tr>`)}
+async function carregarEquipe(){const d=$("eqData").value;if(!d)return;
+ if(d===$("data").value&&typeof D!=="undefined"&&D)return renderEquipe(D.equipe,D.metas_equipe);
+ $("equipe").innerHTML="<tr><td class='mut'>Carregando…</td></tr>";
+ try{const r=await fetch("/api/equipe?data="+d);EQ_DIA=await r.json();renderEquipe(EQ_DIA.equipe,EQ_DIA.metas_equipe)}catch(e){$("equipe").innerHTML="<tr><td>Não consegui carregar.</td></tr>"}}
+$("eqData").addEventListener("change",carregarEquipe);
+const MC=[["separados","Separados / dia",""],["gravados","Gravações / dia",""],["expedidos","Expedidos / dia",""],["produtivo_pct","% produtivo (mínimo)","%"],["grav_min_peca","Tempo por peça gravando (máx.)","min"],["parado_max_min","Parado no dia (máx.)","min"]];
+let METAS=null;
+async function abrirMetas(){dlgMeta.showModal();$("mtMsg").textContent="";
+ const [m,cols]=await Promise.all([fetch("/api/equipe?data="+$("eqData").value).then(r=>r.json()).then(x=>x.metas_equipe),fetch("/api/colaboradores").then(r=>r.json())]);METAS=m;
+ $("mtAlm").value=m.almoco_min;$("mtAlDe").value=m.almoco_de;$("mtAlAte").value=m.almoco_ate;
+ const nomes=[...new Set([...cols.filter(c=>c.ativo).map(c=>c.nome),...Object.keys(m.pessoas||{})])];
+ $("mtTab").innerHTML="<tr><th></th>"+MC.map(([k,t,u])=>`<th>${t}${u?` <span class=mut>(${u})</span>`:""}</th>`).join("")+"</tr>"+
+  `<tr style="background:var(--bg)"><td><b>Geral (todos)</b></td>${MC.map(([k])=>`<td><input type="number" min="0" step="any" data-k="${k}" data-p="" value="${m[k]||""}" placeholder="—" style="width:90px"></td>`).join("")}</tr>`+
+  nomes.map(n=>`<tr><td><b>${esc(n)}</b> <span class="mut" id="mtS_${esc(n).replace(/\W/g,"_")}"></span></td>${MC.map(([k])=>`<td><input type="number" min="0" step="any" data-k="${k}" data-p="${esc(n)}" value="${(m.pessoas[n]||{})[k]??""}" placeholder="geral" style="width:90px"></td>`).join("")}</tr>`).join("")}
+async function sugerirMetas(){$("mtMsg").textContent="Olhando as últimas 3 semanas…";const r=await (await fetch("/api/equipe/sugestao")).json();let n=0;
+ for(const [nome,s] of Object.entries(r.pessoas||{})){for(const [k,v] of Object.entries(s.metas)){const i=document.querySelector(`#mtTab input[data-p="${CSS.escape(nome)}"][data-k="${k}"]`);if(i){i.value=v;i.style.background="#fef3c7";n++}}
+  const sp=document.getElementById("mtS_"+nome.replace(/\W/g,"_"));if(sp)sp.textContent=`(${s.dias} dias · média ${s.media.separados} sep · ${s.media.gravados} grav · ${s.media.expedidos} exp)`}
+ $("mtMsg").textContent=n?"💡 Sugestões em amarelo: um dia bom de cada um (75% dos dias ficou abaixo disso). Ajuste se quiser e clique em Salvar.":"Ainda não tem dias suficientes para sugerir (precisa de pelo menos 3 dias de 4h+ de cada um)."}
+async function salvarMetas(){const d={almoco_min:+$("mtAlm").value||0,almoco_de:$("mtAlDe").value,almoco_ate:$("mtAlAte").value,pessoas:{}};
+ document.querySelectorAll("#mtTab input").forEach(i=>{const k=i.dataset.k,p=i.dataset.p,v=i.value===""?null:+i.value;if(!p)d[k]=v||0;else if(v!=null){(d.pessoas[p]=d.pessoas[p]||{})[k]=v}});
+ const r=await POST("/api/equipe/metas",d);$("mtMsg").textContent=r.ok?"✅ Metas salvas.":"Erro ao salvar";if(r.ok){dlgMeta.close();carregar();if($("eqData").value!==$("data").value)carregarEquipe()}}
 async function carregar(){const d=$("data").value;$("exp").href=`/exportar.csv?de=${d}&ate=${d}`;
- const r=await fetch("/api/painel?data="+d);if(r.status===401)return location.reload();D=await r.json();render();carregarLimp()}
+ const r=await fetch("/api/painel?data="+d);if(r.status===401)return location.reload();D=await r.json();render();carregarLimp();if($("eqData").value&&$("eqData").value!==d&&$("eqData").value===new Date(Date.now()-3*3600e3).toISOString().slice(0,10))carregarEquipe()}
 function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_material).length;
  const AP=D.anteriores_por||{},falta_hoje=D.itens.filter(i=>i.falta_material).length;
  $("kpis").innerHTML=[["Etiquetas de hoje",D.total,D.anteriores],["Pedidos de hoje",D.pedidos??"-"],[`<a href="/upseller" style="color:inherit">🔄 UpSeller em aberto${D.upseller?` · ${hora(D.upseller.em)}`:""}</a>${D.upseller&&!D.upseller.fresco?' <b style="color:#d7263d">desatualizado</b>':""}`,D.upseller?D.upseller.pedidos:"—"],...Object.keys(NOMES).map(k=>[NOMES[k],c[k],AP[k]]),["Falta material",falta_hoje,AP.FALTA],...(D.dia?[["📦 Na retirada",D.dia.na_retirada,D.dia.na_retirada_anteriores],["🚚 Despachados",D.dia.despachados],["↩ Devoluções",D.dia.devolucoes]]:[])]
@@ -157,8 +203,8 @@ function render(){const c=D.contagem;const falta=D.itens.filter(i=>i.falta_mater
  const pl=o=>Object.keys(o||{}).length?" ("+Object.entries(o).map(([n,q])=>esc(n)+": "+q).join(", ")+")":"";
  $("dia").innerHTML=D.dia?(EE&&EE.pecas?`⏱ Gravados esperando a expedição: média <b>${EE.media_min} min</b> (maior ${EE.max_min} min, ${EE.pecas} peças)<br>`:"")+`Shopee (pacotes impressos): 📦 <b>${D.dia.na_retirada}</b> na retirada${pl(D.dia.na_retirada_por_loja)} · 🚚 <b>${D.dia.despachados}</b> despachados${pl(D.dia.despachados_por_loja)} · TikTok entra quando liberarem a API · ↩ <b>${D.dia.devolucoes}</b> devoluções`+(Object.keys(D.dia.devolucoes_por_pessoa).length?" ("+Object.entries(D.dia.devolucoes_por_pessoa).map(([n,q])=>esc(n)+": "+q).join(", ")+")":""):"";
  const hm=m=>m>=60?`${Math.floor(m/60)}h${String(m%60).padStart(2,"0")}`:`${m} min`;
- $("equipe").innerHTML="<tr><th>Colaborador</th><th>Separados</th><th>Gravações</th><th>Tempo por peça (gravando)</th><th>Expedidos</th><th>Devoluções</th><th>Faltas</th><th>⏸ Parado</th><th>Maior parada</th><th>1º bipe</th><th>Último</th></tr>"+
-  Object.entries(D.equipe).map(([n,p])=>`<tr><td><b>${esc(n)}</b></td><td>${p.separados}</td><td>${p.gravados}</td><td>${p.media_gravacao_min??"-"}${p.media_gravacao_min!=null?" min":""}</td><td>${p.expedidos}</td><td>${p.devolucoes||0}</td><td>${p.faltas}</td><td>${p.parado_min!=null?`<b style="color:${p.pct_parado>=30?"#d7263d":p.pct_parado>=15?"#d97706":"inherit"}">${hm(p.parado_min)}</b> <span class="mut">(${p.pct_parado}%)</span>`:"-"}</td><td>${p.maior_parada?`${hm(p.maior_parada.min)} <span class="mut">${p.maior_parada.de}–${p.maior_parada.ate}</span>`:"-"}</td><td>${hora(p.primeiro)}</td><td>${hora(p.ultimo)}${p.ultimo_bipe_ha_min!=null&&p.ultimo_bipe_ha_min>=10?` <span class="mut">(há ${hm(p.ultimo_bipe_ha_min)})</span>`:""}</td></tr>`).join("");
+ if(!$("eqData").value)$("eqData").value=$("data").value;
+ if($("eqData").value===$("data").value)renderEquipe(D.equipe,D.metas_equipe);
  tabela()}
 function tabela(){if(!D)return;const b=$("busca").value.toLowerCase(),f=$("fst").value;
  const L=D.itens.filter(i=>(!f||(f==="FALTA"?i.falta_material:i.status===f))&&(!b||[i.pedido,i.nomes,i.sku,i.rastreio,i.loja].join(" ").toLowerCase().includes(b)));

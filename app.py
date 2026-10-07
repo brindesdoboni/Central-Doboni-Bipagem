@@ -1161,27 +1161,7 @@ def painel(data, leve=False):
         por_canal = por_grupo_status(itens, ETAPAS)
         evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
              ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
-        equipe = {}
-        for e in evs:
-            if e["colaborador_id"] is None:
-                continue  # marcacao automatica (estoque), nao e de ninguem da equipe
-            p = equipe.setdefault(e["nome"] or "?", {"separados": 0, "gravados": 0, "expedidos": 0,
-                                                     "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
-            p["ultimo"] = e["em"]
-            if e["etapa"] == "SEPARADO": p["separados"] += 1
-            if e["etapa"] == "EXPEDIDO": p["expedidos"] += 1
-            if e["etapa"] == "FALTA_MATERIAL": p["faltas"] += 1
-            if e["etapa"] == "GRAVACAO_INICIO":
-                p["gravados"] += 1
-        tempos = {}
-        for nome, _, m in ([] if leve else _gravacoes(c, ini, fim)):
-            tempos.setdefault(nome, []).append(m)
-        for n, p in equipe.items():
-            m = sorted(tempos.get(n, []))
-            p["media_gravacao_min"] = round(m[len(m) // 2], 1) if m else None   # mediana: pausa/engano nao puxa o numero
-        for n, q in ({} if leve else _parados(c, data, ini, fim)).items():
-            if n in equipe:
-                equipe[n].update(q)
+        equipe = _equipe(c, data, ini, fim, leve, evs)
         esp = _espera_expedicao(c, ini, fim)
         espera = {"pecas": len(esp), "media_min": round(sum(esp) / len(esp), 1) if esp else None,
                   "max_min": round(max(esp), 1) if esp else None}
@@ -1192,11 +1172,6 @@ def painel(data, leve=False):
         for e in evs:
             if e["alerta"] and e["alerta"] != "falta de material":
                 alertas.append({"tipo": e["alerta"].upper(), "item": next((i for i in itens if i["id"] == e["item_id"]), {"pedido": "?"})})
-        for e in evs:
-            if e["colaborador_id"] is not None and e["nome"] in equipe:
-                q = equipe[e["nome"]]
-                q["despachados"] = q.get("despachados", 0) + (e["etapa"] == "DESPACHADO")
-                q["devolucoes"] = q.get("devolucoes", 0) + (e["etapa"] == "DEVOLVIDO")
     return {"data": data, "contagem": cont, "total": len(itens), "por_canal": por_canal,
             "pedidos": len({norm(i["pedido"]) for i in itens if i.get("lote") != "DEVOLUCAO"}),
             "anteriores": len(anteriores), "anteriores_lista": anteriores[:300],
@@ -1204,7 +1179,93 @@ def painel(data, leve=False):
                                "FALTA": sum(1 for a in anteriores if a["falta_material"])},
             "upseller": upseller_resumo(),
             "plataformas": por_plataforma(itens), "equipe": equipe, "alertas": alertas, "itens": itens,
-            "dia": contadores_dia(data), "espera_expedicao": espera}
+            "dia": contadores_dia(data), "espera_expedicao": espera, "metas_equipe": None if leve else metas_equipe()}
+
+
+def _equipe(c, data, ini, fim, leve=False, evs=None):
+    """Produtividade de cada pessoa no dia (painel do dono): contagens, tempo por peca, parado, almoco e metas."""
+    if evs is None:
+        evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
+             ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
+    equipe = {}
+    for e in evs:
+        if e["colaborador_id"] is None:
+            continue  # marcacao automatica (estoque), nao e de ninguem da equipe
+        p = equipe.setdefault(e["nome"] or "?", {"separados": 0, "gravados": 0, "expedidos": 0,
+                                                 "faltas": 0, "primeiro": e["em"], "ultimo": e["em"]})
+        p["ultimo"] = e["em"]
+        if e["etapa"] == "SEPARADO": p["separados"] += 1
+        if e["etapa"] == "EXPEDIDO": p["expedidos"] += 1
+        if e["etapa"] == "FALTA_MATERIAL": p["faltas"] += 1
+        if e["etapa"] == "GRAVACAO_INICIO":
+            p["gravados"] += 1
+    tempos = {}
+    for nome, _, m in ([] if leve else _gravacoes(c, ini, fim)):
+        tempos.setdefault(nome, []).append(m)
+    for n, p in equipe.items():
+        m = sorted(tempos.get(n, []))
+        p["media_gravacao_min"] = round(m[len(m) // 2], 1) if m else None   # mediana: pausa/engano nao puxa o numero
+    for n, q in ({} if leve else _parados(c, data, ini, fim)).items():
+        if n in equipe:
+            equipe[n].update(q)
+    for e in evs:
+        if e["colaborador_id"] is not None and e["nome"] in equipe:
+            q = equipe[e["nome"]]
+            q["despachados"] = q.get("despachados", 0) + (e["etapa"] == "DESPACHADO")
+            q["devolucoes"] = q.get("devolucoes", 0) + (e["etapa"] == "DEVOLVIDO")
+    if not leve:
+        M = metas_equipe(c)
+        for n, p in equipe.items():
+            p["metas"] = _metas_de(M, n)
+            p["atingido"] = _atingido(p, p["metas"], next((v for k, v in M["pessoas"].items() if k.lower() == n.lower()), {}))
+    return equipe
+
+
+def sugestao_metas(dias=21):
+    """Sugere metas por pessoa olhando os ultimos dias trabalhados: um pouco acima do normal dela
+    (o dia 'bom' = 75% dos dias ela fez menos que isso). Nao salva nada: so preenche a tela."""
+    hoje_ = datetime.now(BR).date()
+    hist = {}
+    with conn() as c:
+        for k in range(1, dias + 1):
+            d = (hoje_ - timedelta(days=k)).isoformat()
+            ini, fim = dia_utc(d)
+            for n, p in _equipe(c, d, ini, fim).items():
+                if (p.get("no_trabalho_min") or 0) < 240:      # dia curto (meio periodo, saiu cedo) nao entra
+                    continue
+                hist.setdefault(n, []).append(p)
+    def p75(v):
+        v = sorted(v)
+        return v[min(len(v) - 1, int(round(0.75 * (len(v) - 1))))] if v else None
+    out = {}
+    for n, L in hist.items():
+        if len(L) < 3:
+            continue
+        m = {}
+        for k in ("separados", "gravados", "expedidos"):
+            v = [p.get(k) or 0 for p in L if (p.get(k) or 0) > 0]
+            if len(v) >= 3:
+                m[k] = int(round(p75(v) / 5.0) * 5) or p75(v)
+        pr = [p["produtivo_pct"] for p in L if p.get("produtivo_pct") is not None]
+        if pr:
+            m["produtivo_pct"] = max(60, min(95, p75(pr)))
+        gm = [p["media_gravacao_min"] for p in L if p.get("media_gravacao_min")]
+        if len(gm) >= 3:
+            gm = sorted(gm)
+            m["grav_min_peca"] = round(gm[len(gm) // 4], 1)        # o ritmo dos dias mais rapidos dela
+        pa = [p["parado_min"] for p in L if p.get("parado_min") is not None]
+        if pa:
+            m["parado_max_min"] = int(sorted(pa)[len(pa) // 4] // 5 * 5) or 15
+        out[n] = {"metas": m, "dias": len(L),
+                  "media": {k: round(sum(p.get(k) or 0 for p in L) / len(L), 1) for k in ("separados", "gravados", "expedidos")}}
+    return {"dias_olhados": dias, "pessoas": out}
+
+
+def equipe_dia(data):
+    ini, fim = dia_utc(data)
+    with conn() as c:
+        return {"data": data, "equipe": _equipe(c, data, ini, fim), "metas_equipe": metas_equipe(c)}
+
 
 
 _op_cache = {"t": 0, "v": None}
@@ -1353,6 +1414,75 @@ def _gravacoes(c, ini, fim=None):
 PARADO_FOLGA_MIN = float(os.environ.get("PARADO_FOLGA_MIN", "3"))   # cada bipe = ~3 min de trabalho (pegar, conferir, embalar)
 
 
+# ------------------------------------------------------------------ metas da equipe (painel do dono)
+METAS_PADRAO = {"almoco_min": 60, "almoco_de": "11:00", "almoco_ate": "14:30",
+                "separados": 0, "gravados": 0, "expedidos": 0,          # por dia (0 = sem meta)
+                "produtivo_pct": 85, "grav_min_peca": 0, "parado_max_min": 0}
+METAS_CAMPOS = ("separados", "gravados", "expedidos", "produtivo_pct", "grav_min_peca", "parado_max_min")
+
+
+def metas_equipe(c=None):
+    if c is None:
+        with conn() as c2:
+            return metas_equipe(c2)
+    r = c.execute("SELECT valor FROM meta WHERE chave='metas_equipe'").fetchone()
+    try:
+        d = json.loads(r[0]) if r else {}
+    except Exception:
+        d = {}
+    out = {**METAS_PADRAO, **{k: v for k, v in d.items() if k in METAS_PADRAO}}
+    out["pessoas"] = d.get("pessoas") or {}
+    return out
+
+
+def salvar_metas(d):
+    def num(v, lo=0, hi=100000):
+        try:
+            return max(lo, min(hi, float(v)))
+        except Exception:
+            return None
+    hora = lambda v, pad: v if re.fullmatch(r"\d{2}:\d{2}", str(v or "")) else pad
+    with _lock, conn() as c:
+        atual = metas_equipe(c)
+        novo = {"almoco_min": num(d.get("almoco_min", atual["almoco_min"]), 0, 180) or 0,
+                "almoco_de": hora(d.get("almoco_de"), atual["almoco_de"]),
+                "almoco_ate": hora(d.get("almoco_ate"), atual["almoco_ate"])}
+        for k in METAS_CAMPOS:
+            v = num(d.get(k, atual[k]), 0, 100 if k == "produtivo_pct" else 100000)
+            novo[k] = v if v is not None else atual[k]
+        pes = {}
+        for nome, m in (d.get("pessoas") if isinstance(d.get("pessoas"), dict) else atual["pessoas"]).items():
+            mm = {k: num(v) for k, v in (m or {}).items() if k in METAS_CAMPOS and v not in (None, "") and num(v) is not None}
+            if mm and str(nome).strip():
+                pes[str(nome).strip()] = mm
+        novo["pessoas"] = pes
+        c.execute("INSERT OR REPLACE INTO meta(chave,valor) VALUES('metas_equipe',?)", (json.dumps(novo, ensure_ascii=False),))
+    return {"ok": True, "metas": novo}
+
+
+def _metas_de(M, nome):
+    """Meta da pessoa = a geral, trocada pelo que estiver preenchido so para ela."""
+    pm = next((v for k, v in (M.get("pessoas") or {}).items() if k.lower() == (nome or "").lower()), {})
+    return {k: pm.get(k, M.get(k, 0)) for k in METAS_CAMPOS}
+
+
+def _atingido(p, m, propria=None):
+    """% da meta em cada coisa (so onde tem meta). Tempo por peca e parado: quanto menor, melhor.
+    Meta de quantidade geral so vale para quem fez aquela etapa no dia (quem so grava nao 'perde' a meta de separacao);
+    meta colocada so para a pessoa vale sempre."""
+    a = {}
+    for k in ("separados", "gravados", "expedidos"):
+        if m.get(k) and ((p.get(k) or 0) > 0 or k in (propria or {})):
+            a[k] = round(100 * (p.get(k) or 0) / m[k])
+    if m.get("produtivo_pct") and p.get("produtivo_pct") is not None:
+        a["produtivo_pct"] = round(100 * p["produtivo_pct"] / m["produtivo_pct"])
+    if m.get("grav_min_peca") and p.get("media_gravacao_min"):
+        a["grav_min_peca"] = min(150, round(100 * m["grav_min_peca"] / p["media_gravacao_min"]))
+    if m.get("parado_max_min") and p.get("parado_min") is not None:
+        a["parado_max_min"] = min(150, round(100 * m["parado_max_min"] / max(p["parado_min"], 1)))
+    return a
+
+
 def _parados(c, data, ini, fim):
     """So para o painel do dono: quanto tempo cada pessoa ficou PARADA no dia (sem separar, gravar, expedir...).
     Ocupado = do 1o ao 2o bipe de cada peca gravando (varias maquinas ao mesmo tempo contam juntas) + uma folga
@@ -1360,7 +1490,12 @@ def _parados(c, data, ini, fim):
     evs = c.execute("""SELECT e.colaborador_id, k.nome, e.item_id, e.etapa, e.em, COALESCE(e.alerta,'') alerta FROM eventos e
                        JOIN colaboradores k ON k.id=e.colaborador_id WHERE e.desfeito=0 AND e.em>=? AND e.em<?
                        ORDER BY e.em, e.id""", (ini, fim)).fetchall()
-    pausas = c.execute("SELECT hora, pessoas, COALESCE(duracao,15) d FROM pausas").fetchall()
+    pausas = c.execute("SELECT hora, pessoas, COALESCE(duracao,15) d, COALESCE(nome,'') nome FROM pausas").fetchall()
+    M = metas_equipe(c)
+
+    def tem_pausa_almoco(nome):
+        return any("ALMO" in cor_norm(p["nome"]) and (not p["pessoas"] or nome.lower() in p["pessoas"].lower())
+                   for p in pausas)
     d0 = datetime.strptime(data, "%Y-%m-%d").replace(tzinfo=BR)
     agora_ = datetime.now(timezone.utc)
     pes = {}
@@ -1384,6 +1519,7 @@ def _parados(c, data, ini, fim):
         for a in abertos.values():             # ainda gravando agora (sem o 2o bipe): ocupado ate agora (max 2 h)
             if data == datetime.now(BR).strftime("%Y-%m-%d"):
                 ocup.append((a, min(agora_, a + timedelta(hours=2))))
+        pausas_dela = []
         for p in pausas:                        # pausa cadastrada (cafe) nao e "parado"
             quem = (p["pessoas"] or "").lower()
             if quem and nome.lower() not in quem:
@@ -1394,24 +1530,44 @@ def _parados(c, data, ini, fim):
                 continue
             a = (d0 + timedelta(hours=h, minutes=m)).astimezone(timezone.utc)
             ocup.append((a, a + timedelta(minutes=int(p["d"] or 15))))
+            pausas_dela.append((a, a + timedelta(minutes=int(p["d"] or 15))))
         # junta os intervalos ocupados e mede os buracos entre o 1o e o ultimo bipe
         ocup = sorted((max(a, ini_p), min(b, fim_p)) for a, b in ocup if b > ini_p and a < fim_p)
-        cur, parado, maior = ini_p, 0.0, None
+        cur, buracos = ini_p, []
         for a, b in ocup:
             if a > cur:
-                gap = (a - cur).total_seconds() / 60
-                parado += gap
-                if not maior or gap > maior[0]:
-                    maior = (gap, cur, a)
+                buracos.append([(a - cur).total_seconds() / 60, cur, a])
             cur = max(cur, b)
         if fim_p > cur:
-            gap = (fim_p - cur).total_seconds() / 60
-            parado += gap
-            if not maior or gap > maior[0]:
-                maior = (gap, cur, fim_p)
+            buracos.append([(fim_p - cur).total_seconds() / 60, cur, fim_p])
+        # ALMOCO: se nao tem pausa "almoco" cadastrada para a pessoa, o maior buraco (>= 15 min) dentro da janela
+        # do almoco (ex.: 11:00-14:30) e o almoco; desconta ate o tempo do almoco (ex.: 60 min), o que passar e parado.
+        almoco = None
+        if M["almoco_min"] and not tem_pausa_almoco(nome):
+            jd, ja = [(d0 + timedelta(hours=int(x[:2]), minutes=int(x[3:5]))).astimezone(timezone.utc)
+                      for x in (M["almoco_de"], M["almoco_ate"])]
+            cand = [g for g in buracos if g[0] >= 15 and g[1] < ja and g[2] > jd]
+            if cand:
+                g = max(cand, key=lambda x: x[0])
+                desc = min(g[0], M["almoco_min"])
+                almoco = {"min": round(desc), "de": g[1].astimezone(BR).strftime("%H:%M"),
+                          "ate": (g[1] + timedelta(minutes=desc)).astimezone(BR).strftime("%H:%M"),
+                          "passou_min": round(g[0] - desc)}
+                g[0] -= desc
+                g[1] = g[1] + timedelta(minutes=desc)
+        parado = sum(g[0] for g in buracos)
+        maior = max(((g[0], g[1], g[2]) for g in buracos), default=None, key=lambda x: x[0])
         span = (fim_p - ini_p).total_seconds() / 60
-        out[nome] = {"parado_min": round(parado), "trabalhando_min": round(span - parado),
-                     "pct_parado": round(100 * parado / span) if span > 0 else 0,
+        pausa_min = 0.0                         # pausas cadastradas (cafe...) dentro do horario dela
+        for a, b in pausas_dela:
+            a2, b2 = max(a, ini_p), min(b, fim_p)
+            if b2 > a2:
+                pausa_min += (b2 - a2).total_seconds() / 60
+        base = max(span - pausa_min - (almoco["min"] if almoco else 0), 0)   # tempo que devia estar trabalhando
+        out[nome] = {"parado_min": round(parado), "trabalhando_min": round(max(base - parado, 0)),
+                     "pct_parado": round(100 * parado / base) if base > 0 else 0,
+                     "produtivo_pct": round(100 * max(base - parado, 0) / base) if base > 0 else None,
+                     "no_trabalho_min": round(span), "pausas_min": round(pausa_min), "almoco": almoco,
                      "maior_parada": ({"min": round(maior[0]), "de": maior[1].astimezone(BR).strftime("%H:%M"),
                                        "ate": maior[2].astimezone(BR).strftime("%H:%M")} if maior and maior[0] >= 1 else None),
                      "ultimo_bipe_ha_min": (int((agora_ - fim_p).total_seconds() // 60)
@@ -3152,6 +3308,10 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             return self._envia(200, compras(q.get("de") or hoje[:8] + "01", q.get("ate") or hoje))
         if p == "/api/painel":
             return self._envia(200, painel(q.get("data") or hoje))
+        if p == "/api/equipe/sugestao":
+            return self._envia(200, sugestao_metas())
+        if p == "/api/equipe":
+            return self._envia(200, equipe_dia(q.get("data") or hoje))
         if p == "/api/eventos":
             with conn() as c:
                 desde = int(q.get("desde") if q.get("desde") not in (None, "") else -1)
@@ -3415,6 +3575,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 c.execute("UPDATE itens SET sku=?, atualizado_em=? WHERE id=?",
                           (str(d.get("sku", "")).strip().upper(), agora(), int(d["id"])))
             return self._envia(200, {"ok": True})
+        if p == "/api/equipe/metas":
+            return self._envia(200, salvar_metas(d))
         if p == "/api/pausas":
             with _lock, conn() as c:
                 dur = max(1, min(240, int(d.get("duracao") or 15)))
