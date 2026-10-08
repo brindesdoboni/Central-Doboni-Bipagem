@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Etiquetas - Central Boni</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--tx:#1d2330;--mut:#667085;--bd:#dfe3ea;--pri:#d7263d;--ok:#1a7f37;--warn:#b54708;--info:#175cd3}
+*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--tx)}
+header{background:#111827;color:#fff;padding:12px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:20px;margin:0 12px 0 0}header a{color:#cbd5e1}
+button,select,input{font-size:15px;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;background:#fff;color:var(--tx)}
+button{cursor:pointer;font-weight:bold}button.pri{background:var(--pri);color:#fff;border:0}button.ok{background:var(--ok);color:#fff;border:0}
+main{padding:12px 16px;max-width:1300px;margin:auto}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.chips span{display:inline-block;padding:6px 10px;border-radius:20px;background:#fff;border:1px solid var(--bd);margin:2px;cursor:pointer;font-size:14px}
+.chips span.on{background:#111827;color:#fff}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:grid;grid-template-columns:230px 1fr 340px;gap:12px}
+.card.env{opacity:.55}
+.ped b{font-size:16px}.mut{color:var(--mut);font-size:13px}
+.tag{display:inline-block;font-size:12px;padding:2px 7px;border-radius:10px;background:#eef2f6;margin:2px 2px 0 0}
+.t-ER{background:#fde2e4;color:#9f1239}.t-SHOPEE{background:#ffedd5;color:#9a3412}.t-RETIRADA{background:#e5e7eb}
+.msg{background:#fffbea;border-left:3px solid #f5b400;padding:6px 8px;font-size:14px;white-space:pre-wrap;margin-top:6px}
+.it{font-size:14px}.nomes input{width:100%;margin-bottom:4px}
+.tipo-G{border-left:6px solid var(--ok)}.tipo-A{border-left:6px solid var(--warn)}.tipo-C{border-left:6px solid var(--pri)}
+.tipo-E{border-left:6px solid var(--info)}.tipo-N{border-left:6px solid #98a2b3}
+#msg{font-weight:bold}
+#login{max-width:340px;margin:80px auto;background:#fff;padding:20px;border-radius:12px;border:1px solid var(--bd)}
+@media(max-width:900px){.card{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <h2>Etiquetas</h2>
+  <p class="mut">Entre com a senha da tela de etiquetas.</p>
+  <input id="senha" type="password" placeholder="Senha" style="width:100%"><br><br>
+  <button class="pri" onclick="entrar()">Entrar</button> <span id="lerr"></span>
+</div>
+<div id="app" hidden>
+<header>
+  <h1>🏷️ Etiquetas</h1>
+  <label>Prazo até <input type="date" id="ate" onchange="carregar()"></label>
+  <input id="quem" placeholder="Seu nome" style="width:130px">
+  <button onclick="sincronizar()">🔄 Atualizar da Shopee</button>
+  <button onclick="baixarCSV()">⬇️ CSV LightBurn</button>
+  <button class="pri" onclick="enviar()">📦 Enviar lote para produção</button>
+  <span id="msg"></span>
+</header>
+<main>
+  <div class="bar chips" id="fEnvio"></div>
+  <div class="bar chips" id="fTipo"></div>
+  <div class="bar"><input id="busca" placeholder="Buscar pedido, nome, SKU..." oninput="render()" style="flex:1;min-width:200px">
+    <label><input type="checkbox" id="mostrarEnv" onchange="render()"> mostrar já enviados</label></div>
+  <div id="lista"></div>
+  <p class="mut">Os nomes em amarelo são <b>sugestões</b> lidas da mensagem do comprador: confira e salve como <b>Gravar</b>.
+  Pedidos sem nome ficam como <b>Buscar nome no chat</b> — nunca deixe de imprimir. Nada aqui altera a Shopee.</p>
+</main>
+</div>
+<script>
+let D={pedidos:[],fontes:[],tipos:{}}, fEnv='', fTipo='';
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function hoje(){const d=new Date();d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,10)}
+try{$('#quem').value=localStorage.getItem('etq_quem')||''}catch(e){}
+$('#quem').onchange=()=>{try{localStorage.setItem('etq_quem',$('#quem').value)}catch(e){}};
+$('#ate').value=hoje();
+function aviso(t,cor){$('#msg').textContent=t;$('#msg').style.color=cor||'#fff'}
+async function api(url,corpo){const r=await fetch(url,corpo?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo)}:{});
+  if(r.status==401){$('#app').hidden=true;$('#login').hidden=false;throw new Error('login')}return r.json()}
+async function entrar(){const r=await fetch('/etiquetas/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha:$('#senha').value})});
+  if(r.ok){$('#login').hidden=true;carregar()}else $('#lerr').textContent='Senha incorreta'}
+async function carregar(){aviso('Carregando...');D=await api('/api/etiquetas/dia?ate='+$('#ate').value);$('#app').hidden=false;$('#login').hidden=true;
+  aviso(D.pedidos.length+' pedidos com prazo até '+D.dia);render()}
+async function sincronizar(){aviso('Lendo pedidos da Shopee...');const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Atualizado':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
+function baixarCSV(){location.href='/api/etiquetas/csv?ate='+$('#ate').value+(fEnv?'&envios='+encodeURIComponent(fEnv):'')}
+async function enviar(){const n=D.pedidos.filter(p=>!p.enviado_em&&p.envio!='RETIRADA'&&(!fEnv||p.envio==fEnv)).length;
+  if(!n){aviso('Nada novo para enviar','#ffb4b4');return}
+  const pend=D.pedidos.filter(p=>!p.enviado_em&&p.origem=='sugestao'&&p.tipo!='N').length;
+  if(!confirm(`Enviar ${n} pedidos para a produção?`+(pend?`\n\nATENÇÃO: ${pend} ainda estão como sugestão (não conferidos).`:'')))return;
+  const r=await api('/api/etiquetas/enviar',{ate:$('#ate').value,envios:fEnv?[fEnv]:null});
+  aviso(r.ok?`Lote ${r.lote}: ${r.pedidos} pedidos enviados`:'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
+function chips(){const envs=['','ENTREGA RÁPIDA','SHOPEE','RETIRADA'];
+  $('#fEnvio').innerHTML=envs.map(e=>{const n=D.pedidos.filter(p=>!e||p.envio==e).length;return `<span class="${fEnv==e?'on':''}" onclick="fEnv='${e}';render()">${e||'Todos'} (${n})</span>`}).join('');
+  $('#fTipo').innerHTML=[''].concat(Object.keys(D.tipos)).map(t=>{const n=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!t||p.tipo==t)).length;
+    return `<span class="${fTipo==t?'on':''}" onclick="fTipo='${t}';render()">${t?D.tipos[t]:'Todos os tipos'} (${n})</span>`}).join('')}
+function render(){chips();const b=$('#busca').value.toLowerCase(),me=$('#mostrarEnv').checked;
+  const L=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!fTipo||p.tipo==fTipo)&&(me||!p.enviado_em)&&(!b||JSON.stringify(p).toLowerCase().includes(b)));
+  $('#lista').innerHTML=L.map(card).join('')||'<p class="mut">Nenhum pedido.</p>'}
+function card(p){const i=D.pedidos.indexOf(p);const n=Math.max(p.npers,p.nomes.length,p.tipo=='G'||p.tipo=='A'?1:0);
+  const ins=Array.from({length:n},(_,k)=>`<input data-k="${k}" value="${esc(p.nomes[k]||'')}" placeholder="Nome ${k+1}${p.unidades.filter(u=>u.pers)[k]?' - '+esc(p.unidades.filter(u=>u.pers)[k].var.split(',')[0]):''}" style="${p.origem=='sugestao'&&p.nomes[k]?'background:#fff7cc':''}">`).join('');
+  const tcls=p.envio=='ENTREGA RÁPIDA'?'t-ER':'t-'+p.envio;
+  return `<div class="card tipo-${p.tipo} ${p.enviado_em?'env':''}" id="c${i}">
+  <div class="ped"><b>${esc(p.order_sn)}</b><br><span class="tag ${tcls}">${esc(p.envio)}</span><span class="tag">${esc(p.loja)}</span>
+   <div class="mut">Prazo ${esc(p.prazo)} · ${esc(p.status)}</div>
+   ${p.enviado_em?`<span class="tag" style="background:#dcfce7">✔ ${esc(p.lote)}</span>`:''}
+   <span class="tag">${p.origem=='sugestao'?'sugestão':p.origem}</span></div>
+  <div><div class="it">${p.itens.map(t=>`<div>• <b>${esc(t.sku)}</b> ${esc(t.var)} <b>x${t.qtd}</b></div>`).join('')}</div>
+   ${p.msg?`<div class="msg">${esc(p.msg)}</div>`:'<div class="mut">Sem mensagem do comprador no pedido.</div>'}</div>
+  <div><select data-f="tipo">${Object.entries(D.tipos).map(([k,v])=>`<option value="${k}" ${p.tipo==k?'selected':''}>${v}</option>`).join('')}</select>
+   <select data-f="fonte"><option value="">Fonte padrão</option>${D.fontes.map((f,k)=>`<option ${p.fonte==f?'selected':''} value="${esc(f)}">${k+1} - ${esc(f)}</option>`).join('')}</select>
+   <div class="nomes" style="margin-top:6px">${ins}</div>
+   <input data-f="obs" value="${esc(p.obs)}" placeholder="Observação (aparece na etiqueta)" style="width:100%">
+   <div style="margin-top:6px"><button class="ok" onclick="salvar(${i})">Salvar</button> <span id="s${i}" class="mut"></span></div></div></div>`}
+async function salvar(i){const p=D.pedidos[i],c=$('#c'+i);const nomes=[...c.querySelectorAll('.nomes input')].map(x=>x.value.trim()).filter(Boolean);
+  const body={order_sn:p.order_sn,tipo:c.querySelector('[data-f=tipo]').value,fonte:c.querySelector('[data-f=fonte]').value,obs:c.querySelector('[data-f=obs]').value,nomes,por:$('#quem').value};
+  const r=await api('/api/etiquetas/salvar',body);
+  if(r.ok){Object.assign(p,body,{origem:'conferido'});$('#s'+i).textContent='✔ salvo';c.className=c.className.replace(/tipo-\w/,'tipo-'+body.tipo)}
+  else $('#s'+i).textContent='❌ '+r.erro}
+carregar().catch(()=>{});
+</script>
+</body>
+</html>
