@@ -218,6 +218,23 @@ def grupo_envio(i):
     return "TIKTOK" if c == "TIKTOK" else "SHOPEE EXPRESS"
 
 
+def _com_coleta(cont, por_canal, itens):
+    """PRONTO PARA COLETA: expedido que ja foi bipado na saca. Sai de 'Expedidos' e entra em 'Pronto p/ coleta'
+    (so na contagem da tela; para o sistema continua EXPEDIDO)."""
+    cont["COLETA"] = 0
+    for g in por_canal.values():
+        g["COLETA"] = 0
+    for i in itens:
+        if i.get("coleta"):
+            cont["COLETA"] += 1
+            cont["EXPEDIDO"] -= 1
+            g = por_canal.get(grupo_envio(i))
+            if g is not None:
+                g["COLETA"] += 1
+                g["EXPEDIDO"] -= 1
+    return por_canal
+
+
 def por_grupo_status(itens, etapas):
     """Tabela 'Canal' agrupada como os quadros + coluna FALTA (bipado em 'nao tem' e ainda nao saiu)."""
     res = {}
@@ -647,18 +664,44 @@ def _bipar_resp(posto, codigo, operador, modo, leitor=""):
     return r
 
 
+# PRONTO PARA COLETA (ultimo bipe: foi para a saca). Bipe Boni antigo nao conhece o setor COLETA: a etiqueta
+# CMD-COLETA chega aqui e liga o "modo coleta" para aquele operador (sai bipando COLETA de novo, o cracha, ou 1 h parado).
+_coleta_modo = {}
+COLETA_MODO_MIN = 60
+
+
+def _coleta_ativo(opcod):
+    t = _coleta_modo.get(opcod)
+    if t and (datetime.now(timezone.utc) - t).total_seconds() < COLETA_MODO_MIN * 60:
+        _coleta_modo[opcod] = datetime.now(timezone.utc)
+        return True
+    _coleta_modo.pop(opcod, None)
+    return False
+
+
 def _bipar(posto, codigo, operador, modo):
     posto = (posto or "").upper()
     cod = norm(codigo)
     with _lock, conn() as c:
         col = c.execute("SELECT * FROM colaboradores WHERE codigo=? AND ativo=1", (cod,)).fetchone()
         if col:
+            _coleta_modo.pop(col["codigo"], None)
             return {"tipo": "operador", "operador": {"codigo": col["codigo"], "nome": col["nome"]},
                     "msg": f"Ola, {col['nome']}!", "evento": "operador", "colaborador": col["nome"]}
         op = c.execute("SELECT * FROM colaboradores WHERE codigo=? AND ativo=1", (norm(operador),)).fetchone()
         if not op:
             return {"tipo": "erro", "msg": "SEM OPERADOR: bipe o seu CRACHÁ primeiro",
                     "fazer": "Bipe o seu CRACHÁ neste leitor e depois bipe a etiqueta de novo."}
+        if cod == "CMDCOLETA":   # Bipe Boni antigo: liga/desliga o modo coleta deste operador
+            if _coleta_ativo(op["codigo"]):
+                _coleta_modo.pop(op["codigo"], None)
+                return {"tipo": "aviso", "msg": "Saiu do PRONTO PARA COLETA", "evento": "operador",
+                        "fazer": "Voltou ao setor de antes. Para colocar na saca de novo, bipe a etiqueta COLETA."}
+            _coleta_modo[op["codigo"]] = datetime.now(timezone.utc)
+            return {"tipo": "ok", "msg": "Setor: PRONTO PARA COLETA", "evento": "operador",
+                    "fazer": "Bipe cada pacote ao colocar na saca. Para sair: bipe COLETA de novo."}
+        if posto != "COLETA" and _coleta_ativo(op["codigo"]):
+            posto = "COLETA"
         if cod == "CMDDESFAZER":
             ev = c.execute("""SELECT e.*, i.pedido FROM eventos e JOIN itens i ON i.id=e.item_id
                    WHERE colaborador_id=? AND posto=? AND desfeito=0 ORDER BY e.id DESC LIMIT 1""",
@@ -706,7 +749,7 @@ def _bipar(posto, codigo, operador, modo):
             return {"tipo": "erro", "msg": f"ETIQUETA NÃO ENCONTRADA ({codigo})",
                     "fazer": "Separe esta etiqueta e leve para o Lucas incluir no painel (+ Incluir etiquetas). Depois bipe de novo."}
 
-        if posto in ("SEPARACAO", "GRAVACAO", "EXPEDICAO") and modo != "FALTA":
+        if posto in ("SEPARACAO", "GRAVACAO", "EXPEDICAO", "COLETA") and modo != "FALTA":
             canc = _shopee_cancelado(c, [i["id"] for i in itens])
             if canc:
                 if canc["status"] == "IN_CANCEL":
@@ -808,6 +851,23 @@ def _bipar(posto, codigo, operador, modo):
                               (i["id"], "GRAVACAO_FIM", ultimo_op(c, i["id"]), "GRAVACAO", agora(), "fim nao bipado"))
                 r = ev(i, "EXPEDIDO")
             return {"tipo": "ok", "msg": f"EXPEDIDO ({len(pend)} item(ns))", "evento": "expedido", "item": r}
+        if posto == "COLETA":
+            nexp = [i for i in itens if i["status"] != "EXPEDIDO"]
+            if nexp:
+                st = nexp[0]["status"]
+                return {"tipo": "erro", "msg": "NÃO VAI PARA A SACA: ainda NÃO FOI EXPEDIDO",
+                        "fazer": ("É devolução: não vai para a coleta." if st == "DEVOLVIDO" else
+                                  "Leve para a EXPEDIÇÃO e bipe lá primeiro. Depois volte e bipe aqui na COLETA."),
+                        "item": dict(nexp[0])}
+            ja = {r[0] for r in c.execute(f"""SELECT item_id FROM eventos WHERE etapa='COLETA' AND desfeito=0
+                     AND item_id IN ({','.join('?' * len(itens))})""", [i["id"] for i in itens])}
+            pend = [i for i in itens if i["id"] not in ja]
+            if not pend:
+                return {"tipo": "aviso", "msg": "Já está na saca (pronto para coleta).", "item": dict(itens[0])}
+            r = None
+            for i in pend:
+                r = ev(i, "COLETA")
+            return {"tipo": "ok", "msg": f"📦 PRONTO PARA COLETA ({len(pend)} item(ns))  →  na saca", "evento": "expedido", "item": r}
         if posto == "DEVOLUCAO":
             pend = [i for i in itens if i["status"] != "DEVOLVIDO"]
             if not pend:
@@ -824,7 +884,7 @@ def _bipar(posto, codigo, operador, modo):
             msg += " - SKU desconhecido: completar no painel" if sem_sku else (f" - custo R$ {total:.2f}".replace(".", ",") if total else "")
             msg += f"  ·  Hoje: {_contar_hoje(c, 'devolucoes')} devolução(ões)"
             return {"tipo": "aviso" if sem_sku else "ok", "msg": msg, "evento": "devolucao", "item": r}
-        return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição ou Devolução) e bipe de novo."}
+        return {"tipo": "erro", "msg": "SETOR NÃO ESCOLHIDO", "fazer": "Bipe a etiqueta do SETOR (Separação, Gravação, Expedição, Coleta ou Devolução) e bipe de novo."}
 
 
 ANTIGO_DIAS = int(os.environ.get("ANTIGO_DIAS", "4"))
@@ -1178,15 +1238,18 @@ def painel(data, leve=False):
         # o painel "zera" todo dia: so as etiquetas que entraram HOJE ou que foram bipadas HOJE.
         # As que ficaram de dias anteriores sem bipe aparecem a parte ("de dias anteriores"), sem misturar na conta do dia.
         itens = [dict(r) for r in c.execute("""SELECT * FROM itens WHERE COALESCE(oculto,0)=0 AND ((criado_em>=? AND criado_em<?)
-            OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0)) ORDER BY canal, etiqueta, id""",
+            OR id IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0 AND etapa<>'COLETA')) ORDER BY canal, etiqueta, id""",
             (ini, fim, ini, fim))]
+        na_saca = {r[0] for r in c.execute("SELECT DISTINCT item_id FROM eventos WHERE etapa='COLETA' AND desfeito=0")}
+        for i in itens:
+            i["coleta"] = i["status"] == "EXPEDIDO" and i["id"] in na_saca
         anteriores = [dict(r) for r in c.execute("""SELECT id, pedido, canal, loja, sku, cor, status, criado_em, falta_material FROM itens
             WHERE COALESCE(oculto,0)=0 AND status NOT IN ('EXPEDIDO','DEVOLVIDO') AND COALESCE(lote,'')<>'DEVOLUCAO' AND criado_em<?
             AND id NOT IN (SELECT item_id FROM eventos WHERE em>=? AND em<? AND desfeito=0) ORDER BY criado_em""", (ini, ini, fim))]
         cont = {e: 0 for e in ETAPAS}
         for i in itens:
             cont[i["status"]] += 1
-        por_canal = por_grupo_status(itens, ETAPAS)
+        por_canal = _com_coleta(cont, por_grupo_status(itens, ETAPAS), itens)
         evs = [dict(r) for r in c.execute("""SELECT e.*, k.nome FROM eventos e LEFT JOIN colaboradores k
              ON k.id=e.colaborador_id WHERE em>=? AND em<? AND desfeito=0 ORDER BY e.id""", (ini, fim))]
         equipe = _equipe(c, data, ini, fim, leve, evs)
@@ -1320,7 +1383,7 @@ def _operacao():
     cont = {e: 0 for e in ETAPAS if e != "DEVOLVIDO"}
     for i in itens:
         cont[i["status"]] += 1
-    por_canal = por_grupo_status(itens, list(cont))
+    por_canal = _com_coleta(cont, por_grupo_status(itens, list(cont)), itens)
     agora_ = datetime.now(timezone.utc)
     ini, _ = dia_utc(hoje)
     ritmo, restante = {}, {
@@ -2444,7 +2507,7 @@ def _dev_info_pedido(c, order_sn):
 
 
 ETAPA_PT = {"SEPARADO": "Separado", "GRAVACAO_INICIO": "Gravação iniciada", "GRAVACAO_FIM": "Gravação terminada",
-            "EXPEDIDO": "Embalado e expedido", "FALTA_MATERIAL": "Aguardou material", "DEVOLVIDO": "Devolução recebida"}
+            "EXPEDIDO": "Embalado e expedido", "COLETA": "Pronto para coleta (na saca)", "FALTA_MATERIAL": "Aguardou material", "DEVOLVIDO": "Devolução recebida"}
 
 
 def dev_comprovante_jpeg(order_sn):

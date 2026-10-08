@@ -30,7 +30,7 @@ a{color:#aaa}
 <div id="emPausa"></div><footer><span>Códigos especiais: <b>CMD-FALTA</b> (falta material) · <b>CMD-DESFAZER</b> (desfaz o último bipe) · bipe o código do posto para trocar</span><a href="#" onclick="trocarPosto()">trocar posto</a></footer>
 <div id="pilha"></div><input id="in" autocomplete="off">
 <script>
-const POSTOS={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",DEVOLUCAO:"DEVOLUÇÃO"};
+const POSTOS={SEPARACAO:"SEPARAÇÃO",GRAVACAO:"GRAVAÇÃO",EXPEDICAO:"EXPEDIÇÃO",COLETA:"PRONTO P/ COLETA",DEVOLUCAO:"DEVOLUÇÃO"};
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}}, S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
 let posto=L("posto"), chave=L("chave"), op=null, modo=null;
 const $=id=>document.getElementById(id), inp=$("in");
@@ -76,7 +76,7 @@ async function enviar(codigo){
  const c=codigo.trim().toUpperCase(); if(!c)return;
  if(repetida(c))return;
  const cmd=c.replace(/[^A-Z]/g,"");
- if(["CMDSEPARACAO","CMDGRAVACAO","CMDEXPEDICAO","CMDDEVOLUCAO"].includes(cmd)){posto=cmd.slice(3);S("posto",posto);
+ if(["CMDSEPARACAO","CMDGRAVACAO","CMDEXPEDICAO","CMDCOLETA","CMDDEVOLUCAO"].includes(cmd)){posto=cmd.slice(3);S("posto",posto);
    $("posto").textContent=POSTOS[posto];modo=null;$("modo").style.display="none";
    return tela("operador","Posto: "+POSTOS[posto],op?"Operador: "+esc(op.nome):"Bipe seu CRACHÁ")}
  if(c.replace(/[^A-Z]/g,"")==="CMDFALTA"){ if(!op)return tela("erro","Bipe o seu CRACHÁ primeiro.");

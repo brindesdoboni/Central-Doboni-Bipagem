@@ -12,7 +12,7 @@ h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}a{color:var(--az)}
 table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}th{color:var(--mut);font-weight:600}
 tr.c{cursor:pointer}tr.c:hover{background:#8881}
 .tag{padding:2px 8px;border-radius:99px;font-size:12px;font-weight:700;color:#fff}
-.AGUARDANDO{background:#71717a}.SEPARADO{background:#0891b2}.EM_GRAVACAO{background:var(--av)}.GRAVADO{background:var(--az)}.EXPEDIDO{background:var(--ok)}.DEVOLVIDO{background:#7c3aed}
+.AGUARDANDO{background:#71717a}.SEPARADO{background:#0891b2}.EM_GRAVACAO{background:var(--av)}.GRAVADO{background:var(--az)}.EXPEDIDO{background:var(--ok)}.COLETA{background:#0f766e}.DEVOLVIDO{background:#7c3aed}
 .al{padding:8px 10px;border-left:4px solid var(--er);background:#dc262612;margin-bottom:6px;border-radius:4px}
 input,select,button{padding:8px 10px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:14px}
 button{cursor:pointer}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -141,7 +141,7 @@ dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-r
 <script>
 const $=id=>document.getElementById(id), esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const hora=s=>s?new Date(s).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}):"-";
-const NOMES={AGUARDANDO:"Aguardando",SEPARADO:"Separado",EM_GRAVACAO:"Gravando",GRAVADO:"Gravado (esperando exp.)",EXPEDIDO:"Expedido",DEVOLVIDO:"Devolvido"};
+const NOMES={AGUARDANDO:"Aguardando",SEPARADO:"Separado",EM_GRAVACAO:"Gravando",GRAVADO:"Gravado (esperando exp.)",EXPEDIDO:"Expedido",COLETA:"📦 Pronto p/ coleta",DEVOLVIDO:"Devolvido"};
 const SEL=new Set();
 let D=null;
 $("data").value=new Date(Date.now()-3*3600e3).toISOString().slice(0,10);
@@ -366,7 +366,7 @@ async function carregarMail(){const d=await (await fetch("/api/emails")).json(),
  $("mLista").innerHTML="<tr><th>Quando</th><th>De</th><th>Arquivo</th><th>Etiquetas</th><th>Novas</th><th>Já existiam</th><th>Problema</th></tr>"+
   d.recebidos.map(e=>`<tr><td>${dt(e.em)}</td><td>${esc(e.remetente)}</td><td>${esc(e.arquivos)}</td><td>${e.etiquetas}</td><td><b>${e.novos}</b></td><td>${e.atualizados}</td><td style="color:#d7263d">${esc(e.erro)}</td></tr>`).join("")}
 async function delPau(id){await fetch("/api/pausas",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,excluir:true})});carregarPau()}
-const ETQ={SEPARADO:"separou",GRAVACAO_INICIO:"começou a gravar",GRAVACAO_FIM:"terminou de gravar",EXPEDIDO:"expediu",FALTA_MATERIAL:"marcou FALTA DE MATERIAL em",DEVOLVIDO:"registrou DEVOLUÇÃO do"};
+const ETQ={SEPARADO:"separou",GRAVACAO_INICIO:"começou a gravar",GRAVACAO_FIM:"terminou de gravar",EXPEDIDO:"expediu",COLETA:"colocou na saca (pronto p/ coleta)",FALTA_MATERIAL:"marcou FALTA DE MATERIAL em",DEVOLVIDO:"registrou DEVOLUÇÃO do"};
 let ultimoEv=-1,ocupado=false;
 function toast(e){const t=document.createElement("div");t.className="toast "+e.etapa;
  t.innerHTML=`<b>${esc(e.nome||"?")}</b> ${ETQ[e.etapa]||esc(e.etapa)} o pedido ${esc(e.pedido)}<br><span style="color:var(--mut)">${esc(e.sku||"")} ${e.nomes?"· "+esc(e.nomes):""} · ${hora(e.em)}</span>`;

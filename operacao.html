@@ -32,14 +32,14 @@ td.nt{color:#f87171;font-weight:800}
 </main>
 <div id="emPausa"></div>
 <div id="cards" style="position:fixed;left:16px;bottom:16px;z-index:60;display:flex;flex-direction:column-reverse;gap:10px;width:min(720px,60vw)"></div>
-<div id="somOff" style="display:none;position:fixed;right:16px;bottom:16px;z-index:61;background:#b45309;color:#fff;font-size:22px;font-weight:bold;padding:12px 18px;border-radius:12px;cursor:pointer">🔇 Clique aqui para ligar o som dos bipes</div>
+<div id="somOff" style="display:none;position:fixed;left:50%;top:90px;transform:translateX(-50%);z-index:61;background:#b45309;color:#fff;font-size:34px;font-weight:900;padding:22px 34px;border-radius:16px;cursor:pointer;box-shadow:0 8px 30px #000a;text-align:center">🔇 CLIQUE AQUI para ligar o som<br><span style="font-size:20px;font-weight:normal">dos bipes dos computadores dos colaboradores</span></div>
 <div id="alarme"><div>☕ HORA DO CAFÉ!</div><div id="alN" style="font-size:56px;margin-top:16px"></div></div>
 <script>
 const L=k=>{try{return localStorage.getItem(k)}catch(e){return null}},S=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
 let chave=L("chave");if(!chave){chave=prompt("Chave do posto:")||"";S("chave",chave)}
 const $=id=>document.getElementById(id),esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-const COR={AGUARDANDO:"#71717a",SEPARADO:"#0891b2",EM_GRAVACAO:"#d97706",GRAVADO:"#2563eb",EXPEDIDO:"#16a34a"};
-const NOM={AGUARDANDO:"Aguardando",SEPARADO:"Separados",EM_GRAVACAO:"🔥 Gravando",GRAVADO:"✅ Gravados (esperando expedição)",EXPEDIDO:"Expedidos"};
+const COR={AGUARDANDO:"#71717a",SEPARADO:"#0891b2",EM_GRAVACAO:"#d97706",GRAVADO:"#2563eb",EXPEDIDO:"#16a34a",COLETA:"#0f766e"};
+const NOM={AGUARDANDO:"Aguardando",SEPARADO:"Separados",EM_GRAVACAO:"🔥 Gravando",GRAVADO:"✅ Gravados (esperando expedição)",EXPEDIDO:"Expedidos",COLETA:"📦 Pronto p/ coleta"};
 async function carregar(){try{const r=await fetch("/api/operacao",{headers:{"X-Chave":chave}});
  if(r.status===403){S("chave","");return location.reload()}const d=await r.json(),c=d.contagem,t=d.total||1;
  $("kpis").innerHTML=`<div class="k" style="position:relative"><b>${d.total}</b>${d.anteriores?`<em style="position:absolute;top:10px;right:14px;font-style:normal;font-size:22px;color:#fbbf24">(${d.anteriores})</em>`:""}<span>Etiquetas de hoje${d.pedidos!=null?` <span style="display:block;font-size:18px">${d.pedidos} pedidos${d.upseller&&d.upseller.fresco?` · UpSeller: ${d.upseller.pedidos} em aberto`:""}</span>`:""}</span></div>`+Object.keys(NOM).map(k=>`<div class="k" style="border-left:8px solid ${COR[k]};position:relative"><b>${c[k]||0}</b><span>${NOM[k]}</span>${(d.anteriores_por||{})[k]?`<em style="position:absolute;top:10px;right:14px;font-style:normal;font-size:22px;color:#fbbf24">(${d.anteriores_por[k]})</em>`:""}${k=="GRAVADO"&&c[k]&&d.gravado_mais_antigo_min!=null?`<span style="display:block;font-size:18px;color:${d.gravado_mais_antigo_min>=20?"#f87171":"#fbbf24"}">mais antigo há ${d.gravado_mais_antigo_min} min</span>`:""}</div>`).join("")
@@ -85,11 +85,18 @@ function cardBipe(b){const it=b.item||{},tipo=CORC[b.tipo]?b.tipo:"erro";const e
  el.innerHTML=`<div style="font-size:17px;opacity:.9;font-weight:bold">💻 ${esc((b.colaborador||"SEM OPERADOR").toUpperCase())} · ${esc(b.posto||"")} · ${esc(b.em||"")}</div><div style="font-size:30px;font-weight:900;margin:2px 0">${esc(b.msg||"")}</div>`+
   (b.item?`<div style="font-size:19px">SKU ${esc(it.sku)}${it.cor?" · "+esc(it.cor):""}${it.nomes?` · Nome: <b>${esc(it.nomes)}</b>`:""}${it.pedido?" · Pedido "+esc(it.pedido):""}</div>`:"")+(b.fazer?`<div style="font-size:19px;margin-top:4px">👉 ${esc(b.fazer)}</div>`:"");
  const c=$("cards");c.prepend(el);while(c.children.length>4)c.lastChild.remove();setTimeout(()=>el.remove(),b.tipo==="erro"?12000:6000);
- tocarVoz(b.voz??0,tipo==="operador"?"ok":tipo)}
+ const v=b.voz??0;
+ if(tipo==="operador"){tocarTons([[1047,90],[1319,180],[0,150]],"triangle",.4,()=>tocarVoz(v,"ok"))}   // cracha: plim-plim + o som da pessoa
+ else tocarVoz(v,tipo)}
+function tocarTons(L,tipoOnda,vol,depois){try{let t=AC.currentTime+.02;for(const [f,ms] of L){const d=ms/1000;if(f){const o=AC.createOscillator(),g=AC.createGain();o.type=tipoOnda;o.frequency.value=f;o.connect(g);g.connect(AC.destination);
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+.01);g.gain.setValueAtTime(vol,t+d-.03);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d+.01)}t+=d}
+  if(depois)setTimeout(depois,Math.max(0,(t-AC.currentTime)*1000))}catch(e){}}
 async function feed(){try{const r=await fetch("/api/bipes/meus?op=TODOS&tv=1"+(FD!=null?"&desde="+FD:""),{headers:{"X-Chave":chave}});if(!r.ok)return;const d=await r.json();
  if(FD!=null&&!OUVE)(d.bipes||[]).filter(b=>b.origem==="pc"||(!b.origem&&!b.leitor)).forEach(cardBipe);FD=d.ultimo}catch(e){}
  try{$("somOff").style.display=(!AC||AC.state!=="running")?"block":"none"}catch(e){}}
-$("somOff").onclick=()=>{try{AC=AC||new AudioContext();AC.resume().then(()=>{$("somOff").style.display="none";tocarVoz(0,"ok")})}catch(e){}};
-document.addEventListener("click",()=>{try{AC=AC||new AudioContext();AC.resume()}catch(e){}});
+try{AC=new AudioContext()}catch(e){}   // ja cria: se o Chrome deixar, o som funciona sem clicar
+function ligarSom(teste){try{AC=AC||new AudioContext();AC.resume().then(()=>{$("somOff").style.display="none";if(teste)tocarVoz(0,"ok")})}catch(e){}}
+$("somOff").onclick=()=>ligarSom(true);
+["pointerdown","click","keydown","touchstart"].forEach(ev=>document.addEventListener(ev,()=>ligarSom(false),true));
 setInterval(feed,1000);feed();
 </script></body></html>
