@@ -5,28 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Etiquetas - Central Boni</title>
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--tx:#1d2330;--mut:#667085;--bd:#dfe3ea;--pri:#d7263d;--ok:#1a7f37;--warn:#b54708;--info:#175cd3}
+:root{--bg:#f4f5f7;--card:#fff;--tx:#1d2330;--mut:#667085;--bd:#dfe3ea;--pri:#d7263d;--ok:#1a7f37}
 *{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--tx)}
 header{background:#111827;color:#fff;padding:12px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:5}
-header h1{font-size:20px;margin:0 12px 0 0}header a{color:#cbd5e1}
-button,select,input{font-size:15px;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;background:#fff;color:var(--tx)}
+header h1{font-size:20px;margin:0 12px 0 0}
+button,input{font-size:15px;padding:9px 12px;border:1px solid var(--bd);border-radius:8px;background:#fff;color:var(--tx)}
 button{cursor:pointer;font-weight:bold}button.pri{background:var(--pri);color:#fff;border:0}button.ok{background:var(--ok);color:#fff;border:0}
-main{padding:12px 16px;max-width:1300px;margin:auto}
-.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-.chips span{display:inline-block;padding:6px 10px;border-radius:20px;background:#fff;border:1px solid var(--bd);margin:2px;cursor:pointer;font-size:14px}
-.chips span.on{background:#111827;color:#fff}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:grid;grid-template-columns:230px 1fr 340px;gap:12px}
-.card.env{opacity:.55}
-.ped b{font-size:16px}.mut{color:var(--mut);font-size:13px}
-.tag{display:inline-block;font-size:12px;padding:2px 7px;border-radius:10px;background:#eef2f6;margin:2px 2px 0 0}
-.t-ER{background:#fde2e4;color:#9f1239}.t-SHOPEE{background:#ffedd5;color:#9a3412}.t-RETIRADA{background:#e5e7eb}
-.msg{background:#fffbea;border-left:3px solid #f5b400;padding:6px 8px;font-size:14px;white-space:pre-wrap;margin-top:6px}
-.it{font-size:14px}.nomes input{width:100%;margin-bottom:4px}
-.tipo-G{border-left:6px solid var(--ok)}.tipo-A{border-left:6px solid var(--warn)}.tipo-C{border-left:6px solid var(--pri)}
-.tipo-E{border-left:6px solid var(--info)}.tipo-N{border-left:6px solid #98a2b3}
-#msg{font-weight:bold}
+button:disabled{opacity:.5;cursor:wait}
+main{padding:12px 16px;max-width:1100px;margin:auto}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.card h2{font-size:17px;margin:0 0 8px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.mut{color:var(--mut);font-size:13px}
+table{border-collapse:collapse;width:100%;margin-top:6px}th,td{border-bottom:1px solid var(--bd);padding:8px;text-align:center;font-size:15px}
+th:first-child,td:first-child{text-align:left}td.big{font-size:20px;font-weight:bold}
 #login{max-width:340px;margin:80px auto;background:#fff;padding:20px;border-radius:12px;border:1px solid var(--bd)}
-@media(max-width:900px){.card{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -39,104 +32,80 @@ main{padding:12px 16px;max-width:1300px;margin:auto}
 <div id="app" hidden>
 <header>
   <h1>🏷️ Etiquetas</h1>
-  <label>Prazo até <input type="date" id="ate" onchange="carregar()"></label>
-  <input id="quem" placeholder="Seu nome" style="width:130px">
-  <button onclick="sincronizar()">🔄 Atualizar da Shopee</button>
-  <button onclick="baixarCSV()">⬇️ CSV LightBurn</button>
-  <button class="pri" onclick="enviar()">📦 Enviar lote para produção</button>
+  <input id="quem" placeholder="Seu nome" style="width:140px">
   <span id="msg"></span>
 </header>
 <main>
-  <div class="card" style="display:block;border-left:6px solid #111827">
-    <b style="font-size:17px">🖨️ Pedir etiquetas ao Claude (ordem: Entrega Rápida → TikTok → Shopee)</b>
-    <div class="bar" style="margin-top:8px">
+  <div class="card">
+    <h2>📋 O que tem para imprimir</h2>
+    <div class="bar">
+      <button onclick="atualizarUpseller()" id="bUps">🔄 Atualizar UpSeller</button>
+      <button onclick="atualizarShopee()" id="bShp">🔄 Atualizar Shopee</button>
+      <span class="mut" id="quando"></span>
+    </div>
+    <div id="resumo"></div>
+    <div class="mut" id="shopee" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card" style="border-left:6px solid #111827">
+    <h2>🖨️ Imprimir (Entrega Rápida → TikTok → Shopee, dividido em 3 máquinas)</h2>
+    <div class="bar">
       <button class="pri" onclick="pedir('tudo_hoje')">🖨️ Tudo do dia</button>
       <button onclick="pedir('er_hoje')">⚡ Entrega Rápida do dia</button>
       <button onclick="pedir('tt_hoje')">🎵 TikTok do dia</button>
       <button onclick="pedir('sp_hoje')">🛍️ Shopee do dia</button>
       <button onclick="pedir('tudo')">📚 Tudo (inclui próximos dias)</button>
     </div>
-    <div class="mut">O Claude pega o pedido em até 15 min, lê os nomes nos chats, gera as etiquetas + CSV do LightBurn, imprime sozinho,
-      manda por e-mail e dá baixa no UpSeller. Nunca imprime repetido. Se alguma loja estiver deslogada, aparece aqui embaixo: faça o login e clique em <b>Já loguei, continuar</b>.</div>
+    <div class="mut" style="margin-top:6px">Cada impressão sai em <b>Máquina 1</b>, <b>Máquina 2</b> e <b>Máquina 3</b> (cada SKU inteiro numa máquina só,
+      equilibrado pelo tempo de gravação medido nos bipes) e, por último, <b>Sem gravação</b>. O Claude começa em até 15 min, lê os nomes nos chats,
+      imprime sozinho e dá baixa no UpSeller. Nunca imprime repetido. Se algo estiver deslogado, aparece aqui: faça o login e clique em <b>Já loguei, continuar</b>.</div>
     <div id="fila" style="margin-top:8px"></div>
   </div>
-  <div class="bar chips" id="fEnvio"></div>
-  <div class="bar chips" id="fTipo"></div>
-  <div class="bar"><input id="busca" placeholder="Buscar pedido, nome, SKU..." oninput="render()" style="flex:1;min-width:200px">
-    <label><input type="checkbox" id="mostrarEnv" onchange="render()"> mostrar já enviados</label></div>
-  <div id="lista"></div>
-  <p class="mut">Os nomes em amarelo são <b>sugestões</b> lidas da mensagem do comprador: confira e salve como <b>Gravar</b>.
-  Pedidos sem nome ficam como <b>Buscar nome no chat</b> — nunca deixe de imprimir. Nada aqui altera a Shopee.</p>
 </main>
 </div>
 <script>
-let D={pedidos:[],fontes:[],tipos:{}}, fEnv='', fTipo='';
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-function hoje(){const d=new Date();d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,10)}
 try{$('#quem').value=localStorage.getItem('etq_quem')||''}catch(e){}
 $('#quem').onchange=()=>{try{localStorage.setItem('etq_quem',$('#quem').value)}catch(e){}};
-$('#ate').value=hoje();
 function aviso(t,cor){$('#msg').textContent=t;$('#msg').style.color=cor||'#fff'}
 async function api(url,corpo){const r=await fetch(url,corpo?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo)}:{});
   if(r.status==401){$('#app').hidden=true;$('#login').hidden=false;throw new Error('login')}return r.json()}
 async function entrar(){const r=await fetch('/etiquetas/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha:$('#senha').value})});
-  if(r.ok){$('#login').hidden=true;carregar().then(fila)}else $('#lerr').textContent='Senha incorreta'}
-async function carregar(){aviso('Carregando...');D=await api('/api/etiquetas/dia?ate='+$('#ate').value);$('#app').hidden=false;$('#login').hidden=true;
-  aviso(D.pedidos.length+' para imprimir (prazo até '+D.dia+')'+(D.upseller_em?' · lista do UpSeller de '+D.upseller_em:'')+(D.aviso?' · ⚠ '+D.aviso:''),D.aviso?'#ffd479':undefined);render()}
-async function sincronizar(){aviso('Lendo pedidos da Shopee...');const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Atualizado':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
-function baixarCSV(){location.href='/api/etiquetas/csv?ate='+$('#ate').value+(fEnv?'&envios='+encodeURIComponent(fEnv):'')}
-async function enviar(){const n=D.pedidos.filter(p=>!p.enviado_em&&p.envio!='RETIRADA'&&(!fEnv||p.envio==fEnv)).length;
-  if(!n){aviso('Nada novo para enviar','#ffb4b4');return}
-  const pend=D.pedidos.filter(p=>!p.enviado_em&&p.origem=='sugestao'&&p.tipo!='N').length;
-  if(!confirm(`Enviar ${n} pedidos para a produção?`+(pend?`\n\nATENÇÃO: ${pend} ainda estão como sugestão (não conferidos).`:'')))return;
-  const r=await api('/api/etiquetas/enviar',{ate:$('#ate').value,envios:fEnv?[fEnv]:null});
-  aviso(r.ok?`Lote ${r.lote}: ${r.pedidos} pedidos enviados`:'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
+  if(r.ok){$('#login').hidden=true;iniciar()}else $('#lerr').textContent='Senha incorreta'}
 const FST={NA_FILA:['⏳ Na fila','#eef2f6'],TRABALHANDO:['⚙️ Claude trabalhando','#dbeafe'],PRECISA_LOGIN:['🔑 Precisa logar','#fde68a'],
   ERRO:['❌ Erro','#fecaca'],PRONTO:['✅ Pronto','#dcfce7'],CANCELADO:['🚫 Cancelado','#e5e7eb']};
-async function pedir(g){const G=FILAG||{};let txt='Pedir ao Claude: '+(G[g]||g)+'?';
-  if(g=='tudo')txt='ATENÇÃO: isso imprime também etiquetas que NÃO são de hoje.\n\nÉ isso mesmo?';
-  if(!confirm(txt))return;const r=await api('/api/fila/pedir',{grupo:g,por:$('#quem').value});
-  if(!r.ok)alert(r.erro);fila()}
-let FILAG=null;
-async function fila(){try{const r=await api('/api/fila');FILAG=r.grupos;const L=r.fila.filter((x,k)=>k<8);
-  $('#fila').innerHTML=L.map(x=>{const [t,c]=FST[x.status]||[x.status,'#eee'];const quando=new Date(x.criado).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
-    return `<div style="background:${c};border-radius:8px;padding:8px 10px;margin-top:6px"><b>${t}</b> · nº ${x.id} · ${esc(r.grupos[x.grupo]||x.grupo)} · ${quando}${x.por?' · '+esc(x.por):''}
+let FILAG={};
+function quando(iso){return iso?new Date(iso).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):''}
+function dataISO(d){d=new Date(d);d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,10)}
+async function resumo(){try{
+  const H=await api('/api/etiquetas/dia');const F=await api('/api/etiquetas/dia?ate='+dataISO(Date.now()+30*864e5));
+  const cont=(D,e)=>D.pedidos.filter(p=>p.envio==e).length;
+  const linhas=[['⚡ Entrega Rápida','ENTREGA RÁPIDA'],['🎵 TikTok','TIKTOK'],['🛍️ Shopee','SHOPEE']];let th=0,to=0;
+  $('#resumo').innerHTML='<table><tr><th></th><th>Prazo hoje</th><th>Próximos dias</th></tr>'+
+    linhas.map(([n,e])=>{const h=cont(H,e),o=cont(F,e)-h;th+=h;to+=o;return `<tr><td>${n}</td><td class="big">${h}</td><td>${o}</td></tr>`}).join('')+
+    `<tr><td><b>Total</b></td><td class="big">${th}</td><td><b>${to}</b></td></tr></table>`;
+  $('#quando').textContent=H.fonte_lista=='upseller'?('Lista do UpSeller de '+H.upseller_em):'Lista pela Shopee (UpSeller desatualizado)';
+  $('#shopee').textContent=H.aviso?('⚠ '+H.aviso):'';$('#shopee').style.color=H.aviso?'#b54708':''}catch(e){}}
+async function fila(){try{const r=await api('/api/fila');FILAG=r.grupos;
+  const L=r.fila.slice(0,8);
+  $('#fila').innerHTML=L.map(x=>{const [t,c]=FST[x.status]||[x.status,'#eee'];
+    return `<div style="background:${c};border-radius:8px;padding:8px 10px;margin-top:6px"><b>${t}</b> · nº ${x.id} · ${esc(r.grupos[x.grupo]||x.grupo)} · ${quando(x.criado)}${x.por?' · '+esc(x.por):''}
     <div style="white-space:pre-wrap">${esc(x.msg)}</div>${x.resultado?`<div class="mut" style="white-space:pre-wrap">${esc(x.resultado)}</div>`:''}
     ${x.status=='PRECISA_LOGIN'||x.status=='ERRO'?`<button class="ok" style="margin-top:6px" onclick="filaAcao('continuar',${x.id})">Já loguei, continuar</button> `:''}
     ${['NA_FILA','PRECISA_LOGIN','ERRO'].includes(x.status)?`<button style="margin-top:6px" onclick="filaAcao('cancelar',${x.id})">Cancelar</button>`:''}</div>`}).join('')||'<span class="mut">Nenhum pedido ainda.</span>'}catch(e){}}
+async function pedir(g){let txt='Pedir ao Claude: '+(FILAG[g]||g)+'?';
+  if(g=='tudo')txt='ATENÇÃO: isso imprime também etiquetas que NÃO são de hoje.\n\nÉ isso mesmo?';
+  if(!confirm(txt))return;const r=await api('/api/fila/pedir',{grupo:g,por:$('#quem').value});if(!r.ok)alert(r.erro);fila()}
+async function atualizarUpseller(){const r=await api('/api/fila/pedir',{grupo:'atualizar_upseller',por:$('#quem').value});
+  if(!r.ok)alert(r.erro);else aviso('Pedido de atualização do UpSeller na fila (até 15 min)','#7ee787');fila()}
+async function atualizarShopee(){const b=$('#bShp');b.disabled=true;aviso('Lendo pedidos da Shopee...');
+  try{const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Shopee atualizada':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');await resumo()}
+  finally{b.disabled=false}}
 async function filaAcao(a,id){const r=await api('/api/fila/'+a,{id,por:$('#quem').value});if(!r.ok)alert(r.erro);fila()}
-setInterval(fila,15000);
-function chips(){const envs=['','ENTREGA RÁPIDA','TIKTOK','SHOPEE','RETIRADA'];
-  $('#fEnvio').innerHTML=envs.map(e=>{const n=D.pedidos.filter(p=>!e||p.envio==e).length;return `<span class="${fEnv==e?'on':''}" onclick="fEnv='${e}';render()">${e||'Todos'} (${n})</span>`}).join('');
-  $('#fTipo').innerHTML=[''].concat(Object.keys(D.tipos)).map(t=>{const n=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!t||p.tipo==t)).length;
-    return `<span class="${fTipo==t?'on':''}" onclick="fTipo='${t}';render()">${t?D.tipos[t]:'Todos os tipos'} (${n})</span>`}).join('')}
-function render(){chips();const b=$('#busca').value.toLowerCase(),me=$('#mostrarEnv').checked;
-  const L=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!fTipo||p.tipo==fTipo)&&(me||!p.enviado_em)&&(!b||JSON.stringify(p).toLowerCase().includes(b)));
-  $('#lista').innerHTML=L.map(card).join('')||'<p class="mut">Nenhum pedido.</p>'}
-function card(p){const i=D.pedidos.indexOf(p);const n=Math.max(p.npers,p.nomes.length,p.tipo=='G'||p.tipo=='A'?1:0);
-  const ins=Array.from({length:n},(_,k)=>`<input data-k="${k}" value="${esc(p.nomes[k]||'')}" placeholder="Nome ${k+1}${p.unidades.filter(u=>u.pers)[k]?' - '+esc(p.unidades.filter(u=>u.pers)[k].var.split(',')[0]):''}" style="${p.origem=='sugestao'&&p.nomes[k]?'background:#fff7cc':''}">`).join('');
-  const tcls=p.envio=='ENTREGA RÁPIDA'?'t-ER':'t-'+p.envio;
-  return `<div class="card tipo-${p.tipo} ${p.enviado_em?'env':''}" id="c${i}">
-  <div class="ped"><b>${esc(p.order_sn)}</b><br><span class="tag ${tcls}">${esc(p.envio)}</span><span class="tag">${esc(p.loja)}</span>
-   <div class="mut">Prazo ${esc(p.prazo)} · ${esc(p.status)}</div>
-   ${p.impresso?`<span class="tag" style="background:#dbeafe">🖨️ ${esc(p.impresso)}</span>`:''}
-   ${(!p.impresso&&p.na_central)?`<span class="tag" style="background:#dbeafe">🖨️ já impressa (UpSeller)</span>`:''}
-   ${p.enviado_em?`<span class="tag" style="background:#dcfce7">✔ ${esc(p.lote)}</span>`:''}
-   <span class="tag">${p.origem=='sugestao'?'sugestão':p.origem}</span></div>
-  <div><div class="it">${p.itens.map(t=>`<div>• <b>${esc(t.sku)}</b> ${esc(t.var)} <b>x${t.qtd}</b></div>`).join('')}</div>
-   ${p.msg?`<div class="msg">${esc(p.msg)}</div>`:'<div class="mut">Sem mensagem do comprador no pedido.</div>'}</div>
-  <div><select data-f="tipo">${Object.entries(D.tipos).map(([k,v])=>`<option value="${k}" ${p.tipo==k?'selected':''}>${v}</option>`).join('')}</select>
-   <select data-f="fonte"><option value="">Fonte padrão</option>${D.fontes.map((f,k)=>`<option ${p.fonte==f?'selected':''} value="${esc(f)}">${k+1} - ${esc(f)}</option>`).join('')}</select>
-   <div class="nomes" style="margin-top:6px">${ins}</div>
-   <input data-f="obs" value="${esc(p.obs)}" placeholder="Observação (aparece na etiqueta)" style="width:100%">
-   <div style="margin-top:6px"><button class="ok" onclick="salvar(${i})">Salvar</button> <span id="s${i}" class="mut"></span></div></div></div>`}
-async function salvar(i){const p=D.pedidos[i],c=$('#c'+i);const nomes=[...c.querySelectorAll('.nomes input')].map(x=>x.value.trim()).filter(Boolean);
-  const body={order_sn:p.order_sn,tipo:c.querySelector('[data-f=tipo]').value,fonte:c.querySelector('[data-f=fonte]').value,obs:c.querySelector('[data-f=obs]').value,nomes,por:$('#quem').value};
-  const r=await api('/api/etiquetas/salvar',body);
-  if(r.ok){Object.assign(p,body,{origem:'conferido'});$('#s'+i).textContent='✔ salvo';c.className=c.className.replace(/tipo-\w/,'tipo-'+body.tipo)}
-  else $('#s'+i).textContent='❌ '+r.erro}
-carregar().then(fila).catch(()=>{});
+async function iniciar(){try{await api('/api/fila');$('#app').hidden=false;$('#login').hidden=true;fila();resumo()}catch(e){}}
+setInterval(fila,15000);setInterval(resumo,60000);
+iniciar();
 </script>
 </body>
 </html>

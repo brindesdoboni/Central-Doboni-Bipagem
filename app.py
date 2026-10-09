@@ -3212,6 +3212,10 @@ class H(BaseHTTPRequestHandler):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
             return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS})
+        if p == "/api/maquinas/tempos":
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, maquinas_tempos(int(q.get("dias") or 30)))
         if p == "/api/fila/proximo":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -3558,6 +3562,10 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                                                    so_de=("PRECISA_LOGIN", "ERRO")))
             return self._envia(200, fila_mudar(d.get("id"), "CANCELADO", "Cancelado por " + str(d.get("por") or "equipe")[:40],
                                                so_de=("NA_FILA", "PRECISA_LOGIN", "ERRO")))
+        if p == "/api/fila/dividir":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "sem acesso"})
+            return self._envia(200, maquinas_dividir(d.get("pedidos"), d.get("maquinas") or 3))
         if p == "/api/fila/status":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -8032,6 +8040,67 @@ def fila_proximo():
         d = dict(r)
     d["nome_grupo"] = FILA_GRUPOS.get(d["grupo"], d["grupo"])
     return {"ok": True, "pedido": d}
+
+
+# ---- divisao em 3 maquinas (SKU inteiro na mesma maquina, equilibrado pelo tempo medido nos bipes da gravacao)
+FILA_GRUPOS["atualizar_upseller"] = "Atualizar o que tem para imprimir (UpSeller)"
+MAQ_TEMPO_PADRAO = float(os.environ.get("MAQ_TEMPO_PADRAO_MIN", "3"))
+
+
+def _sku_base(s):
+    return re.split(r"[-\s]", str(s or "").strip().upper(), 1)[0] or "(SEM SKU)"
+
+
+def maquinas_tempos(dias=30):
+    """Minutos por peca de cada SKU = mediana dos bipes de gravacao dos ultimos `dias` (min. 3 pecas)."""
+    ini = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    with conn() as c:
+        g = _gravacoes(c, ini)
+    por = {}
+    for _, sku, m in g:
+        por.setdefault(_sku_base(sku), []).append(m)
+    med = lambda v: sorted(v)[len(v) // 2]
+    tudo = [m for v in por.values() for m in v]
+    padrao = round(med(tudo), 2) if len(tudo) >= 10 else MAQ_TEMPO_PADRAO
+    return {"padrao_min": padrao, "dias": dias,
+            "skus": {k: {"min": round(med(v), 2), "pecas": len(v)} for k, v in por.items() if len(v) >= 3}}
+
+
+def maquinas_dividir(pedidos, n=3):
+    """pedidos: [{pedido, itens:[{sku, qtd}]}] (so os que vao para a gravacao).
+    Um SKU nunca e dividido entre maquinas: pedidos que dividem algum SKU ficam no mesmo grupo (pedido com 2 SKUs
+    junta os dois grupos). Grupos distribuidos do maior para o menor na maquina com menos tempo (equilibrado)."""
+    t = maquinas_tempos()
+    tmin = lambda sku: t["skus"].get(_sku_base(sku), {}).get("min", t["padrao_min"])
+    pai = {}
+
+    def raiz(x):
+        while pai.setdefault(x, x) != x:
+            pai[x] = pai[pai[x]]
+            x = pai[x]
+        return x
+    lista = []
+    for p in pedidos or []:
+        its = [i for i in (p.get("itens") or []) if int(i.get("qtd") or 0) > 0] or [{"sku": "", "qtd": 1}]
+        skus = [_sku_base(i.get("sku")) for i in its]
+        for s2 in skus[1:]:
+            pai[raiz(s2)] = raiz(skus[0])
+        raiz(skus[0])
+        lista.append((str(p.get("pedido")), skus, its))
+    grupos = {}
+    for ped, skus, its in lista:
+        g = grupos.setdefault(raiz(skus[0]), {"skus": set(), "pedidos": [], "pecas": 0, "min": 0.0})
+        g["skus"].update(skus); g["pedidos"].append(ped)
+        g["pecas"] += sum(int(i.get("qtd") or 1) for i in its)
+        g["min"] += sum(tmin(i.get("sku")) * int(i.get("qtd") or 1) for i in its)
+    maq = [{"maquina": k + 1, "skus": [], "pedidos": [], "pecas": 0, "min": 0.0} for k in range(max(1, int(n)))]
+    for g in sorted(grupos.values(), key=lambda x: -x["min"]):
+        m = min(maq, key=lambda x: (x["min"], x["maquina"]))
+        m["skus"] += sorted(g["skus"]); m["pedidos"] += g["pedidos"]; m["pecas"] += g["pecas"]; m["min"] += g["min"]
+    for m in maq:
+        m["min"] = round(m["min"], 1)
+    return {"ok": True, "maquinas": maq, "pedido_maquina": {p: m["maquina"] for m in maq for p in m["pedidos"]},
+            "tempos": t}
 
 
 if __name__ == "__main__":
