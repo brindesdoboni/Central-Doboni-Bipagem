@@ -3216,6 +3216,10 @@ class H(BaseHTTPRequestHandler):
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "sem acesso"})
             return self._envia(200, fila_proximo())
+        if p == "/api/etiquetas/upseller/vale":   # codigo de 30 min para a aba do UpSeller mandar a lista Para Imprimir
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, {"ok": True, "vale": etq_vale_novo()})
         if p in ("/api/etiquetas/dia", "/api/etiquetas/imprimir", "/api/etiquetas/ultimo", "/api/etiquetas/csv_lote", "/api/etiquetas/csv"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -3558,6 +3562,12 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "sem acesso"})
             return self._envia(200, fila_mudar(d.get("id"), str(d.get("status") or ""), d.get("msg") or "", d.get("resultado")))
+        if p == "/api/etiquetas/upseller":   # lista "Para Imprimir" do UpSeller (mandada pela automacao do PC)
+            cors = {"Access-Control-Allow-Origin": "*"}   # a aba do UpSeller manda direto (text/plain + vale)
+            if not (self._etq_ok() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)
+                    or etq_vale_ok(str(d.get("vale") or ""))):
+                return self._envia(401, {"erro": "login necessario"}, extra=cors)
+            return self._envia(200, etq_upseller_salvar(d), extra=cors)
         if p in ("/api/etiquetas/salvar", "/api/etiquetas/enviar", "/api/etiquetas/sincronizar"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -7556,6 +7566,68 @@ def etq_sugerir(msg, qtd_pers):
     return nomes, fonte
 
 
+# 09/10/2026 (Lucas/Jo): a tela mostra EXATAMENTE o que esta "Para Imprimir" no UpSeller (Shopee + TikTok).
+# A automacao do PC manda a lista completa para /api/etiquetas/upseller a cada ~15 min (e quando pedem).
+ETQ_UPS_MIN = int(os.environ.get("ETQ_UPSELLER_MIN", "90"))   # lista mais velha que isso = desatualizada
+
+
+_etq_vales = {}
+
+
+def etq_vale_novo():
+    import time
+    now = time.time()
+    for k in [k for k, v in _etq_vales.items() if v < now]:
+        _etq_vales.pop(k, None)
+    v = secrets.token_urlsafe(12)
+    _etq_vales[v] = now + 1800
+    return v
+
+
+def etq_vale_ok(v):
+    import time
+    return bool(v) and _etq_vales.get(v, 0) > time.time()
+
+
+def etq_upseller_salvar(d):
+    L = d.get("pedidos")
+    if not isinstance(L, list) or not d.get("completo"):
+        return {"ok": False, "erro": "mande a lista completa do Para Imprimir (pedidos + completo=true)"}
+    out = []
+    for o in L:
+        if not isinstance(o, dict) or not norm(str(o.get("id") or "")):
+            continue
+        try:
+            prazo = int(o.get("prazo") or 0)
+        except (TypeError, ValueError):
+            prazo = 0
+        out.append({"id": norm(str(o["id"])), "n": str(o.get("n") or "")[:30], "p": str(o.get("p") or "")[:20].lower(),
+                    "l": str(o.get("l") or "")[:60], "prov": str(o.get("prov") or "")[:60], "prazo": prazo,
+                    "msg": str(o.get("msg") or "")[:500],
+                    "i": [[str(x) if x is not None else "" for x in (list(it) + [""] * 4)[:4]] for it in (o.get("i") or [])][:40]})
+    with _lock, conn() as c:
+        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('etq_upseller', ?)",
+                  (json.dumps({"em": agora(), "pedidos": out}, ensure_ascii=False),))
+    return {"ok": True, "pedidos": len(out)}
+
+
+def _etq_upseller():
+    """(lista, quando, fresca) da ultima lista Para Imprimir do UpSeller."""
+    with conn() as c:
+        r = c.execute("SELECT valor FROM meta WHERE chave='etq_upseller'").fetchone()
+    if not r or not r[0]:
+        return [], None, False
+    d = json.loads(r[0])
+    em = datetime.fromisoformat(d["em"])
+    return d.get("pedidos") or [], em, (datetime.now(timezone.utc) - em).total_seconds() < ETQ_UPS_MIN * 60
+
+
+def _etq_envio_ups(o, carrier=""):
+    if "tiktok" in (o.get("p") or ""):
+        return "TIKTOK"
+    return _etq_envio(o.get("prov") or carrier)
+
+
 def etq_lista(ate=None, incluir_impressos=False):
     """Pedidos a enviar com prazo ate o fim do dia `ate` (YYYY-MM-DD, padrao hoje).
     09/10/2026 (Lucas/Jo): a tela mostra SO o que ainda nao foi impresso (o que esta "Para Imprimir").
@@ -7563,9 +7635,27 @@ def etq_lista(ate=None, incluir_impressos=False):
     OU o espelho do UpSeller (recente) diz que ja esta em Para Retirada. Esses pedidos nao aparecem."""
     dia = datetime.strptime(ate, "%Y-%m-%d").replace(tzinfo=BR) if ate else datetime.now(BR)
     fim = int(dia.replace(hour=23, minute=59, second=59).timestamp())
+    snap, snap_em, fresca = _etq_upseller()
+    snap = {o["id"]: o for o in snap if 0 < (o.get("prazo") or 0) <= fim} if fresca else {}
     with conn() as c:
-        peds = [dict(r) for r in c.execute("""SELECT * FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP')
-                 AND prazo>0 AND prazo<=? ORDER BY prazo""", (fim,))]
+        if fresca:   # fonte = UpSeller "Para Imprimir"; dados extras (mensagem, itens) da Shopee quando houver
+            sp = {}
+            if snap:
+                sp = {r["order_sn"]: dict(r) for r in c.execute(
+                    f"SELECT * FROM shopee_pedidos WHERE order_sn IN ({','.join('?' * len(snap))})", list(snap))}
+            peds = []
+            for sn, o in snap.items():
+                p = sp.get(sn) or {"order_sn": sn, "loja": o["l"], "status": "", "envio": o["prov"], "msg": o["msg"],
+                                   "itens": json.dumps([{"sku": x[1] or x[0], "var": x[2], "qtd": int(x[3]) if str(x[3]).isdigit() else 1}
+                                                        for x in o["i"]], ensure_ascii=False)}
+                p = dict(p, prazo=o["prazo"], _envio=_etq_envio_ups(o, p.get("envio")), _ups=True)
+                if not p.get("msg") and o["msg"]:
+                    p["msg"] = o["msg"]
+                peds.append(p)
+            peds.sort(key=lambda p: p["prazo"])
+        else:
+            peds = [dict(r) for r in c.execute("""SELECT * FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP')
+                     AND prazo>0 AND prazo<=? ORDER BY prazo""", (fim,))]
         salvos = {r["order_sn"]: dict(r) for r in c.execute("SELECT * FROM etq_pedidos")}
         cent = {}
         if peds:
@@ -7592,7 +7682,10 @@ def etq_lista(ate=None, incluir_impressos=False):
         npers = sum(u["pers"] for u in unid)
         s = salvos.get(p["order_sn"])
         ce = cent.get(p["order_sn"])
-        ja_impresso = bool(s and s.get("impresso_em")) or bool(ce) or ups.get(p["order_sn"]) in ("to_pickup", "pickup_exception")
+        if p.get("_ups"):   # esta no Para Imprimir do UpSeller: so some se ja foi impresso por esta tela
+            ja_impresso = bool(s and s.get("impresso_em"))
+        else:
+            ja_impresso = bool(s and s.get("impresso_em")) or bool(ce) or ups.get(p["order_sn"]) in ("to_pickup", "pickup_exception")
         if ja_impresso and not incluir_impressos:
             continue
         if s and s["tipo"]:
@@ -7604,17 +7697,20 @@ def etq_lista(ate=None, incluir_impressos=False):
             nomes, fonte = etq_sugerir(p["msg"], npers)
             tipo = "N" if not npers else ("A" if nomes and len(nomes) == npers else "C")
             obs, origem = "", "sugestao"
-        out.append({"order_sn": p["order_sn"], "loja": p["loja"], "envio": _etq_envio(p["envio"]), "carrier": p["envio"],
+        out.append({"order_sn": p["order_sn"], "loja": p["loja"], "envio": p.get("_envio") or _etq_envio(p["envio"]), "carrier": p["envio"],
                     "prazo": datetime.fromtimestamp(p["prazo"], BR).strftime("%d/%m %H:%M"), "msg": p["msg"],
                     "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
                     "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
                     "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
                     "na_central": ja_impresso,   # so aparece True quando incluir_impressos (reimpressao autorizada)
-                    "status": SHOPEE_STATUS_PT.get(p["status"], p["status"])})
+                    "status": SHOPEE_STATUS_PT.get(p["status"], p["status"]) if p["status"] else "Para imprimir (UpSeller)"})
     out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
                             x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
+    em_txt = snap_em.astimezone(BR).strftime("%d/%m %H:%M") if snap_em else ""
     return {"ok": True, "dia": dia.strftime("%d/%m/%Y"), "pedidos": out, "fontes": ETQ_FONTES, "tipos": ETQ_TIPOS,
-            "sync": _shopee_sync}
+            "sync": _shopee_sync, "fonte_lista": "upseller" if fresca else "shopee", "upseller_em": em_txt,
+            "aviso": "" if fresca else ("Lista do UpSeller desatualizada" + (f" (última {em_txt})" if em_txt else "")
+                                        + ": pode aparecer pedido já impresso. Peça para atualizar.")}
 
 
 def etq_salvar(d, por=""):

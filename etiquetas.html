@@ -83,7 +83,7 @@ async function api(url,corpo){const r=await fetch(url,corpo?{method:'POST',heade
 async function entrar(){const r=await fetch('/etiquetas/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha:$('#senha').value})});
   if(r.ok){$('#login').hidden=true;carregar().then(fila)}else $('#lerr').textContent='Senha incorreta'}
 async function carregar(){aviso('Carregando...');D=await api('/api/etiquetas/dia?ate='+$('#ate').value);$('#app').hidden=false;$('#login').hidden=true;
-  aviso(D.pedidos.length+' pedidos com prazo até '+D.dia);render()}
+  aviso(D.pedidos.length+' para imprimir (prazo até '+D.dia+')'+(D.upseller_em?' · lista do UpSeller de '+D.upseller_em:'')+(D.aviso?' · ⚠ '+D.aviso:''),D.aviso?'#ffd479':undefined);render()}
 async function sincronizar(){aviso('Lendo pedidos da Shopee...');const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Atualizado':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
 function baixarCSV(){location.href='/api/etiquetas/csv?ate='+$('#ate').value+(fEnv?'&envios='+encodeURIComponent(fEnv):'')}
 async function enviar(){const n=D.pedidos.filter(p=>!p.enviado_em&&p.envio!='RETIRADA'&&(!fEnv||p.envio==fEnv)).length;
@@ -107,7 +107,7 @@ async function fila(){try{const r=await api('/api/fila');FILAG=r.grupos;const L=
     ${['NA_FILA','PRECISA_LOGIN','ERRO'].includes(x.status)?`<button style="margin-top:6px" onclick="filaAcao('cancelar',${x.id})">Cancelar</button>`:''}</div>`}).join('')||'<span class="mut">Nenhum pedido ainda.</span>'}catch(e){}}
 async function filaAcao(a,id){const r=await api('/api/fila/'+a,{id,por:$('#quem').value});if(!r.ok)alert(r.erro);fila()}
 setInterval(fila,15000);
-function chips(){const envs=['','ENTREGA RÁPIDA','SHOPEE','RETIRADA'];
+function chips(){const envs=['','ENTREGA RÁPIDA','TIKTOK','SHOPEE','RETIRADA'];
   $('#fEnvio').innerHTML=envs.map(e=>{const n=D.pedidos.filter(p=>!e||p.envio==e).length;return `<span class="${fEnv==e?'on':''}" onclick="fEnv='${e}';render()">${e||'Todos'} (${n})</span>`}).join('');
   $('#fTipo').innerHTML=[''].concat(Object.keys(D.tipos)).map(t=>{const n=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!t||p.tipo==t)).length;
     return `<span class="${fTipo==t?'on':''}" onclick="fTipo='${t}';render()">${t?D.tipos[t]:'Todos os tipos'} (${n})</span>`}).join('')}
