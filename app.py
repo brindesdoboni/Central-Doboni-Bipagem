@@ -3211,7 +3211,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/fila":
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS})
+            return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS, "travados": len(reserva_consultar()["pedidos"])})
         if p == "/api/maquinas/tempos":
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -3562,6 +3562,17 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                                                    so_de=("PRECISA_LOGIN", "ERRO")))
             return self._envia(200, fila_mudar(d.get("id"), "CANCELADO", "Cancelado por " + str(d.get("por") or "equipe")[:40],
                                                so_de=("NA_FILA", "PRECISA_LOGIN", "ERRO")))
+        if p in ("/api/reserva", "/api/reserva/marcar", "/api/reserva/consultar"):
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "sem acesso"})
+            if p == "/api/reserva":
+                return self._envia(200, reserva_pedir(d.get("pedidos"), d.get("lote") or "", d.get("por") or ""))
+            if p == "/api/reserva/marcar":
+                st = str(d.get("status") or "").upper()
+                if st not in ("IMPRESSO", "LIBERAR"):
+                    return self._envia(400, {"erro": "status deve ser IMPRESSO ou LIBERAR"})
+                return self._envia(200, reserva_marcar(d.get("pedidos"), st, d.get("arquivo") or ""))
+            return self._envia(200, reserva_consultar(d.get("pedidos")))
         if p == "/api/fila/dividir":
             if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
                 return self._envia(403, {"erro": "sem acesso"})
@@ -8045,10 +8056,18 @@ def fila_proximo():
 # ---- divisao em 3 maquinas (SKU inteiro na mesma maquina, equilibrado pelo tempo medido nos bipes da gravacao)
 FILA_GRUPOS["atualizar_upseller"] = "Atualizar o que tem para imprimir (UpSeller)"
 MAQ_TEMPO_PADRAO = float(os.environ.get("MAQ_TEMPO_PADRAO_MIN", "3"))
+# SKU (sem zeros a esquerda) -> maquinas onde pode ser feito. Lucas 09/10: chaveiro 9824 so nas maquinas 2 e 3.
+# Mudar sem mexer no codigo: variavel MAQ_RESTRICOES="9824:2,3;1234:1"
+MAQ_RESTRICOES = {"9824": [2, 3]}
+for _r in (os.environ.get("MAQ_RESTRICOES") or "").split(";"):
+    if ":" in _r:
+        _k, _v = _r.split(":", 1)
+        MAQ_RESTRICOES[_k.strip().upper().lstrip("0")] = [int(x) for x in _v.split(",") if x.strip().isdigit()]
 
 
 def _sku_base(s):
-    return re.split(r"[-\s]", str(s or "").strip().upper(), 1)[0] or "(SEM SKU)"
+    b = re.split(r"[-\s]", str(s or "").strip().upper(), 1)[0]
+    return (b.lstrip("0") or b) or "(SEM SKU)"   # 09824 e 9824 sao o mesmo produto
 
 
 def maquinas_tempos(dias=30):
@@ -8094,8 +8113,19 @@ def maquinas_dividir(pedidos, n=3):
         g["pecas"] += sum(int(i.get("qtd") or 1) for i in its)
         g["min"] += sum(tmin(i.get("sku")) * int(i.get("qtd") or 1) for i in its)
     maq = [{"maquina": k + 1, "skus": [], "pedidos": [], "pecas": 0, "min": 0.0} for k in range(max(1, int(n)))]
-    for g in sorted(grupos.values(), key=lambda x: -x["min"]):
-        m = min(maq, key=lambda x: (x["min"], x["maquina"]))
+    todas = [m["maquina"] for m in maq]
+
+    def pode(g):   # maquinas onde TODOS os SKUs do grupo podem ser feitos
+        ok = set(todas)
+        for s2 in g["skus"]:
+            r = MAQ_RESTRICOES.get(s2.lstrip("0"))
+            if r:
+                ok &= set(r)
+        return ok or set(todas)
+    # primeiro os grupos com restricao (ex.: chaveiro 9824 so na 2 e 3), depois o resto, sempre do maior para o menor
+    for g in sorted(grupos.values(), key=lambda x: (len(pode(x)) == len(todas), -x["min"])):
+        perm = pode(g)
+        m = min((x for x in maq if x["maquina"] in perm), key=lambda x: (x["min"], x["maquina"]))
         m["skus"] += sorted(g["skus"]); m["pedidos"] += g["pedidos"]; m["pecas"] += g["pecas"]; m["min"] += g["min"]
     for m in maq:
         m["min"] = round(m["min"], 1)
@@ -8103,11 +8133,68 @@ def maquinas_dividir(pedidos, n=3):
             "tempos": t}
 
 
+# ---- TRAVA ANTI-DUPLICACAO: todo lote (app, agendado, Turbo) reserva os pedidos aqui ANTES de gerar a etiqueta.
+# Pedido ja reservado/impresso nao pode ser reservado de novo -> nunca sai etiqueta repetida, nem com 2 lotes ao mesmo tempo.
+RESERVA_VELHA_H = float(os.environ.get("RESERVA_VELHA_H", "3"))
+
+
+def reserva_iniciar():
+    with conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS etq_reserva(pedido TEXT PRIMARY KEY, lote TEXT, por TEXT,
+                     reservado_em TEXT, status TEXT, impresso_em TEXT DEFAULT '', arquivo TEXT DEFAULT '')""")
+
+
+def _ped_norm(p):
+    return re.sub(r"\s+", "", str(p or "")).upper()
+
+
+def reserva_pedir(pedidos, lote, por=""):
+    """Reserva cada pedido (nº UPPUS). Devolve os que o lote PODE imprimir e os bloqueados (com o motivo)."""
+    ok, bloq = [], {}
+    with _lock, conn() as c:
+        for p in dict.fromkeys(_ped_norm(x) for x in (pedidos or []) if _ped_norm(x)):
+            r = c.execute("SELECT lote, status, reservado_em, impresso_em FROM etq_reserva WHERE pedido=?", (p,)).fetchone()
+            if r:
+                bloq[p] = {"lote": r[0], "status": r[1], "em": r[3] or r[2]}
+                continue
+            c.execute("INSERT INTO etq_reserva(pedido, lote, por, reservado_em, status) VALUES(?,?,?,?,'RESERVADO')",
+                      (p, str(lote)[:80], str(por)[:40], agora()))
+            ok.append(p)
+    return {"ok": True, "pode_imprimir": ok, "bloqueados": bloq}
+
+
+def reserva_marcar(pedidos, status, arquivo=""):
+    """status IMPRESSO (saiu na Zebra) ou LIBERAR (o lote parou ANTES de salvar o arquivo para imprimir)."""
+    n = 0
+    with _lock, conn() as c:
+        for p in (pedidos or []):
+            p = _ped_norm(p)
+            if status == "IMPRESSO":
+                n += c.execute("UPDATE etq_reserva SET status='IMPRESSO', impresso_em=?, arquivo=? WHERE pedido=?",
+                               (agora(), str(arquivo)[:120], p)).rowcount
+            elif status == "LIBERAR":
+                n += c.execute("DELETE FROM etq_reserva WHERE pedido=? AND status='RESERVADO'", (p,)).rowcount
+    return {"ok": True, "alterados": n}
+
+
+def reserva_consultar(pedidos=None):
+    """Sem lista: os RESERVADOS ha mais de RESERVA_VELHA_H horas (lote que parou no meio - conferir no log da Zebra)."""
+    with conn() as c:
+        if pedidos:
+            ps = [_ped_norm(x) for x in pedidos]
+            rows = c.execute(f"SELECT * FROM etq_reserva WHERE pedido IN ({','.join('?' * len(ps))})", ps).fetchall()
+        else:
+            lim = (datetime.now(timezone.utc) - timedelta(hours=RESERVA_VELHA_H)).isoformat()
+            rows = c.execute("SELECT * FROM etq_reserva WHERE status='RESERVADO' AND reservado_em<? ORDER BY reservado_em", (lim,)).fetchall()
+        return {"ok": True, "pedidos": [dict(r) for r in rows]}
+
+
 if __name__ == "__main__":
     iniciar_db()
     etq_iniciar()
     etq_iniciar_pdf()
     fila_iniciar()
+    reserva_iniciar()
     try:
         n = carregar_abertura()
         if n:
