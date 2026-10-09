@@ -39,7 +39,7 @@ dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-r
 @keyframes ent{from{opacity:0;transform:translateY(10px)}}
 </style></head><body>
 <header><h1>Central Boni · Produção</h1>
-<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/setores" target="_blank">Etiquetas de setor</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="dlgMail.showModal();carregarMail()">E-mail de etiquetas</button><button onclick="abrirEst()"><b>Estoque</b></button><button onclick="abrirMat()"><b>Materiais e compras</b></button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
+<div class="row"><input type="date" id="data"><a id="exp" href="#">Exportar CSV</a><a href="/crachas" target="_blank">Crachás</a><a href="/setores" target="_blank">Etiquetas de setor</a><a href="/backup.db">Backup</a><a href="/operacao" target="_blank">Tela da operação</a><a href="/sair">Sair</a><button onclick="dlgCol.showModal();carregarCol()">Equipe</button><button onclick="dlgPau.showModal();carregarPau()">Pausas</button><button onclick="dlgMail.showModal();carregarMail()">E-mail de etiquetas</button><button onclick="abrirEst()"><b>Estoque</b></button><button onclick="abrirRap()" style="background:#fef3c7;border-color:#f59e0b"><b>⚡ Entrega Rápida</b></button><button onclick="abrirMat()"><b>Materiais e compras</b></button><button onclick="abrirProd()">Produtividade</button><button onclick="abrirDev()">Devoluções</button><button onclick="dlgCus.showModal();carregarCus()">Custos</button></div></header>
 <div class="wrap">
 <div class="kpis" id="kpis"></div><p id="dia" class="mut" style="margin:6px 0"></p><p id="limp" class="mut" style="margin:4px 0"></p>
 <dialog id="dlgOc" class="largo"><h2>🧹 Etiquetas que saíram da conta</h2><p class="mut">Duplicadas: a mesma etiqueta que entrou 2 vezes (lote, PDF, e-mail, bipe) — ficou só uma. Encerradas: já saíram pela Shopee, foram canceladas, ou estavam paradas há dias sem nenhum bipe. Nada foi apagado e o estoque não foi mexido. Se uma encerrada for bipada, ela volta sozinha.</p>
@@ -77,6 +77,15 @@ dialog.tela .fx{margin-left:auto;background:#dc2626;color:#fff;border:0;border-r
 <textarea id="cTxt" placeholder="06016B;12,90&#10;09824;8,50"></textarea><div class="row" style="margin:8px 0"><button onclick="importCus()">Importar lista</button> ou um só: <input id="cSku" placeholder="SKU" size="12"><input id="cVal" placeholder="Custo (ex.: 12,90)" size="10"><button onclick="addCus()">Salvar</button><span id="cMsg" class="mut"></span></div>
 <div class="dbody"><table id="cus"></table></div><p><button onclick="dlgCus.close()">Fechar</button></p></dialog>
 <dialog id="dlgHist"><h2 id="hTit"></h2><table id="hist"></table><p><button onclick="dlgHist.close()">Fechar</button></p></dialog>
+<dialog id="dlgRap" class="largo tela"><div class="topo"><h2 style="margin:0">⚡ Estoque da Entrega Rápida</h2>
+<label style="font-weight:bold">Projetar <select id="rpDias" onchange="carregarRap()"><option value="3">3 dias</option><option value="4" selected>4 dias</option><option value="5">5 dias</option></select></label>
+<button onclick="copiarRap()">📋 Copiar lista de compra</button><button class="fx" onclick="dlgRap.close()">✕ Fechar</button></div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px 14px;margin-bottom:10px;font-size:14px">
+<b>Para que serve:</b> não deixar faltar material para os pedidos de <b>Entrega Rápida / Direta / Turbo</b> da Shopee (falta aqui gera atraso, cancelamento e penalidade).<br>
+<b>Como funciona:</b> olha as etiquetas de entrega rápida que entraram na Central nos últimos dias, calcula quanto sai por dia de cada material (com o peso do dia da semana) e projeta os próximos dias. Compara com o que tem <b>disponível</b> na prateleira (já tirando o que está reservado nas etiquetas de hoje) e soma <span id="rpMarg">20</span>% de segurança.<br>
+<span style="display:inline-block;margin-top:4px"><b style="color:#dc2626">🔴 Vermelho</b> = vai faltar amanhã (ou já acabou): comprar já · <b style="color:#b45309">🟡 Amarelo</b> = não dá para os dias escolhidos: comprar · <b style="color:#15803d">🟢 Verde</b> = tem o suficiente</span></div>
+<div id="rpRes" class="row" style="gap:10px;margin-bottom:8px"></div>
+<div class="estab"><table id="rpTab"></table></div><p id="rpInfo" class="mut" style="font-size:13px"></p></dialog>
 <dialog id="dlgEst" class="largo tela"><div class="topo"><h2 style="margin:0">📦 Estoque</h2>
 <span class="lupa">🔍<input id="esBusca" placeholder="Pesquisar SKU, cor ou nome" oninput="renderEst()" onkeydown="if(event.key==='Enter'){topoEst();$('esTab').scrollIntoView({behavior:'smooth',block:'start'})}" type="search"></span>
 <label style="white-space:nowrap"><input type="checkbox" id="esSoComprar" onchange="renderEst()"> só comprar / alerta</label><b id="esTotal"></b>
@@ -443,4 +452,21 @@ async function addCus(){if(!cSku.value.trim()||!cVal.value.trim())return;const r
 async function delCus(sku){if(confirm("Excluir o custo de "+sku+"?")){await POST("/api/custos",{sku,excluir:true});carregarCus()}}
 carregar();vigiar();setInterval(vigiar,1000);setInterval(()=>{if(!document.hidden)carregar()},30000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)carregar()});
+
+// ---- Entrega Rapida: projecao de 3-5 dias so dos pedidos de entrega rapida/direta/turbo
+let RP=null;
+function abrirRap(){dlgRap.showModal();carregarRap()}
+async function carregarRap(){$("rpTab").innerHTML="<tr><td>Calculando…</td></tr>";$("rpRes").innerHTML="";
+ try{RP=await (await fetch("/api/estoque/rapida?dias="+$("rpDias").value)).json()}catch(e){$("rpTab").innerHTML="<tr><td>Não consegui calcular. Tente de novo.</td></tr>";return}
+ $("rpMarg").textContent=RP.margem_pct??20;
+ if(!RP.itens.length){$("rpTab").innerHTML=`<tr><td>${esc(RP.msg||"Nenhum material de entrega rápida nos últimos dias.")}</td></tr>`;$("rpInfo").textContent="";return}
+ const R=RP.resumo,box=(cor,bg,n,t)=>`<div style="background:${bg};border-left:6px solid ${cor};border-radius:10px;padding:8px 14px;min-width:150px"><b style="font-size:26px;color:${cor}">${n}</b><br><span style="font-size:13px">${t}</span></div>`;
+ $("rpRes").innerHTML=box("#dc2626","#fef2f2",R.vermelho,"🔴 vão faltar amanhã")+box("#d97706","#fffbeb",R.amarelo,`🟡 comprar para ${RP.dias} dias`)+box("#16a34a","#f0fdf4",R.verde,"🟢 ok")+box("#1d4ed8","#eff6ff",RP.comprar_total,"peças para comprar");
+ const CS={vermelho:["#dc2626","#fef2f2"],amarelo:["#b45309","#fffbeb"],verde:["#15803d","#f0fdf4"]};
+ $("rpTab").innerHTML="<tr><th></th><th>SKU</th><th>Produto</th><th>Cor</th><th>Prat.</th><th title='Média por dia só da entrega rápida'>Sai/dia (rápida)</th><th title='Nos últimos 7 dias'>Últ. 7 dias</th><th>Projeção "+RP.dias+" dias</th><th title='Projeção + margem de segurança'>Precisa ter</th><th title='Na prateleira menos o reservado das etiquetas de hoje'>Disponível</th><th>Dá para</th><th>Comprar</th><th>XBZ tem</th></tr>"+
+  RP.itens.map(i=>{const [c,bg]=CS[i.status];return `<tr style="background:${bg}"><td><b style="color:${c};white-space:nowrap">${i.status==="vermelho"?"🔴":i.status==="amarelo"?"🟡":"🟢"} ${esc(i.status_txt)}</b></td><td><b>${esc(i.sku)}</b></td><td>${esc(i.nome)}</td><td>${esc(i.cor)}</td><td>${esc(i.prateleira||"")}</td><td>${i.por_dia}</td><td>${i.ultimos_7d}</td><td>${i.projecao}</td><td>${i.precisa}</td><td><b style="color:${c}">${i.disponivel??"?"}</b>${i.contado?"":' <span class="mut" title="Ainda não foi contado no estoque">(sem contagem)</span>'}</td><td>${i.da_para} dia(s)</td><td><b style="font-size:16px;color:${c}">${i.comprar||""}</b></td><td>${i.xbz??"—"}</td></tr>`}).join("");
+ $("rpInfo").innerHTML=`Próximos dias: ${(RP.proximos||[]).join(", ")}. Histórico usado: ${RP.historico_dias} dia(s) de entrega rápida (ritmo dos últimos ${RP.janela} dias). Peso do dia da semana: ${Object.entries(RP.pesos||{}).map(([d,v])=>d+" "+v+"x").join(" · ")}${RP.historico_dias<14?" (com menos de 14 dias de histórico o peso fica 1x)":""}.`}
+function copiarRap(){if(!RP||!RP.itens)return;const L=RP.itens.filter(i=>i.comprar>0).map(i=>`${i.sku} ${i.cor} - ${i.comprar}`);
+ const t=L.length?`Compra ENTREGA RÁPIDA (${RP.dias} dias):\n`+L.join("\n"):"Nada para comprar 👍";
+ try{navigator.clipboard.writeText(t);alert("Lista copiada:\n\n"+t)}catch(e){prompt("Copie a lista:",t)}}
 </script></body></html>
