@@ -3160,6 +3160,113 @@ def assinatura():
     return hmac.new(SECRET, ADMIN_PASSWORD.encode(), hashlib.sha256).hexdigest()
 
 
+
+# ================================================================== CRM em operacao.brindesdoboni.com/crm
+# O CRM e outro sistema (outro servico no Railway). Aqui a Central so REPASSA tudo que comeca com /crm para ele
+# e ajusta os enderecos da resposta (/login -> /crm/login), sem guardar nada. O CRM continua com o login dele.
+CRM_URL = os.environ.get("CRM_URL", "https://crm-doboni-production.up.railway.app").rstrip("/")
+CRM_PREFIXO = "/crm"
+_CRM_RX_HTML = re.compile(r'((?:href|src|action|formaction|poster)\s*=\s*["\'])/(?!/|crm/)', re.I)
+_CRM_RX_CSS = re.compile(r'(url\(\s*["\']?)/(?!/|crm/)', re.I)
+_CRM_RX_JS = re.compile(r'((?:fetch|open|assign|replace)\(\s*["\']|location(?:\.href)?\s*=\s*["\'])/(?!/|crm/)')
+_CRM_SALTO = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
+              "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding"}
+
+
+def _crm_caminho(url_ou_caminho):
+    """Endereco que o CRM devolveu (Location) -> o mesmo dentro de /crm."""
+    v = url_ou_caminho or ""
+    if v.startswith(CRM_URL):
+        v = v[len(CRM_URL):] or "/"
+    if v.startswith("/") and not v.startswith("//") and not v.startswith(CRM_PREFIXO + "/") and v != CRM_PREFIXO:
+        return CRM_PREFIXO + v
+    return v
+
+
+def _crm_reescrever(corpo, tipo):
+    t = (tipo or "").lower()
+    if not any(x in t for x in ("html", "css", "javascript")):
+        return corpo
+    try:
+        txt = corpo.decode("utf-8")
+    except Exception:
+        return corpo
+    if "html" in t:
+        txt = _CRM_RX_HTML.sub(lambda m: m.group(1) + CRM_PREFIXO + "/", txt)
+    if "html" in t or "css" in t:
+        txt = _CRM_RX_CSS.sub(lambda m: m.group(1) + CRM_PREFIXO + "/", txt)
+    if "html" in t or "javascript" in t:
+        txt = _CRM_RX_JS.sub(lambda m: m.group(1) + CRM_PREFIXO + "/", txt)
+    return txt.encode("utf-8")
+
+
+def crm_repassar(h, metodo):
+    """h = o pedido que chegou na Central. Responde com o que o CRM devolveu."""
+    import http.client
+    alvo = urlparse(CRM_URL)
+    caminho = h.path[len(CRM_PREFIXO):] or "/"
+    if not caminho.startswith("/"):
+        caminho = "/" + caminho
+    n = int(h.headers.get("Content-Length") or 0)
+    if n > 60 * 1024 * 1024:
+        return h._envia(413, "arquivo grande demais", "text/plain; charset=utf-8")
+    corpo = h.rfile.read(n) if n > 0 else None
+    cab = {}
+    for k, v in h.headers.items():
+        kl = k.lower()
+        if kl in _CRM_SALTO:
+            continue
+        if kl == "cookie":   # o login da Central (cb_admin) nao vai para o CRM
+            v = "; ".join(x for x in v.split(";") if x.strip() and not x.strip().startswith("cb_"))
+            if not v:
+                continue
+        if kl in ("origin", "referer"):
+            v = v.replace(f"https://{h.headers.get('Host', '')}{CRM_PREFIXO}", CRM_URL).replace(
+                f"http://{h.headers.get('Host', '')}{CRM_PREFIXO}", CRM_URL).replace(
+                f"https://{h.headers.get('Host', '')}", CRM_URL).replace(f"http://{h.headers.get('Host', '')}", CRM_URL)
+        cab[k] = v
+    cab["Host"] = alvo.netloc
+    cab["Accept-Encoding"] = "identity"
+    cab["X-Forwarded-Host"] = h.headers.get("Host", "")
+    cab["X-Forwarded-Prefix"] = CRM_PREFIXO
+    ip = (h.headers.get("X-Forwarded-For") or h.client_address[0] or "").strip()
+    if ip:
+        cab["X-Forwarded-For"] = ip   # o CRM ve o IP de quem acessou (bloqueio de senha errada por pessoa, nao por todos)
+    try:
+        Conn = http.client.HTTPSConnection if alvo.scheme == "https" else http.client.HTTPConnection
+        px = urlparse(os.environ.get("HTTPS_PROXY") or "") if alvo.scheme == "https" else None
+        if px and px.hostname:   # so se o servidor estiver atras de proxy (no Railway nao esta)
+            cx = Conn(px.hostname, px.port, timeout=60)
+            cx.set_tunnel(alvo.hostname, alvo.port or 443)
+        else:
+            cx = Conn(alvo.hostname, alvo.port, timeout=60)
+        cx.request(metodo, caminho, body=corpo, headers=cab)
+        r = cx.getresponse()
+        dados = r.read()
+        hdrs = r.getheaders()
+        cx.close()
+    except Exception as e:
+        print("crm:", e, flush=True)
+        return h._envia(502, "<h2>O CRM não respondeu agora. Tente de novo em alguns segundos.</h2>", "text/html; charset=utf-8")
+    tipo = next((v for k, v in hdrs if k.lower() == "content-type"), "")
+    dados = _crm_reescrever(dados, tipo)
+    h.send_response(r.status)
+    for k, v in hdrs:
+        kl = k.lower()
+        if kl in _CRM_SALTO or kl in ("content-encoding",):
+            continue
+        if kl == "location":
+            v = _crm_caminho(v)
+        elif kl == "set-cookie":
+            v = re.sub(r"(?i);\s*domain=[^;]*", "", v)
+            v = re.sub(r"(?i)path=/(?=;|$)", "Path=" + CRM_PREFIXO, v)
+        h.send_header(k, v)
+    h.send_header("Content-Length", str(len(dados)))
+    h.end_headers()
+    if metodo != "HEAD":
+        h.wfile.write(dados)
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "CentralBoni"
 
@@ -3186,10 +3293,6 @@ class H(BaseHTTPRequestHandler):
         with open(caminho, encoding="utf-8") as f:
             self._envia(200, f.read(), "text/html; charset=utf-8")
 
-    def _etq_ok(self):
-        ck = self.headers.get("Cookie", "").replace(" ", "")
-        return self._admin() or (bool(ETQ_SENHA) and f"cb_etq={etq_assinatura()}" in ck)
-
     def _admin(self):
         ck = self.headers.get("Cookie", "")
         return f"cb_admin={assinatura()}" in ck.replace(" ", "")
@@ -3198,7 +3301,22 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+    def _eh_crm(self):
+        p = urlparse(self.path).path
+        return p == CRM_PREFIXO or p.startswith(CRM_PREFIXO + "/")
+
+    def do_PUT(self):
+        return crm_repassar(self, "PUT") if self._eh_crm() else self._envia(404, {"erro": "nao encontrado"})
+
+    def do_DELETE(self):
+        return crm_repassar(self, "DELETE") if self._eh_crm() else self._envia(404, {"erro": "nao encontrado"})
+
+    def do_PATCH(self):
+        return crm_repassar(self, "PATCH") if self._eh_crm() else self._envia(404, {"erro": "nao encontrado"})
+
     def do_GET(self):
+        if self._eh_crm():
+            return crm_repassar(self, "GET")
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         p = u.path
@@ -3206,61 +3324,6 @@ class H(BaseHTTPRequestHandler):
             return self._pagina("bipar.html")
         if p == "/saude":
             return self._envia(200, {"ok": True})
-        if p == "/etiquetas":
-            return self._pagina("etiquetas.html")
-        if p == "/api/fila":
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS, "travados": len(reserva_consultar()["pedidos"])})
-        if p == "/api/chat":
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, {"ok": True, "msgs": chat_lista(), "shopee_auto": _etq_shopee_auto})
-        if p == "/api/maquinas/tempos":
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, maquinas_tempos(int(q.get("dias") or 30)))
-        if p == "/api/fila/proximo":
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "sem acesso"})
-            return self._envia(200, fila_proximo())
-        if p == "/api/etiquetas/upseller/vale":   # codigo de 30 min para a aba do UpSeller mandar a lista Para Imprimir
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, {"ok": True, "vale": etq_vale_novo()})
-        if p in ("/api/etiquetas/dia", "/api/etiquetas/imprimir", "/api/etiquetas/ultimo", "/api/etiquetas/csv_lote", "/api/etiquetas/csv"):
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            if p == "/api/etiquetas/dia":
-                return self._envia(200, etq_lista(q.get("ate") or None))
-            if p == "/api/etiquetas/imprimir":
-                g = q.get("grupo", "")
-                if g not in ETQ_GRUPOS:
-                    return self._envia(400, {"ok": False, "erro": "grupo invalido"})
-                try:
-                    r = etq_pdf(g, q.get("ate") or None, q.get("reimprimir") == "1")
-                except Exception as e:
-                    return self._envia(200, {"ok": False, "erro": str(e)[:300]})
-                if not r.get("ok"):
-                    return self._envia(200, r)
-                return self._envia(200, r["pdf"], "application/pdf",
-                                   extra={"Content-Disposition": f'attachment; filename="etiquetas_{r["lote"]}.pdf"',
-                                          "X-Lote": r["lote"]})
-            if p == "/api/etiquetas/ultimo":
-                return self._envia(200, _etq_ultimo)
-            if p == "/api/etiquetas/csv_lote":
-                with conn() as c:
-                    row = c.execute("SELECT valor FROM meta WHERE chave=?", ("etq_csv_" + q.get("lote", ""),)).fetchone()
-                if not row:
-                    return self._envia(404, {"erro": "lote nao encontrado"})
-                return self._envia(200, row[0], "text/csv; charset=utf-8",
-                                   extra={"Content-Disposition": f'attachment; filename="lightburn_nomes_{q.get("lote")}.csv"'})
-            if p == "/api/etiquetas/csv":
-                env = [x for x in (q.get("envios") or "").split(",") if x]
-                csv_txt = etq_csv(q.get("ate") or None, env or None, q.get("todos") != "1")
-                nome = "lightburn_nomes_" + datetime.now(BR).strftime("%Y-%m-%d_%Hh%M") + ".csv"
-                return self._envia(200, csv_txt, "text/csv; charset=utf-8",
-                                   extra={"Content-Disposition": f'attachment; filename="{nome}"'})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
         if p == "/shopee/retorno" or p.startswith("/shopee/retorno/"):
@@ -3439,11 +3502,6 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, fotos_aplicar(aplicar=False))
             except Exception as e:
                 return self._envia(200, {"ok": False, "erro": str(e)[:200]})
-        if p == "/api/shopee/etiqueta/teste":
-            try:
-                return self._envia(200, shopee_etiqueta_teste(q.get("shop_id", "0"), q.get("order_sn", "")))
-            except Exception as e:
-                return self._envia(200, {"ok": False, "erro": str(e)[:300]})
         if p == "/api/shopee/testar":
             try:
                 return self._envia(200, shopee_testar(q.get("shop_id", "0")))
@@ -3534,6 +3592,8 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
         self._envia(404, {"erro": "nao encontrado"})
 
     def do_POST(self):
+        if self._eh_crm():
+            return crm_repassar(self, "POST")
         p = urlparse(self.path).path
         if p == "/api/devolucoes/midia":   # foto/video do celular (binario, nao JSON)
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
@@ -3548,69 +3608,6 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
             d = self._json()
         except Exception:
             return self._envia(400, {"erro": "json invalido"})
-        if p == "/etiquetas/login":
-            if ETQ_SENHA and hmac.compare_digest(str(d.get("senha", "")), ETQ_SENHA):
-                return self._envia(200, {"ok": True}, extra={
-                    "Set-Cookie": f"cb_etq={etq_assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
-            if hmac.compare_digest(str(d.get("senha", "")), ADMIN_PASSWORD):
-                return self._envia(200, {"ok": True}, extra={
-                    "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
-            return self._envia(403, {"erro": "senha incorreta"})
-        if p == "/api/chat/enviar":
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            return self._envia(200, chat_enviar(d.get("texto"), d.get("por")))
-        if p == "/api/chat/responder":
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "sem acesso"})
-            return self._envia(200, chat_responder(d.get("fila_id"), d.get("texto")))
-        if p in ("/api/fila/pedir", "/api/fila/continuar", "/api/fila/cancelar"):
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            if p == "/api/fila/pedir":
-                return self._envia(200, fila_pedir(str(d.get("grupo") or ""), d.get("por")))
-            if p == "/api/fila/continuar":
-                return self._envia(200, fila_mudar(d.get("id"), "NA_FILA", "Logado — voltou para a fila (até 15 min)",
-                                                   so_de=("PRECISA_LOGIN", "ERRO")))
-            return self._envia(200, fila_mudar(d.get("id"), "CANCELADO", "Cancelado por " + str(d.get("por") or "equipe")[:40],
-                                               so_de=("NA_FILA", "PRECISA_LOGIN", "ERRO")))
-        if p in ("/api/reserva", "/api/reserva/marcar", "/api/reserva/consultar"):
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "sem acesso"})
-            if p == "/api/reserva":
-                return self._envia(200, reserva_pedir(d.get("pedidos"), d.get("lote") or "", d.get("por") or ""))
-            if p == "/api/reserva/marcar":
-                st = str(d.get("status") or "").upper()
-                if st not in ("IMPRESSO", "LIBERAR"):
-                    return self._envia(400, {"erro": "status deve ser IMPRESSO ou LIBERAR"})
-                return self._envia(200, reserva_marcar(d.get("pedidos"), st, d.get("arquivo") or ""))
-            return self._envia(200, reserva_consultar(d.get("pedidos")))
-        if p == "/api/fila/dividir":
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "sem acesso"})
-            return self._envia(200, maquinas_dividir(d.get("pedidos"), d.get("maquinas") or 3))
-        if p == "/api/fila/status":
-            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
-                return self._envia(403, {"erro": "sem acesso"})
-            return self._envia(200, fila_mudar(d.get("id"), str(d.get("status") or ""), d.get("msg") or "", d.get("resultado")))
-        if p == "/api/etiquetas/upseller":   # lista "Para Imprimir" do UpSeller (mandada pela automacao do PC)
-            cors = {"Access-Control-Allow-Origin": "*"}   # a aba do UpSeller manda direto (text/plain + vale)
-            if not (self._etq_ok() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)
-                    or etq_vale_ok(str(d.get("vale") or ""))):
-                return self._envia(401, {"erro": "login necessario"}, extra=cors)
-            return self._envia(200, etq_upseller_salvar(d), extra=cors)
-        if p in ("/api/etiquetas/salvar", "/api/etiquetas/enviar", "/api/etiquetas/sincronizar"):
-            if not self._etq_ok():
-                return self._envia(401, {"erro": "login necessario"})
-            if p == "/api/etiquetas/salvar":
-                return self._envia(200, etq_salvar(d, str(d.get("por") or "")))
-            if p == "/api/etiquetas/enviar":
-                return self._envia(200, etq_enviar(d))
-            if p == "/api/etiquetas/sincronizar":
-                try:
-                    return self._envia(200, {"ok": True, "lojas": shopee_sincronizar_todas()})
-                except Exception as e:
-                    return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/login":
             if hmac.compare_digest(str(d.get("senha", "")), ADMIN_PASSWORD):
                 return self._envia(200, {"ok": True}, extra={
@@ -7079,29 +7076,6 @@ def shopee_sincronizar(shop_id, dias_iniciais=3):
     return {"ok": True, "loja": loja.get("nome"), "pedidos": len(det), **est}
 
 
-
-# ---------------- teste SO DE LEITURA da API de Logistica (nao gera, nao altera nada na Shopee)
-def shopee_etiqueta_teste(shop_id, order_sn):
-    if str(shop_id) in ("", "0") and order_sn:
-        with conn() as c:
-            r = c.execute("SELECT shop_id FROM shopee_pedidos WHERE order_sn=?", (order_sn,)).fetchone()
-        shop_id = r[0] if r else 0
-    loja = _shopee_token_ok(shop_id)
-    if not loja:
-        return {"ok": False, "erro": "loja nao autorizada ou pedido nao encontrado"}
-    out = {"ok": True, "loja": loja.get("nome"), "order_sn": order_sn}
-    for nome, metodo, path, params, corpo in [
-        ("rastreio", "GET", "/api/v2/logistics/get_tracking_number", {"order_sn": order_sn}, None),
-        ("parametro_documento", "POST", "/api/v2/logistics/get_shipping_document_parameter", None,
-         {"order_list": [{"order_sn": order_sn}]}),
-        ("status_documento", "POST", "/api/v2/logistics/get_shipping_document_result", None,
-         {"order_list": [{"order_sn": order_sn}]})]:
-        try:
-            out[nome] = _shopee_http(metodo, path, loja=loja, params=params, corpo=corpo).get("response")
-        except Exception as e:
-            out[nome + "_erro"] = str(e)[:200]
-    return out
-
 def shopee_sincronizar_todas():
     with conn() as c:
         ids = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas")]
@@ -7520,800 +7494,8 @@ def shopee_lojas():
     return {"configurado": bool(pid), "lojas": rows, "status": _shopee_status, "retorno": SHOPEE_RETORNO}
 
 
-
-# ================================================================== ETIQUETAS (tela de nomes para gravacao)
-# Le os pedidos que a Central ja sincroniza da Shopee (API oficial, so leitura), sugere nome/fonte a partir da
-# mensagem do comprador e deixa o colaborador conferir/corrigir. Gera o CSV do LightBurn e manda o lote para a
-# producao (mesma rota /api/lotes). Nada e alterado na Shopee.
-ETQ_SENHA = os.environ.get("ETIQUETAS_SENHA", "")  # senha so da tela de etiquetas (colaborador); vazio = so admin
-ETQ_FONTES = ["Alice", "Glacial Indifference", "Chewy", "Great Vibes", "Gilker", "Waltograph", "Avengeance", "Julli"]
-_ETQ_ALIAS = {"alice": 0, "glacial": 1, "chewy": 2, "great": 3, "grat": 3, "vibes": 3, "gilker": 4, "walt": 5,
-              "disney": 5, "aveng": 6, "avang": 6, "julli": 7, "juli ": 7}
-ETQ_TIPOS = {"G": "Gravar", "A": "Conferir", "C": "Buscar nome no chat", "E": "Especial", "N": "Sem personalização"}
-ETQ_ORDEM_ENVIO = ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"]
-
-
-def etq_assinatura():
-    return hmac.new(SECRET, ("etq:" + ETQ_SENHA).encode(), hashlib.sha256).hexdigest()
-
-
-def etq_iniciar():
-    with conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS etq_pedidos(order_sn TEXT PRIMARY KEY, tipo TEXT, nomes TEXT, fonte TEXT,
-                     obs TEXT, por TEXT, atualizado TEXT, lote TEXT DEFAULT '', enviado_em TEXT DEFAULT '')""")
-
-
-def _etq_pers(sku, var):
-    s = f"{sku} {var}".upper()
-    if re.search(r"SEM PERSONALIZ", s):
-        return False
-    return bool(re.search(r"PERSONALIZ|PZD|NOME|LOGO|7447|DESENHO", s))
-
-
-def _etq_envio(carrier):
-    c = (carrier or "").upper()
-    if "RÁPIDA" in c or "RAPIDA" in c or "TURBO" in c:
-        return "ENTREGA RÁPIDA"
-    if "RETIRADA" in c:
-        return "RETIRADA"
-    return "SHOPEE"
-
-
-def _etq_fonte(txt):
-    t = (txt or "").lower()
-    m = re.search(r"(?:fonte|letra|font)\s*[:\-]?\s*(?:n[ºo°]?\s*)?\(?([1-8])\)?(?!\d)", t)
-    if m:
-        return ETQ_FONTES[int(m.group(1)) - 1]
-    for k, i in _ETQ_ALIAS.items():
-        if k in t:
-            return ETQ_FONTES[i]
-    return ""
-
-
-def etq_sugerir(msg, qtd_pers):
-    """Sugestao de nomes a partir da mensagem do comprador. Sempre conferida por uma pessoa."""
-    if not msg or not qtd_pers:
-        return [], ""
-    fonte = _etq_fonte(msg)
-    aspas = re.findall(r"[\"“”']([^\"“”']{2,30})[\"“”']", msg)
-    if aspas:
-        return [a.strip() for a in aspas][:qtd_pers], fonte
-    txt = re.sub(r"observa[cç][aã]o( do)? pedido\s*:?", " ", msg, flags=re.I)
-    txt = re.sub(r"\b(?:fonte|letra|font)\b\s*[:\-]?\s*(?:n[ºo°]?\s*)?\(?[1-8]?\)?\s*[-–]?\s*[A-Za-zÀ-ú]*(?:\s+(?:vibes|indifference|signature|\(estilo disney\)))?",
-                 "\n", txt, flags=re.I)
-    partes = re.split(r"\n|;|\bnomes?\b(?:\s+(?:para personalizar|da caneca \d+|pra colocar|é))?\s*[:\-]?", txt, flags=re.I)
-    nomes = []
-    for p in partes:
-        p = re.sub(r"\b(somente|colocar|por favor|o nome|é|a outra com|com o|com|escrito|em uma garrafa)\b", " ", p, flags=re.I)
-        p = re.sub(r"[\"“”]|\s+", " ", p).strip(" .,:-–")
-        if not p or len(p) > 40 or re.search(r"\d{4,}|https?:|obrigad|poss[ií]vel|chegar|presente|ol[aá]\b|personaliza", p, re.I):
-            continue
-        for x in re.split(r"\s+e\s+|,|/|\s-\s|\ba outra\b", p):
-            x = re.sub(r"^(de|da|do|\d+)\s+", "", x.strip(" .,:-"), flags=re.I).strip()
-            if x.lower() in [f.lower() for f in ETQ_FONTES] or re.fullmatch(r"\d+", x):
-                continue
-            if 1 < len(x) <= 30 and len(nomes) < qtd_pers:
-                nomes.append(x)
-    return nomes, fonte
-
-
-# 09/10/2026 (Lucas/Jo): a tela mostra EXATAMENTE o que esta "Para Imprimir" no UpSeller (Shopee + TikTok).
-# A automacao do PC manda a lista completa para /api/etiquetas/upseller a cada ~15 min (e quando pedem).
-ETQ_UPS_MIN = int(os.environ.get("ETQ_UPSELLER_MIN", "90"))   # lista mais velha que isso = desatualizada
-
-
-_etq_vales = {}
-
-
-def etq_vale_novo():
-    import time
-    now = time.time()
-    for k in [k for k, v in _etq_vales.items() if v < now]:
-        _etq_vales.pop(k, None)
-    v = secrets.token_urlsafe(12)
-    _etq_vales[v] = now + 1800
-    return v
-
-
-def etq_vale_ok(v):
-    import time
-    return bool(v) and _etq_vales.get(v, 0) > time.time()
-
-
-def etq_upseller_salvar(d):
-    L = d.get("pedidos")
-    if not isinstance(L, list) or not d.get("completo"):
-        return {"ok": False, "erro": "mande a lista completa do Para Imprimir (pedidos + completo=true)"}
-    out = []
-    for o in L:
-        if not isinstance(o, dict) or not norm(str(o.get("id") or "")):
-            continue
-        try:
-            prazo = int(o.get("prazo") or 0)
-        except (TypeError, ValueError):
-            prazo = 0
-        out.append({"id": norm(str(o["id"])), "n": str(o.get("n") or "")[:30], "p": str(o.get("p") or "")[:20].lower(),
-                    "l": str(o.get("l") or "")[:60], "prov": str(o.get("prov") or "")[:60], "prazo": prazo,
-                    "msg": str(o.get("msg") or "")[:500],
-                    "i": [[str(x) if x is not None else "" for x in (list(it) + [""] * 4)[:4]] for it in (o.get("i") or [])][:40]})
-    with _lock, conn() as c:
-        c.execute("INSERT OR REPLACE INTO meta(chave, valor) VALUES('etq_upseller', ?)",
-                  (json.dumps({"em": agora(), "pedidos": out}, ensure_ascii=False),))
-    return {"ok": True, "pedidos": len(out)}
-
-
-def _etq_upseller():
-    """(lista, quando, fresca) da ultima lista Para Imprimir do UpSeller."""
-    with conn() as c:
-        r = c.execute("SELECT valor FROM meta WHERE chave='etq_upseller'").fetchone()
-    if not r or not r[0]:
-        return [], None, False
-    d = json.loads(r[0])
-    em = datetime.fromisoformat(d["em"])
-    return d.get("pedidos") or [], em, (datetime.now(timezone.utc) - em).total_seconds() < ETQ_UPS_MIN * 60
-
-
-def _etq_envio_ups(o, carrier=""):
-    if "tiktok" in (o.get("p") or ""):
-        return "TIKTOK"
-    return _etq_envio(o.get("prov") or carrier)
-
-
-def etq_lista(ate=None, incluir_impressos=False):
-    """Pedidos a enviar com prazo ate o fim do dia `ate` (YYYY-MM-DD, padrao hoje).
-    09/10/2026 (Lucas/Jo): a tela mostra SO o que ainda nao foi impresso (o que esta "Para Imprimir").
-    Ja impresso = impresso por esta tela, OU a etiqueta ja entrou na Central (PDF/e-mail/lote/Zebra),
-    OU o espelho do UpSeller (recente) diz que ja esta em Para Retirada. Esses pedidos nao aparecem."""
-    dia = datetime.strptime(ate, "%Y-%m-%d").replace(tzinfo=BR) if ate else datetime.now(BR)
-    fim = int(dia.replace(hour=23, minute=59, second=59).timestamp())
-    snap, snap_em, fresca = _etq_upseller()
-    snap = {o["id"]: o for o in snap if 0 < (o.get("prazo") or 0) <= fim} if fresca else {}
-    with conn() as c:
-        if fresca:   # fonte = UpSeller "Para Imprimir"; dados extras (mensagem, itens) da Shopee quando houver
-            sp = {}
-            if snap:
-                sp = {r["order_sn"]: dict(r) for r in c.execute(
-                    f"SELECT * FROM shopee_pedidos WHERE order_sn IN ({','.join('?' * len(snap))})", list(snap))}
-            peds = []
-            for sn, o in snap.items():
-                p = sp.get(sn) or {"order_sn": sn, "loja": o["l"], "status": "", "envio": o["prov"], "msg": o["msg"],
-                                   "itens": json.dumps([{"sku": x[1] or x[0], "var": x[2], "qtd": int(x[3]) if str(x[3]).isdigit() else 1}
-                                                        for x in o["i"]], ensure_ascii=False)}
-                p = dict(p, prazo=o["prazo"], _envio=_etq_envio_ups(o, p.get("envio")), _ups=True)
-                if not p.get("msg") and o["msg"]:
-                    p["msg"] = o["msg"]
-                peds.append(p)
-            peds.sort(key=lambda p: p["prazo"])
-        else:
-            peds = [dict(r) for r in c.execute("""SELECT * FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP')
-                     AND prazo>0 AND prazo<=? ORDER BY prazo""", (fim,))]
-        salvos = {r["order_sn"]: dict(r) for r in c.execute("SELECT * FROM etq_pedidos")}
-        cent = {}
-        if peds:
-            # itens criados so pelo espelho do UpSeller (lote "UPSELLER ...") nao sao etiqueta impressa
-            for r in c.execute(f"""SELECT k.codigo, i.nomes, i.fonte, i.tipo, i.impresso FROM codigos k JOIN itens i ON i.id=k.item_id
-                                   WHERE k.codigo IN ({",".join("?" * len(peds))})
-                                   AND COALESCE(i.lote,'') NOT LIKE 'UPSELLER%' AND COALESCE(i.lote,'')<>'DEVOLUCAO'""",
-                                [p["order_sn"] for p in peds]):
-                cent.setdefault(r[0], dict(r))
-        ups = {}
-        try:
-            rr = c.execute("SELECT valor FROM meta WHERE chave='upseller_resumo'").fetchone()
-            if peds and rr and rr[0] and (datetime.now(timezone.utc) - datetime.fromisoformat(json.loads(rr[0])["em"])).total_seconds() < UPSELLER_FRESCO_H * 3600:
-                ups = {r[0]: r[1] for r in c.execute(f"""SELECT codigo, estado FROM upseller_pedidos
-                       WHERE codigo IN ({",".join("?" * len(peds))})""", [p["order_sn"] for p in peds])}
-        except Exception:
-            ups = {}
-    out = []
-    for p in peds:
-        itens = json.loads(p["itens"] or "[]")
-        unid = []
-        for i in itens:
-            unid += [{"sku": i.get("sku", ""), "var": i.get("var", ""), "pers": _etq_pers(i.get("sku"), i.get("var"))}] * int(i.get("qtd") or 1)
-        npers = sum(u["pers"] for u in unid)
-        s = salvos.get(p["order_sn"])
-        ce = cent.get(p["order_sn"])
-        if p.get("_ups"):   # esta no Para Imprimir do UpSeller: so some se ja foi impresso por esta tela
-            ja_impresso = bool(s and s.get("impresso_em"))
-        else:
-            ja_impresso = bool(s and s.get("impresso_em")) or bool(ce) or ups.get(p["order_sn"]) in ("to_pickup", "pickup_exception")
-        if ja_impresso and not incluir_impressos:
-            continue
-        if s and s["tipo"]:
-            tipo, nomes, fonte, obs, origem = s["tipo"], json.loads(s["nomes"] or "[]"), s["fonte"], s["obs"], "conferido"
-        elif ce and (ce.get("nomes") or ce.get("tipo")):
-            nomes = [x.strip() for x in (ce.get("nomes") or "").split("|") if x.strip()]
-            tipo, fonte, obs, origem = ce.get("tipo") or ("G" if nomes else "C"), ce.get("fonte") or "", "", "central"
-        else:
-            nomes, fonte = etq_sugerir(p["msg"], npers)
-            tipo = "N" if not npers else ("A" if nomes and len(nomes) == npers else "C")
-            obs, origem = "", "sugestao"
-        out.append({"order_sn": p["order_sn"], "loja": p["loja"], "envio": p.get("_envio") or _etq_envio(p["envio"]), "carrier": p["envio"],
-                    "prazo": datetime.fromtimestamp(p["prazo"], BR).strftime("%d/%m %H:%M"), "msg": p["msg"],
-                    "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
-                    "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
-                    "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
-                    "na_central": ja_impresso,   # so aparece True quando incluir_impressos (reimpressao autorizada)
-                    "status": SHOPEE_STATUS_PT.get(p["status"], p["status"]) if p["status"] else "Para imprimir (UpSeller)"})
-    out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
-                            x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
-    em_txt = snap_em.astimezone(BR).strftime("%d/%m %H:%M") if snap_em else ""
-    return {"ok": True, "dia": dia.strftime("%d/%m/%Y"), "pedidos": out, "fontes": ETQ_FONTES, "tipos": ETQ_TIPOS,
-            "sync": _shopee_sync, "fonte_lista": "upseller" if fresca else "shopee", "upseller_em": em_txt,
-            "aviso": "" if fresca else ("Lista do UpSeller desatualizada" + (f" (última {em_txt})" if em_txt else "")
-                                        + ": pode aparecer pedido já impresso. Peça para atualizar.")}
-
-
-def etq_salvar(d, por=""):
-    sn = norm(d.get("order_sn"))
-    tipo = (d.get("tipo") or "").upper()
-    if not sn or tipo not in ETQ_TIPOS:
-        return {"ok": False, "erro": "pedido ou tipo invalido"}
-    nomes = [str(x).strip()[:40] for x in (d.get("nomes") or []) if str(x).strip()]
-    if tipo == "G" and not nomes:
-        return {"ok": False, "erro": "para GRAVAR informe o(s) nome(s)"}
-    with _lock, conn() as c:
-        c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado) VALUES(?,?,?,?,?,?,?)
-                     ON CONFLICT(order_sn) DO UPDATE SET tipo=excluded.tipo, nomes=excluded.nomes, fonte=excluded.fonte,
-                     obs=excluded.obs, por=excluded.por, atualizado=excluded.atualizado""",
-                  (sn, tipo, json.dumps(nomes, ensure_ascii=False), (d.get("fonte") or "")[:40], (d.get("obs") or "")[:200],
-                   por[:40], agora()))
-    return {"ok": True}
-
-
-def _etq_selecionados(ate, envios, so_novos):
-    L = etq_lista(ate)["pedidos"]
-    return [p for p in L if (not envios or p["envio"] in envios) and p["envio"] != "RETIRADA"
-            and (not so_novos or not p["enviado_em"])]
-
-
-def etq_csv(ate=None, envios=None, so_novos=True):
-    """CSV do LightBurn: uma linha por nome a gravar (so pedidos GRAVAR), na ordem da tela."""
-    linhas = []
-    for p in _etq_selecionados(ate, envios, so_novos):
-        if p["tipo"] == "G":
-            linhas += [n.replace(",", " ") for n in p["nomes"]]
-    return "\r\n" + "".join(f"{n},\r\n" for n in linhas)
-
-
-def etq_para_producao(sel, lote):
-    """Manda os pedidos para a producao (itens da Central), igual ao /api/lotes."""
-    LJ = {"bexlu": "BEXLU", "brindesbexlu": "BRINDESBEXLU", "jlimportsjl": "JL IMPORTS", "jlimports": "JL IMPORTS"}
-    itens = []
-    for p in sel:
-        pec = {}
-        for u in p["unidades"]:
-            k = (u["sku"].split("-")[0].strip(), u["var"].split(",")[0].strip())
-            pec[k] = pec.get(k, 0) + 1
-        first = p["unidades"][0] if p["unidades"] else {"sku": "", "var": ""}
-        itens.append({"pedido": p["order_sn"], "codigos": [p["order_sn"]], "canal": "SHOPEE",
-                      "envio": "ENTREGA DIRETA" if p["envio"] == "ENTREGA RÁPIDA" else "",
-                      "loja": LJ.get(norm(p["loja"]).lower(), p["loja"].upper()), "sku": first["sku"].split("-")[0].strip(),
-                      "cor": " + ".join(dict.fromkeys(k[1] for k in pec)), "nomes": p["nomes"] if p["tipo"] in ("G", "A") else [],
-                      "fonte": p["fonte"], "tipo": p["tipo"], "personalizado": p["tipo"] != "N", "obs": p["obs"],
-                      "pecas": [{"sku": k[0], "cor": k[1], "qtd": q} for k, q in pec.items()], "seq": 1})
-    r = importar_lote({"lote": lote, "itens": itens})
-    with _lock, conn() as c:
-        for p in sel:
-            c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado, lote, enviado_em)
-                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET lote=excluded.lote,
-                         enviado_em=excluded.enviado_em""",
-                      (p["order_sn"], p["tipo"], json.dumps(p["nomes"], ensure_ascii=False), p["fonte"], p["obs"], "",
-                       agora(), lote, agora()))
-    return r
-
-
-def etq_enviar(d):
-    """Fecha o lote: manda para a producao e marca os pedidos como enviados neste lote."""
-    sel = _etq_selecionados(d.get("ate") or None, d.get("envios") or None, True)
-    if not sel:
-        return {"ok": False, "erro": "nenhum pedido novo para enviar"}
-    lote = "ETQ " + datetime.now(BR).strftime("%d/%m %Hh%M")
-    r = etq_para_producao(sel, lote)
-    return {"ok": True, "lote": lote, "pedidos": len(sel), **{k: r.get(k) for k in ("novos", "atualizados")}}
-
-
-# ================================================================== ETIQUETAS: PDF pronto para imprimir (Shopee, API oficial)
-# Autorizado pelo Lucas (08/10/2026): a Central pede a etiqueta OFICIAL da Shopee (mesmo documento que o UpSeller imprime)
-# e monta o PDF com o painel de gravacao, na mesma ordem dos lotes (Entrega Rapida > TikTok > Shopee).
-# Nao muda status do pedido, nao envia nada ao comprador. TikTok entra quando a API do TikTok for liberada.
-ETQ_GRUPOS = {
-    "tudo_hoje": ("Tudo do dia", ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"], True),
-    "er_hoje": ("Entrega Rápida do dia", ["ENTREGA RÁPIDA"], True),
-    "tt_hoje": ("TikTok do dia", ["TIKTOK"], True),
-    "sp_hoje": ("Shopee do dia", ["SHOPEE"], True),
-    "tudo": ("Tudo (inclui próximos dias)", ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"], False),
-}
-_ETQ_CANAL = {"ENTREGA RÁPIDA": "ER", "TIKTOK": "TT", "SHOPEE": "SP"}
-
-
-_etq_ultimo = {}
-
-
-def etq_iniciar_pdf():
-    with conn() as c:
-        cols = [r[1] for r in c.execute("PRAGMA table_info(etq_pedidos)")]
-        if "impresso_em" not in cols:
-            c.execute("ALTER TABLE etq_pedidos ADD COLUMN impresso_em TEXT DEFAULT ''")
-            c.execute("ALTER TABLE etq_pedidos ADD COLUMN impresso_lote TEXT DEFAULT ''")
-
-
-def _shopee_doc_bytes(path, corpo, loja):
-    import urllib.request, urllib.parse, time
-    pid, key = _shopee_cred()
-    ts = int(time.time())
-    q = {"partner_id": pid, "timestamp": ts, "access_token": loja["access_token"], "shop_id": loja["shop_id"],
-         "sign": _shopee_assina(key, pid, path, ts, loja["access_token"], loja["shop_id"])}
-    req = urllib.request.Request(SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q), data=json.dumps(corpo).encode(),
-                                 method="POST", headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        b = r.read()
-    if not b.startswith(b"%PDF"):
-        try:
-            res = json.loads(b or b"{}")
-        except ValueError:
-            res = {}
-        raise RuntimeError(f"{res.get('error', 'sem PDF')}: {res.get('message', '')}"[:200])
-    return b
-
-
-def shopee_etiquetas_oficiais(order_sns):
-    """{order_sn: bytes do PDF} para os pedidos pedidos. Gera o documento na Shopee quando ainda nao existe.
-    Devolve tambem {order_sn: erro} para os que nao deram."""
-    import time
-    with conn() as c:
-        lojas = {r[0]: r[1] for r in c.execute(
-            f"SELECT order_sn, shop_id FROM shopee_pedidos WHERE order_sn IN ({','.join('?' * len(order_sns))})", order_sns)}
-    por_loja, ok, erros = {}, {}, {}
-    for sn in order_sns:
-        por_loja.setdefault(lojas.get(sn), []).append(sn)
-    for shop_id, sns in por_loja.items():
-        loja = _shopee_token_ok(shop_id) if shop_id else None
-        if not loja:
-            for sn in sns:
-                erros[sn] = "loja nao autorizada"
-            continue
-        for k in range(0, len(sns), 50):
-            lote = sns[k:k + 50]
-            tipos = {}
-            try:
-                r = _shopee_http("POST", "/api/v2/logistics/get_shipping_document_parameter", loja=loja,
-                                 corpo={"order_list": [{"order_sn": sn} for sn in lote]})
-                for x in (r.get("response") or {}).get("result_list") or []:
-                    tipos[x.get("order_sn")] = x.get("suggest_shipping_document_type") or "THERMAL_AIR_WAYBILL"
-            except Exception as e:
-                for sn in lote:
-                    erros[sn] = str(e)[:160]
-                continue
-            def status():
-                r = _shopee_http("POST", "/api/v2/logistics/get_shipping_document_result", loja=loja,
-                                 corpo={"order_list": [{"order_sn": sn, "shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL")}
-                                                       for sn in lote]})
-                return {x.get("order_sn"): x for x in (r.get("response") or {}).get("result_list") or []}
-            st = status()
-            criar = [sn for sn in lote if (st.get(sn) or {}).get("status") != "READY"]
-            if criar:
-                lst = []
-                for sn in criar:
-                    try:
-                        trk = (_shopee_http("GET", "/api/v2/logistics/get_tracking_number", loja=loja,
-                                            params={"order_sn": sn}).get("response") or {}).get("tracking_number", "")
-                    except Exception:
-                        trk = ""
-                    lst.append({"order_sn": sn, "tracking_number": trk,
-                                "shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL")})
-                try:
-                    _shopee_http("POST", "/api/v2/logistics/create_shipping_document", loja=loja, corpo={"order_list": lst})
-                except Exception as e:
-                    for sn in criar:
-                        erros[sn] = str(e)[:160]
-                for _ in range(15):
-                    time.sleep(2)
-                    st = status()
-                    if all((st.get(sn) or {}).get("status") in ("READY", "FAILED") for sn in criar):
-                        break
-            for sn in lote:
-                s = (st.get(sn) or {})
-                if s.get("status") != "READY":
-                    erros.setdefault(sn, f"etiqueta nao liberada pela Shopee ({s.get('status') or s.get('fail_message') or '?'})")
-                    continue
-                try:
-                    ok[sn] = _shopee_doc_bytes("/api/v2/logistics/download_shipping_document",
-                                               {"shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL"),
-                                                "order_list": [{"order_sn": sn}]}, loja)
-                    erros.pop(sn, None)
-                except Exception as e:
-                    erros[sn] = str(e)[:160]
-    return ok, erros
-
-
-def etq_pdf(grupo, ate=None, reimprimir=False):
-    """Monta o PDF do grupo (ordem dos lotes) e o CSV do LightBurn. Marca os pedidos como impressos."""
-    import io, sys, tempfile
-    from pypdf import PdfReader, PdfWriter
-    sys.path.insert(0, AQUI)
-    import etq_montar
-    nome_g, envios, so_dia = ETQ_GRUPOS[grupo]
-    if not so_dia:
-        ate = (datetime.now(BR) + timedelta(days=30)).strftime("%Y-%m-%d")
-    L = etq_lista(ate, incluir_impressos=reimprimir)["pedidos"]
-    with conn() as c:
-        ja = {r[0] for r in c.execute("SELECT order_sn FROM etq_pedidos WHERE impresso_em<>''")}
-    sel = [p for p in L if p["envio"] in envios and (reimprimir or (p["order_sn"] not in ja and not p.get("na_central")))]
-    avisos = []
-    if "TIKTOK" in envios:
-        avisos.append("TikTok ainda não está ligado na Central (aguardando liberação da API do TikTok)")
-    if not sel:
-        return {"ok": False, "erro": "nada novo para imprimir neste grupo", "avisos": avisos}
-    pdfs, erros = shopee_etiquetas_oficiais([p["order_sn"] for p in sel])
-    if not pdfs:
-        return {"ok": False, "erro": "a Shopee não liberou nenhuma etiqueta", "falhas": erros, "avisos": avisos}
-    w, page_of, P = PdfWriter(), {}, []
-    for p in sel:
-        if p["order_sn"] not in pdfs:
-            continue
-        r = PdfReader(io.BytesIO(pdfs[p["order_sn"]]))
-        ini = len(w.pages)
-        for pg in r.pages:
-            w.add_page(pg)
-        page_of[p["order_sn"]] = list(range(ini, len(w.pages)))
-        tipo = p["tipo"] if p["tipo"] in ETQ_TIPOS else "C"
-        if tipo == "A" and p["origem"] == "sugestao":
-            obs = "nome sugerido pela mensagem - CONFERIR"
-        else:
-            obs = p["obs"] or ("nome não veio na nota - BUSCAR NO CHAT" if tipo == "C" else "")
-        nomes = list(p["nomes"])
-        its, k = [], 0
-        for u in p["unidades"]:
-            sku = u["sku"].split("-")[0].strip()
-            cor = (u["var"] or "").split(",")[0].strip()
-            if u["pers"] and tipo in ("G", "A"):
-                its.append((sku, cor, nomes[k] if k < len(nomes) else "")); k += 1
-            else:
-                its.append((sku, cor, ""))
-        if tipo == "G" and k != len([u for u in p["unidades"] if u["pers"]]):
-            tipo = "A"; obs = obs or "quantidade de nomes diferente das peças - CONFERIR"
-        if not any(u["pers"] for u in p["unidades"]):
-            tipo = "N"
-        P.append((p["order_sn"], _ETQ_CANAL.get(p["envio"], "SP"), tipo, its or [("", "", "")], p["fonte"], obs))
-    with conn() as c:
-        prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
-    agora_br = datetime.now(BR)
-    lote = agora_br.strftime("%Y-%m-%d_%Hh%M") + "_" + grupo
-    with tempfile.TemporaryDirectory() as td:
-        src, out, csvp = f"{td}/src.pdf", f"{td}/out.pdf", f"{td}/nomes.csv"
-        with open(src, "wb") as f:
-            w.write(f)
-        info = etq_montar.main(src, P, out, csvp, lote, page_of=page_of, ids={}, prateleiras=prat or None)
-        pdf_b = open(out, "rb").read()
-        csv_b = open(csvp, "rb").read()
-    with _lock, conn() as c:
-        for sn in page_of:
-            c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado, impresso_em, impresso_lote)
-                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET impresso_em=excluded.impresso_em,
-                         impresso_lote=excluded.impresso_lote""",
-                      (sn, "", "[]", "", "", "", agora(), agora(), lote))
-        c.execute("INSERT INTO meta(chave, valor) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
-                  ("etq_csv_" + lote, csv_b.decode("utf-8")))
-    try:
-        etq_para_producao([p for p in sel if p["order_sn"] in page_of], "ETQ " + agora_br.strftime("%d/%m %Hh%M"))
-    except Exception as e:
-        avisos.append("não consegui lançar na produção: " + str(e)[:120])
-    _etq_ultimo.update(lote=lote, falhas=erros, avisos=avisos, pedidos=len(page_of))
-    return {"ok": True, "lote": lote, "pdf": pdf_b, "pedidos": len(page_of), "paginas": info["paginas"],
-            "falhas": erros, "avisos": avisos}
-
-
-# ================================================================== FILA DO APP (botao no app -> Claude faz o lote)
-# O colaborador clica no botao; o pedido entra na fila. O Claude (tarefa agendada) pega o pedido, le os chats,
-# gera as etiquetas, imprime e devolve o andamento aqui (ou "precisa logar na loja X").
-FILA_GRUPOS = {"er_hoje": "Entrega Rápida do dia", "tt_hoje": "TikTok do dia", "sp_hoje": "Shopee do dia",
-               "tudo_hoje": "Tudo do dia (Entrega Rápida → TikTok → Shopee)", "tudo": "Tudo, inclusive próximos dias"}
-FILA_ABERTOS = ("NA_FILA", "TRABALHANDO", "PRECISA_LOGIN")
-
-
-def fila_iniciar():
-    with conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS app_fila(id INTEGER PRIMARY KEY AUTOINCREMENT, grupo TEXT, por TEXT,
-                     criado TEXT, status TEXT, msg TEXT DEFAULT '', atualizado TEXT, resultado TEXT DEFAULT '')""")
-        try:   # 09/10 (Lucas): pedido escrito no chat do app (grupo "livre")
-            c.execute("ALTER TABLE app_fila ADD COLUMN texto TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-        c.execute("""CREATE TABLE IF NOT EXISTS app_chat(id INTEGER PRIMARY KEY AUTOINCREMENT, fila_id INTEGER,
-                     de TEXT, por TEXT, texto TEXT, criado TEXT)""")
-
-
-def fila_lista(n=20):
-    with conn() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM app_fila ORDER BY id DESC LIMIT ?", (n,))]
-
-
-def fila_pedir(grupo, por):
-    if grupo not in FILA_GRUPOS or grupo == "livre":   # pedido "livre" entra so pelo chat (chat_enviar)
-        return {"ok": False, "erro": "grupo invalido"}
-    with _lock, conn() as c:
-        ab = c.execute(f"SELECT id, status FROM app_fila WHERE grupo=? AND status IN ({','.join('?' * len(FILA_ABERTOS))})",
-                       (grupo, *FILA_ABERTOS)).fetchone()
-        if ab:
-            return {"ok": False, "erro": f"Esse pedido já está na fila (nº {ab[0]}, {ab[1]}). Aguarde terminar."}
-        cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado) VALUES(?,?,?,?,?,?)",
-                        (grupo, str(por or "")[:40], agora(), "NA_FILA", "Aguardando o Claude começar (até 15 min)", agora()))
-        return {"ok": True, "id": cur.lastrowid}
-
-
-def fila_mudar(fid, status, msg="", resultado=None, so_de=None):
-    if status not in ("NA_FILA", "TRABALHANDO", "PRECISA_LOGIN", "ERRO", "PRONTO", "CANCELADO"):
-        return {"ok": False, "erro": "status invalido"}
-    with _lock, conn() as c:
-        r = c.execute("SELECT status FROM app_fila WHERE id=?", (int(fid or 0),)).fetchone()
-        if not r:
-            return {"ok": False, "erro": "pedido da fila nao encontrado"}
-        if so_de and r[0] not in so_de:
-            return {"ok": False, "erro": f"não dá para mudar: está {r[0]}"}
-        g = c.execute("SELECT grupo FROM app_fila WHERE id=?", (int(fid),)).fetchone()
-        if g and g[0] == "livre" and status in ("PRECISA_LOGIN", "ERRO", "PRONTO") and str(msg or "").strip():
-            c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)",
-                      (int(fid), "claude", "Claude", str(msg)[:2000], agora()))
-        if resultado is None:
-            c.execute("UPDATE app_fila SET status=?, msg=?, atualizado=? WHERE id=?", (status, str(msg)[:1000], agora(), int(fid)))
-        else:
-            c.execute("UPDATE app_fila SET status=?, msg=?, resultado=?, atualizado=? WHERE id=?",
-                      (status, str(msg)[:1000], str(resultado)[:4000], agora(), int(fid)))
-    return {"ok": True}
-
-
-def fila_proximo():
-    """Para o Claude: devolve o pedido mais antigo NA_FILA e ja marca TRABALHANDO."""
-    with _lock, conn() as c:
-        r = c.execute("SELECT * FROM app_fila WHERE status='NA_FILA' ORDER BY id LIMIT 1").fetchone()
-        if not r:
-            r = _fila_auto_upseller(c)
-        if not r:
-            return {"ok": True, "pedido": None}
-        c.execute("UPDATE app_fila SET status='TRABALHANDO', msg='Claude começou o lote', atualizado=? WHERE id=?", (agora(), r["id"]))
-        d = dict(r)
-    d["nome_grupo"] = FILA_GRUPOS.get(d["grupo"], d["grupo"])
-    return {"ok": True, "pedido": d}
-
-
-# ---- 09/10 (Lucas): chat do app + atualizacao automatica (sem precisar apertar botao)
-FILA_GRUPOS["livre"] = "Pedido especial (escrito no chat)"
-# UpSeller nao tem API: quem le e o Claude (tarefa da fila). Se a lista estiver mais velha que isso, a proxima
-# rodada da fila ja atualiza sozinha (seg-sab, das ETQ_AUTO_INI as ETQ_AUTO_FIM). 0 = desliga.
-ETQ_UPS_AUTO_MIN = int(os.environ.get("ETQ_UPSELLER_AUTO_MIN", "0"))   # Lucas 09/10: UpSeller so quando apertar o botao
-ETQ_AUTO_INI, ETQ_AUTO_FIM = int(os.environ.get("ETQ_AUTO_INI", "7")), int(os.environ.get("ETQ_AUTO_FIM", "19"))
-# Shopee tem API oficial: a Central le sozinha a cada ETQ_SHOPEE_AUTO_MIN minutos no horario de trabalho. 0 = desliga.
-ETQ_SHOPEE_AUTO_MIN = float(os.environ.get("ETQ_SHOPEE_AUTO_MIN", "1"))   # roda no servidor (API oficial), nao gasta Claude
-_etq_shopee_auto = {"em": None, "erro": ""}
-
-
-def _etq_horario():
-    h = datetime.now(BR)
-    return h.weekday() < 6 and ETQ_AUTO_INI <= h.hour < ETQ_AUTO_FIM
-
-
-def _fila_auto_upseller(c):
-    """Chamado dentro de fila_proximo (com _lock): cria e devolve um 'atualizar_upseller' automatico se precisar."""
-    if ETQ_UPS_AUTO_MIN <= 0 or not _etq_horario():
-        return None
-    lim = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()   # automatico que travou no meio nao segura os proximos
-    c.execute("""UPDATE app_fila SET status='ERRO', msg='Atualização automática parou sem terminar (a próxima tenta de novo)', atualizado=?
-                 WHERE grupo='atualizar_upseller' AND por='automático' AND status='TRABALHANDO' AND atualizado<?""", (agora(), lim))
-    ab = c.execute(f"SELECT id FROM app_fila WHERE grupo='atualizar_upseller' AND status IN ({','.join('?' * len(FILA_ABERTOS))})",
-                   FILA_ABERTOS).fetchone()
-    if ab:
-        return None
-    r = c.execute("SELECT valor FROM meta WHERE chave='etq_upseller'").fetchone()
-    try:
-        idade = (datetime.now(timezone.utc) - datetime.fromisoformat(json.loads(r[0])["em"])).total_seconds() / 60 if r and r[0] else 1e9
-    except Exception:
-        idade = 1e9
-    if idade < ETQ_UPS_AUTO_MIN - 2:
-        return None
-    cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado) VALUES(?,?,?,?,?,?)",
-                    ("atualizar_upseller", "automático", agora(), "NA_FILA", "Atualização automática do UpSeller", agora()))
-    return c.execute("SELECT * FROM app_fila WHERE id=?", (cur.lastrowid,)).fetchone()
-
-
-def chat_lista(n=60):
-    with conn() as c:
-        msgs = [dict(r) for r in c.execute("SELECT * FROM app_chat ORDER BY id DESC LIMIT ?", (n,))][::-1]
-        ids = sorted({m["fila_id"] for m in msgs if m["fila_id"]})
-        st = {r[0]: r[1] for r in c.execute(f"SELECT id, status FROM app_fila WHERE id IN ({','.join('?' * len(ids))})", ids)} if ids else {}
-    for m in msgs:
-        m["status"] = st.get(m["fila_id"], "")
-    return msgs
-
-
-def chat_enviar(texto, por):
-    """Mensagem da equipe no chat = pedido especial na fila (o Claude le o texto e faz exatamente isso)."""
-    texto = str(texto or "").strip()
-    if len(texto) < 3:
-        return {"ok": False, "erro": "Escreva o que você precisa."}
-    with _lock, conn() as c:
-        cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado, texto) VALUES(?,?,?,?,?,?,?)",
-                        ("livre", str(por or "")[:40], agora(), "NA_FILA", "Aguardando o Claude ler o pedido (até 15 min)", agora(), texto[:2000]))
-        fid = cur.lastrowid
-        c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)", (fid, "equipe", str(por or "")[:40], texto[:2000], agora()))
-    return {"ok": True, "id": fid}
-
-
-def chat_responder(fid, texto):
-    """Para o Claude: responde no chat (ex.: o que entendeu, pergunta de duvida)."""
-    texto = str(texto or "").strip()
-    if not texto:
-        return {"ok": False, "erro": "texto vazio"}
-    with _lock, conn() as c:
-        c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)",
-                  (int(fid or 0) or None, "claude", "Claude", texto[:2000], agora()))
-    return {"ok": True}
-
-
-def _etq_shopee_auto_loop():
-    """Le os pedidos da Shopee (API oficial, so leitura) a cada poucos minutos no horario de trabalho,
-    para a tela de etiquetas estar sempre atualizada sem apertar botao."""
-    import time
-    time.sleep(60)
-    while True:
-        try:
-            if ETQ_SHOPEE_AUTO_MIN > 0 and _etq_horario():
-                with conn() as c:
-                    ids = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas")]
-                for sid in ids:
-                    try:
-                        shopee_sincronizar(sid)
-                    except Exception as e:
-                        _etq_shopee_auto["erro"] = str(e)[:200]
-                _etq_shopee_auto["em"] = agora()
-        except Exception as e:
-            _etq_shopee_auto["erro"] = str(e)[:200]
-        time.sleep(max(60, ETQ_SHOPEE_AUTO_MIN * 60))
-
-
-# ---- divisao em 3 maquinas (SKU inteiro na mesma maquina, equilibrado pelo tempo medido nos bipes da gravacao)
-FILA_GRUPOS["atualizar_upseller"] = "Atualizar o que tem para imprimir (UpSeller)"
-MAQ_TEMPO_PADRAO = float(os.environ.get("MAQ_TEMPO_PADRAO_MIN", "3"))
-# SKU (sem zeros a esquerda) -> maquinas onde pode ser feito. Lucas 09/10: chaveiro 9824 so nas maquinas 2 e 3.
-# Mudar sem mexer no codigo: variavel MAQ_RESTRICOES="9824:2,3;1234:1"
-MAQ_RESTRICOES = {"9824": [2, 3]}
-for _r in (os.environ.get("MAQ_RESTRICOES") or "").split(";"):
-    if ":" in _r:
-        _k, _v = _r.split(":", 1)
-        MAQ_RESTRICOES[_k.strip().upper().lstrip("0")] = [int(x) for x in _v.split(",") if x.strip().isdigit()]
-
-
-def _sku_base(s):
-    b = re.split(r"[-\s]", str(s or "").strip().upper(), 1)[0]
-    return (b.lstrip("0") or b) or "(SEM SKU)"   # 09824 e 9824 sao o mesmo produto
-
-
-def maquinas_tempos(dias=30):
-    """Minutos por peca de cada SKU = mediana dos bipes de gravacao dos ultimos `dias` (min. 3 pecas)."""
-    ini = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
-    with conn() as c:
-        g = _gravacoes(c, ini)
-    por = {}
-    for _, sku, m in g:
-        por.setdefault(_sku_base(sku), []).append(m)
-    med = lambda v: sorted(v)[len(v) // 2]
-    tudo = [m for v in por.values() for m in v]
-    padrao = round(med(tudo), 2) if len(tudo) >= 10 else MAQ_TEMPO_PADRAO
-    return {"padrao_min": padrao, "dias": dias,
-            "skus": {k: {"min": round(med(v), 2), "pecas": len(v)} for k, v in por.items() if len(v) >= 3}}
-
-
-def maquinas_dividir(pedidos, n=3):
-    """pedidos: [{pedido, itens:[{sku, qtd}]}] (so os que vao para a gravacao).
-    Um SKU nunca e dividido entre maquinas: pedidos que dividem algum SKU ficam no mesmo grupo (pedido com 2 SKUs
-    junta os dois grupos). Grupos distribuidos do maior para o menor na maquina com menos tempo (equilibrado)."""
-    t = maquinas_tempos()
-    tmin = lambda sku: t["skus"].get(_sku_base(sku), {}).get("min", t["padrao_min"])
-    pai = {}
-
-    def raiz(x):
-        while pai.setdefault(x, x) != x:
-            pai[x] = pai[pai[x]]
-            x = pai[x]
-        return x
-    lista = []
-    for p in pedidos or []:
-        its = [i for i in (p.get("itens") or []) if int(i.get("qtd") or 0) > 0] or [{"sku": "", "qtd": 1}]
-        skus = [_sku_base(i.get("sku")) for i in its]
-        for s2 in skus[1:]:
-            pai[raiz(s2)] = raiz(skus[0])
-        raiz(skus[0])
-        lista.append((str(p.get("pedido")), skus, its))
-    grupos = {}
-    for ped, skus, its in lista:
-        g = grupos.setdefault(raiz(skus[0]), {"skus": set(), "pedidos": [], "pecas": 0, "min": 0.0})
-        g["skus"].update(skus); g["pedidos"].append(ped)
-        g["pecas"] += sum(int(i.get("qtd") or 1) for i in its)
-        g["min"] += sum(tmin(i.get("sku")) * int(i.get("qtd") or 1) for i in its)
-    maq = [{"maquina": k + 1, "skus": [], "pedidos": [], "pecas": 0, "min": 0.0} for k in range(max(1, int(n)))]
-    todas = [m["maquina"] for m in maq]
-
-    def pode(g):   # maquinas onde TODOS os SKUs do grupo podem ser feitos
-        ok = set(todas)
-        for s2 in g["skus"]:
-            r = MAQ_RESTRICOES.get(s2.lstrip("0"))
-            if r:
-                ok &= set(r)
-        return ok or set(todas)
-    # primeiro os grupos com restricao (ex.: chaveiro 9824 so na 2 e 3), depois o resto, sempre do maior para o menor
-    for g in sorted(grupos.values(), key=lambda x: (len(pode(x)) == len(todas), -x["min"])):
-        perm = pode(g)
-        m = min((x for x in maq if x["maquina"] in perm), key=lambda x: (x["min"], x["maquina"]))
-        m["skus"] += sorted(g["skus"]); m["pedidos"] += g["pedidos"]; m["pecas"] += g["pecas"]; m["min"] += g["min"]
-    for m in maq:
-        m["min"] = round(m["min"], 1)
-    return {"ok": True, "maquinas": maq, "pedido_maquina": {p: m["maquina"] for m in maq for p in m["pedidos"]},
-            "tempos": t}
-
-
-# ---- TRAVA ANTI-DUPLICACAO: todo lote (app, agendado, Turbo) reserva os pedidos aqui ANTES de gerar a etiqueta.
-# Pedido ja reservado/impresso nao pode ser reservado de novo -> nunca sai etiqueta repetida, nem com 2 lotes ao mesmo tempo.
-RESERVA_VELHA_H = float(os.environ.get("RESERVA_VELHA_H", "3"))
-
-
-def reserva_iniciar():
-    with conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS etq_reserva(pedido TEXT PRIMARY KEY, lote TEXT, por TEXT,
-                     reservado_em TEXT, status TEXT, impresso_em TEXT DEFAULT '', arquivo TEXT DEFAULT '')""")
-
-
-def _ped_norm(p):
-    return re.sub(r"\s+", "", str(p or "")).upper()
-
-
-def reserva_pedir(pedidos, lote, por=""):
-    """Reserva cada pedido (nº UPPUS). Devolve os que o lote PODE imprimir e os bloqueados (com o motivo)."""
-    ok, bloq = [], {}
-    with _lock, conn() as c:
-        for p in dict.fromkeys(_ped_norm(x) for x in (pedidos or []) if _ped_norm(x)):
-            r = c.execute("SELECT lote, status, reservado_em, impresso_em FROM etq_reserva WHERE pedido=?", (p,)).fetchone()
-            if r:
-                bloq[p] = {"lote": r[0], "status": r[1], "em": r[3] or r[2]}
-                continue
-            c.execute("INSERT INTO etq_reserva(pedido, lote, por, reservado_em, status) VALUES(?,?,?,?,'RESERVADO')",
-                      (p, str(lote)[:80], str(por)[:40], agora()))
-            ok.append(p)
-    return {"ok": True, "pode_imprimir": ok, "bloqueados": bloq}
-
-
-def reserva_marcar(pedidos, status, arquivo=""):
-    """status IMPRESSO (saiu na Zebra) ou LIBERAR (o lote parou ANTES de salvar o arquivo para imprimir)."""
-    n = 0
-    with _lock, conn() as c:
-        for p in (pedidos or []):
-            p = _ped_norm(p)
-            if status == "IMPRESSO":
-                n += c.execute("UPDATE etq_reserva SET status='IMPRESSO', impresso_em=?, arquivo=? WHERE pedido=?",
-                               (agora(), str(arquivo)[:120], p)).rowcount
-            elif status == "LIBERAR":
-                n += c.execute("DELETE FROM etq_reserva WHERE pedido=? AND status='RESERVADO'", (p,)).rowcount
-    return {"ok": True, "alterados": n}
-
-
-def reserva_consultar(pedidos=None):
-    """Sem lista: os RESERVADOS ha mais de RESERVA_VELHA_H horas (lote que parou no meio - conferir no log da Zebra)."""
-    with conn() as c:
-        if pedidos:
-            ps = [_ped_norm(x) for x in pedidos]
-            rows = c.execute(f"SELECT * FROM etq_reserva WHERE pedido IN ({','.join('?' * len(ps))})", ps).fetchall()
-        else:
-            lim = (datetime.now(timezone.utc) - timedelta(hours=RESERVA_VELHA_H)).isoformat()
-            rows = c.execute("SELECT * FROM etq_reserva WHERE status='RESERVADO' AND reservado_em<? ORDER BY reservado_em", (lim,)).fetchall()
-        return {"ok": True, "pedidos": [dict(r) for r in rows]}
-
-
 if __name__ == "__main__":
     iniciar_db()
-    etq_iniciar()
-    etq_iniciar_pdf()
-    fila_iniciar()
-    reserva_iniciar()
-    threading.Thread(target=_etq_shopee_auto_loop, daemon=True).start()   # tela de etiquetas sempre atualizada (Shopee)
     try:
         n = carregar_abertura()
         if n:
