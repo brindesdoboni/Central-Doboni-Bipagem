@@ -166,10 +166,10 @@ async function carregar(){
 }
 async function post(url,body){return api(url,body||{})}
 async function registrar(){const c=$("cod").value.trim();if(!c)return;$("msg").textContent="Registrando...";
-  try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada: ${c}`:`Já estava registrada: ${c}`)+" — o pacote bipado está em destaque abaixo":"❌ "+d.erro;$("cod").value="";
-    FOCO=d.ok&&d.ids?d.ids:[];FOCO_COD=c;$("oq").style.display="none";await carregar();
-    const el=FOCO.length&&$("d"+FOCO[0]);if(el)el.scrollIntoView({behavior:"smooth",block:"start"});
-    else if(d.ok)$("msg").textContent+=" (já foi conferido: veja no histórico)"}
+  try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada: ${c}`:`Já estava registrada: ${c}`)+" — o pacote bipado fica em destaque na lista":"❌ "+d.erro;$("cod").value="";
+    FOCO=d.ok&&d.ids?d.ids:[];FOCO_COD=c;await carregar();
+    if(d.ok&&d.ids&&d.ids.length)oque(d.ids[0]);   // abre o "O que fazer na Shopee" como antes
+    if(d.ok&&!(FOCO.length&&$("d"+FOCO[0])))$("msg").textContent+=" (já foi conferido: veja no histórico)"}
   catch(e){$("msg").textContent="❌ Não salvou — tente de novo"}$("cod").focus()}
 async function decidir(id,destino){const m=$("m"+id).value;
   if(!m){$("msg").textContent="Escolha o MOTIVO antes";$("m"+id).focus();return}
@@ -201,7 +201,7 @@ function desenharOq(){const o=OQ,el=$("oq");
      <button class="tb" onclick="tirar('video','Vídeo da abertura')">${vids.length?"Gravar de novo":"🎥 Gravar vídeo"}</button>
      ${vids.length?`<button class="tb" style="background:#dc2626" onclick="apagar('${vids[0].arquivo}')">✕</button>`:""}</div>
      <div class="barra" id="barra" style="display:none"><i></i></div></div>
-   <div class="bloco"><b>📸 2. Tire estas fotos</b> <span class="mini">(a Shopee aceita só <b>3 fotos</b>: ${OQ.midias.filter(m=>m.tipo=="foto").length}/3)</span>${o.fotos.map((f,i)=>{const t=daFoto(f);return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}${esc(f)}</span><button class="tb" onclick="tirar('foto',OQ.fotos[${i}])">📸 ${t.length?"Mais uma":"Tirar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`}).join("")}
+   <div class="bloco"><b>📸 2. Tire estas fotos</b> <div style="font-size:13px;color:#555;margin:2px 0 4px">A Shopee aceita só <span style="font-weight:bold">3 fotos</span> · tiradas: <span style="font-weight:bold">${OQ.midias.filter(m=>m.tipo=="foto").length}/3</span></div>${o.fotos.map((f,i)=>{const t=daFoto(f);return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}${esc(f)}</span><button class="tb" onclick="tirar('foto',OQ.fotos[${i}])">📸 ${t.length?"Mais uma":"Tirar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`}).join("")}
      ${o.personalizado||o.categoria=="sem_nome"?(()=>{const t=o.midias.filter(m=>m.tipo=="foto"&&m.rotulo.startsWith("Comprovante de produção"));return `<div class="foto ${t.length?"ok":""}"><span>${t.length?"✅ ":""}🧾 Comprovante de produção (a Central monta com os bipes: nome pedido, quem gravou e quando)</span><button class="tb" onclick="comprovante()">${t.length?"Gerar de novo":"🧾 Gerar"}</button><div class="th">${t.map(thumb).join("")}</div></div>`})():""}
      </div>
    <div class="bloco"><b>✍️ 3. Texto para a Shopee</b><textarea id="oqTxt" maxlength="256" oninput="contar(this)">${esc(o.texto)}</textarea><div class="mini" id="oqTxtN">${(o.texto||"").length}/256 caracteres (máximo da Shopee)</div>
