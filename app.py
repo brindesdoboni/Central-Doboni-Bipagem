@@ -3177,6 +3177,10 @@ class H(BaseHTTPRequestHandler):
         ck = self.headers.get("Cookie", "")
         return f"cb_admin={assinatura()}" in ck.replace(" ", "")
 
+    def _etq_ok(self):
+        ck = self.headers.get("Cookie", "").replace(" ", "")
+        return self._admin() or (bool(ETQ_SENHA) and f"cb_etq={etq_assinatura()}" in ck)
+
     def _json(self):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
@@ -3189,6 +3193,41 @@ class H(BaseHTTPRequestHandler):
             return self._pagina("bipar.html")
         if p == "/saude":
             return self._envia(200, {"ok": True})
+        if p == "/etiquetas":
+            return self._pagina("etiquetas.html")
+        if p.startswith("/api/etiquetas/"):
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            if p == "/api/etiquetas/dia":
+                return self._envia(200, etq_lista(q.get("ate") or None))
+            if p == "/api/etiquetas/imprimir":
+                g = q.get("grupo", "")
+                if g not in ETQ_GRUPOS:
+                    return self._envia(400, {"ok": False, "erro": "grupo invalido"})
+                try:
+                    r = etq_pdf(g, q.get("ate") or None, q.get("reimprimir") == "1")
+                except Exception as e:
+                    return self._envia(200, {"ok": False, "erro": str(e)[:300]})
+                if not r.get("ok"):
+                    return self._envia(200, r)
+                return self._envia(200, r["pdf"], "application/pdf",
+                                   extra={"Content-Disposition": f'attachment; filename="etiquetas_{r["lote"]}.pdf"',
+                                          "X-Lote": r["lote"]})
+            if p == "/api/etiquetas/ultimo":
+                return self._envia(200, _etq_ultimo)
+            if p == "/api/etiquetas/csv_lote":
+                with conn() as c:
+                    row = c.execute("SELECT valor FROM meta WHERE chave=?", ("etq_csv_" + q.get("lote", ""),)).fetchone()
+                if not row:
+                    return self._envia(404, {"erro": "lote nao encontrado"})
+                return self._envia(200, row[0], "text/csv; charset=utf-8",
+                                   extra={"Content-Disposition": f'attachment; filename="lightburn_nomes_{q.get("lote")}.csv"'})
+            if p == "/api/etiquetas/csv":
+                env = [x for x in (q.get("envios") or "").split(",") if x]
+                csv_txt = etq_csv(q.get("ate") or None, env or None, q.get("todos") != "1")
+                nome = "lightburn_nomes_" + datetime.now(BR).strftime("%Y-%m-%d_%Hh%M") + ".csv"
+                return self._envia(200, csv_txt, "text/csv; charset=utf-8",
+                                   extra={"Content-Disposition": f'attachment; filename="{nome}"'})
         if p == "/painel":
             return self._pagina("painel.html" if self._admin() else "login.html")
         if p == "/shopee/retorno" or p.startswith("/shopee/retorno/"):
@@ -3474,6 +3513,26 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True}, extra={
                     "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
             return self._envia(403, {"erro": "senha incorreta"})
+        if p == "/etiquetas/login":
+            if ETQ_SENHA and hmac.compare_digest(str(d.get("senha", "")), ETQ_SENHA):
+                return self._envia(200, {"ok": True}, extra={
+                    "Set-Cookie": f"cb_etq={etq_assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
+            if hmac.compare_digest(str(d.get("senha", "")), ADMIN_PASSWORD):
+                return self._envia(200, {"ok": True}, extra={
+                    "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
+            return self._envia(403, {"erro": "senha incorreta"})
+        if p.startswith("/api/etiquetas/"):
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            if p == "/api/etiquetas/salvar":
+                return self._envia(200, etq_salvar(d, str(d.get("por") or "")))
+            if p == "/api/etiquetas/enviar":
+                return self._envia(200, etq_enviar(d))
+            if p == "/api/etiquetas/sincronizar":
+                try:
+                    return self._envia(200, {"ok": True, "lojas": shopee_sincronizar_todas()})
+                except Exception as e:
+                    return self._envia(200, {"ok": False, "erro": str(e)[:200]})
         if p == "/api/bipes/setor":
             # o leitor trocou de setor (etiqueta de SETOR): so avisa o computador central, nao muda nada na operacao
             if not hmac.compare_digest(self.headers.get("X-Chave", ""), STATION_KEY):
@@ -7257,8 +7316,390 @@ def shopee_lojas():
     return {"configurado": bool(pid), "lojas": rows, "status": _shopee_status, "retorno": SHOPEE_RETORNO}
 
 
+# ================================================================== ETIQUETAS (tela de nomes para gravacao)
+# Le os pedidos que a Central ja sincroniza da Shopee (API oficial, so leitura), sugere nome/fonte a partir da
+# mensagem do comprador e deixa o colaborador conferir/corrigir. Gera o CSV do LightBurn e manda o lote para a
+# producao (mesma rota /api/lotes). Nada e alterado na Shopee.
+ETQ_SENHA = os.environ.get("ETIQUETAS_SENHA", "")  # senha so da tela de etiquetas (colaborador); vazio = so admin
+ETQ_FONTES = ["Alice", "Glacial Indifference", "Chewy", "Great Vibes", "Gilker", "Waltograph", "Avengeance", "Julli"]
+_ETQ_ALIAS = {"alice": 0, "glacial": 1, "chewy": 2, "great": 3, "grat": 3, "vibes": 3, "gilker": 4, "walt": 5,
+              "disney": 5, "aveng": 6, "avang": 6, "julli": 7, "juli ": 7}
+ETQ_TIPOS = {"G": "Gravar", "A": "Conferir", "C": "Buscar nome no chat", "E": "Especial", "N": "Sem personalização"}
+ETQ_ORDEM_ENVIO = ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"]
+
+
+def etq_assinatura():
+    return hmac.new(SECRET, ("etq:" + ETQ_SENHA).encode(), hashlib.sha256).hexdigest()
+
+
+def etq_iniciar():
+    with conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS etq_pedidos(order_sn TEXT PRIMARY KEY, tipo TEXT, nomes TEXT, fonte TEXT,
+                     obs TEXT, por TEXT, atualizado TEXT, lote TEXT DEFAULT '', enviado_em TEXT DEFAULT '')""")
+
+
+def _etq_pers(sku, var):
+    s = f"{sku} {var}".upper()
+    if re.search(r"SEM PERSONALIZ", s):
+        return False
+    return bool(re.search(r"PERSONALIZ|PZD|NOME|LOGO|7447|DESENHO", s))
+
+
+def _etq_envio(carrier):
+    c = (carrier or "").upper()
+    if "RÁPIDA" in c or "RAPIDA" in c or "TURBO" in c:
+        return "ENTREGA RÁPIDA"
+    if "RETIRADA" in c:
+        return "RETIRADA"
+    return "SHOPEE"
+
+
+def _etq_fonte(txt):
+    t = (txt or "").lower()
+    m = re.search(r"(?:fonte|letra|font)\s*[:\-]?\s*(?:n[ºo°]?\s*)?\(?([1-8])\)?(?!\d)", t)
+    if m:
+        return ETQ_FONTES[int(m.group(1)) - 1]
+    for k, i in _ETQ_ALIAS.items():
+        if k in t:
+            return ETQ_FONTES[i]
+    return ""
+
+
+def etq_sugerir(msg, qtd_pers):
+    """Sugestao de nomes a partir da mensagem do comprador. Sempre conferida por uma pessoa."""
+    if not msg or not qtd_pers:
+        return [], ""
+    fonte = _etq_fonte(msg)
+    aspas = re.findall(r"[\"“”']([^\"“”']{2,30})[\"“”']", msg)
+    if aspas:
+        return [a.strip() for a in aspas][:qtd_pers], fonte
+    txt = re.sub(r"observa[cç][aã]o( do)? pedido\s*:?", " ", msg, flags=re.I)
+    txt = re.sub(r"\b(?:fonte|letra|font)\b\s*[:\-]?\s*(?:n[ºo°]?\s*)?\(?[1-8]?\)?\s*[-–]?\s*[A-Za-zÀ-ú]*(?:\s+(?:vibes|indifference|signature|\(estilo disney\)))?",
+                 "\n", txt, flags=re.I)
+    partes = re.split(r"\n|;|\bnomes?\b(?:\s+(?:para personalizar|da caneca \d+|pra colocar|é))?\s*[:\-]?", txt, flags=re.I)
+    nomes = []
+    for p in partes:
+        p = re.sub(r"\b(somente|colocar|por favor|o nome|é|a outra com|com o|com|escrito|em uma garrafa)\b", " ", p, flags=re.I)
+        p = re.sub(r"[\"“”]|\s+", " ", p).strip(" .,:-–")
+        if not p or len(p) > 40 or re.search(r"\d{4,}|https?:|obrigad|poss[ií]vel|chegar|presente|ol[aá]\b|personaliza", p, re.I):
+            continue
+        for x in re.split(r"\s+e\s+|,|/|\s-\s|\ba outra\b", p):
+            x = re.sub(r"^(de|da|do|\d+)\s+", "", x.strip(" .,:-"), flags=re.I).strip()
+            if x.lower() in [f.lower() for f in ETQ_FONTES] or re.fullmatch(r"\d+", x):
+                continue
+            if 1 < len(x) <= 30 and len(nomes) < qtd_pers:
+                nomes.append(x)
+    return nomes, fonte
+
+
+def etq_lista(ate=None):
+    """Pedidos a enviar com prazo ate o fim do dia `ate` (YYYY-MM-DD, padrao hoje)."""
+    dia = datetime.strptime(ate, "%Y-%m-%d").replace(tzinfo=BR) if ate else datetime.now(BR)
+    fim = int(dia.replace(hour=23, minute=59, second=59).timestamp())
+    with conn() as c:
+        peds = [dict(r) for r in c.execute("""SELECT * FROM shopee_pedidos WHERE status IN ('READY_TO_SHIP','PROCESSED','RETRY_SHIP')
+                 AND prazo>0 AND prazo<=? ORDER BY prazo""", (fim,))]
+        salvos = {r["order_sn"]: dict(r) for r in c.execute("SELECT * FROM etq_pedidos")}
+        cent = {}
+        if peds:
+            for r in c.execute(f"""SELECT k.codigo, i.nomes, i.fonte, i.tipo, i.impresso FROM codigos k JOIN itens i ON i.id=k.item_id
+                                   WHERE k.codigo IN ({",".join("?" * len(peds))})""", [p["order_sn"] for p in peds]):
+                cent.setdefault(r[0], dict(r))
+    out = []
+    for p in peds:
+        itens = json.loads(p["itens"] or "[]")
+        unid = []
+        for i in itens:
+            unid += [{"sku": i.get("sku", ""), "var": i.get("var", ""), "pers": _etq_pers(i.get("sku"), i.get("var"))}] * int(i.get("qtd") or 1)
+        npers = sum(u["pers"] for u in unid)
+        s = salvos.get(p["order_sn"])
+        ce = cent.get(p["order_sn"])
+        if s and s["tipo"]:
+            tipo, nomes, fonte, obs, origem = s["tipo"], json.loads(s["nomes"] or "[]"), s["fonte"], s["obs"], "conferido"
+        elif ce and (ce.get("nomes") or ce.get("tipo")):
+            nomes = [x.strip() for x in (ce.get("nomes") or "").split("|") if x.strip()]
+            tipo, fonte, obs, origem = ce.get("tipo") or ("G" if nomes else "C"), ce.get("fonte") or "", "", "central"
+        else:
+            nomes, fonte = etq_sugerir(p["msg"], npers)
+            tipo = "N" if not npers else ("A" if nomes and len(nomes) == npers else "C")
+            obs, origem = "", "sugestao"
+        out.append({"order_sn": p["order_sn"], "loja": p["loja"], "envio": _etq_envio(p["envio"]), "carrier": p["envio"],
+                    "prazo": datetime.fromtimestamp(p["prazo"], BR).strftime("%d/%m %H:%M"), "msg": p["msg"],
+                    "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
+                    "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
+                    "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
+                    "status": SHOPEE_STATUS_PT.get(p["status"], p["status"])})
+    out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
+                            x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
+    return {"ok": True, "dia": dia.strftime("%d/%m/%Y"), "pedidos": out, "fontes": ETQ_FONTES, "tipos": ETQ_TIPOS,
+            "sync": _shopee_sync}
+
+
+def etq_salvar(d, por=""):
+    sn = norm(d.get("order_sn"))
+    tipo = (d.get("tipo") or "").upper()
+    if not sn or tipo not in ETQ_TIPOS:
+        return {"ok": False, "erro": "pedido ou tipo invalido"}
+    nomes = [str(x).strip()[:40] for x in (d.get("nomes") or []) if str(x).strip()]
+    if tipo == "G" and not nomes:
+        return {"ok": False, "erro": "para GRAVAR informe o(s) nome(s)"}
+    with _lock, conn() as c:
+        c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado) VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(order_sn) DO UPDATE SET tipo=excluded.tipo, nomes=excluded.nomes, fonte=excluded.fonte,
+                     obs=excluded.obs, por=excluded.por, atualizado=excluded.atualizado""",
+                  (sn, tipo, json.dumps(nomes, ensure_ascii=False), (d.get("fonte") or "")[:40], (d.get("obs") or "")[:200],
+                   por[:40], agora()))
+    return {"ok": True}
+
+
+def _etq_selecionados(ate, envios, so_novos):
+    L = etq_lista(ate)["pedidos"]
+    return [p for p in L if (not envios or p["envio"] in envios) and p["envio"] != "RETIRADA"
+            and (not so_novos or not p["enviado_em"])]
+
+
+def etq_csv(ate=None, envios=None, so_novos=True):
+    """CSV do LightBurn: uma linha por nome a gravar (so pedidos GRAVAR), na ordem da tela."""
+    linhas = []
+    for p in _etq_selecionados(ate, envios, so_novos):
+        if p["tipo"] == "G":
+            linhas += [n.replace(",", " ") for n in p["nomes"]]
+    return "\r\n" + "".join(f"{n},\r\n" for n in linhas)
+
+
+def etq_para_producao(sel, lote):
+    """Manda os pedidos para a producao (itens da Central), igual ao /api/lotes."""
+    LJ = {"bexlu": "BEXLU", "brindesbexlu": "BRINDESBEXLU", "jlimportsjl": "JL IMPORTS", "jlimports": "JL IMPORTS"}
+    itens = []
+    for p in sel:
+        pec = {}
+        for u in p["unidades"]:
+            k = (u["sku"].split("-")[0].strip(), u["var"].split(",")[0].strip())
+            pec[k] = pec.get(k, 0) + 1
+        first = p["unidades"][0] if p["unidades"] else {"sku": "", "var": ""}
+        itens.append({"pedido": p["order_sn"], "codigos": [p["order_sn"]], "canal": "SHOPEE",
+                      "envio": "ENTREGA DIRETA" if p["envio"] == "ENTREGA RÁPIDA" else "",
+                      "loja": LJ.get(norm(p["loja"]).lower(), p["loja"].upper()), "sku": first["sku"].split("-")[0].strip(),
+                      "cor": " + ".join(dict.fromkeys(k[1] for k in pec)), "nomes": p["nomes"] if p["tipo"] in ("G", "A") else [],
+                      "fonte": p["fonte"], "tipo": p["tipo"], "personalizado": p["tipo"] != "N", "obs": p["obs"],
+                      "pecas": [{"sku": k[0], "cor": k[1], "qtd": q} for k, q in pec.items()], "seq": 1})
+    r = importar_lote({"lote": lote, "itens": itens})
+    with _lock, conn() as c:
+        for p in sel:
+            c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado, lote, enviado_em)
+                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET lote=excluded.lote,
+                         enviado_em=excluded.enviado_em""",
+                      (p["order_sn"], p["tipo"], json.dumps(p["nomes"], ensure_ascii=False), p["fonte"], p["obs"], "",
+                       agora(), lote, agora()))
+    return r
+
+
+def etq_enviar(d):
+    """Fecha o lote: manda para a producao e marca os pedidos como enviados neste lote."""
+    sel = _etq_selecionados(d.get("ate") or None, d.get("envios") or None, True)
+    if not sel:
+        return {"ok": False, "erro": "nenhum pedido novo para enviar"}
+    lote = "ETQ " + datetime.now(BR).strftime("%d/%m %Hh%M")
+    r = etq_para_producao(sel, lote)
+    return {"ok": True, "lote": lote, "pedidos": len(sel), **{k: r.get(k) for k in ("novos", "atualizados")}}
+
+
+# ================================================================== ETIQUETAS: PDF pronto para imprimir (Shopee, API oficial)
+# Autorizado pelo Lucas (08/10/2026): a Central pede a etiqueta OFICIAL da Shopee (mesmo documento que o UpSeller imprime)
+# e monta o PDF com o painel de gravacao, na mesma ordem dos lotes (Entrega Rapida > TikTok > Shopee).
+# Nao muda status do pedido, nao envia nada ao comprador. TikTok entra quando a API do TikTok for liberada.
+ETQ_GRUPOS = {
+    "tudo_hoje": ("Tudo do dia", ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"], True),
+    "er_hoje": ("Entrega Rápida do dia", ["ENTREGA RÁPIDA"], True),
+    "tt_hoje": ("TikTok do dia", ["TIKTOK"], True),
+    "sp_hoje": ("Shopee do dia", ["SHOPEE"], True),
+    "tudo": ("Tudo (inclui próximos dias)", ["ENTREGA RÁPIDA", "TIKTOK", "SHOPEE"], False),
+}
+_ETQ_CANAL = {"ENTREGA RÁPIDA": "ER", "TIKTOK": "TT", "SHOPEE": "SP"}
+
+
+_etq_ultimo = {}
+
+
+def etq_iniciar_pdf():
+    with conn() as c:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(etq_pedidos)")]
+        if "impresso_em" not in cols:
+            c.execute("ALTER TABLE etq_pedidos ADD COLUMN impresso_em TEXT DEFAULT ''")
+            c.execute("ALTER TABLE etq_pedidos ADD COLUMN impresso_lote TEXT DEFAULT ''")
+
+
+def _shopee_doc_bytes(path, corpo, loja):
+    import urllib.request, urllib.parse, time
+    pid, key = _shopee_cred()
+    ts = int(time.time())
+    q = {"partner_id": pid, "timestamp": ts, "access_token": loja["access_token"], "shop_id": loja["shop_id"],
+         "sign": _shopee_assina(key, pid, path, ts, loja["access_token"], loja["shop_id"])}
+    req = urllib.request.Request(SHOPEE_HOST + path + "?" + urllib.parse.urlencode(q), data=json.dumps(corpo).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        b = r.read()
+    if not b.startswith(b"%PDF"):
+        try:
+            res = json.loads(b or b"{}")
+        except ValueError:
+            res = {}
+        raise RuntimeError(f"{res.get('error', 'sem PDF')}: {res.get('message', '')}"[:200])
+    return b
+
+
+def shopee_etiquetas_oficiais(order_sns):
+    """{order_sn: bytes do PDF} para os pedidos pedidos. Gera o documento na Shopee quando ainda nao existe.
+    Devolve tambem {order_sn: erro} para os que nao deram."""
+    import time
+    with conn() as c:
+        lojas = {r[0]: r[1] for r in c.execute(
+            f"SELECT order_sn, shop_id FROM shopee_pedidos WHERE order_sn IN ({','.join('?' * len(order_sns))})", order_sns)}
+    por_loja, ok, erros = {}, {}, {}
+    for sn in order_sns:
+        por_loja.setdefault(lojas.get(sn), []).append(sn)
+    for shop_id, sns in por_loja.items():
+        loja = _shopee_token_ok(shop_id) if shop_id else None
+        if not loja:
+            for sn in sns:
+                erros[sn] = "loja nao autorizada"
+            continue
+        for k in range(0, len(sns), 50):
+            lote = sns[k:k + 50]
+            tipos = {}
+            try:
+                r = _shopee_http("POST", "/api/v2/logistics/get_shipping_document_parameter", loja=loja,
+                                 corpo={"order_list": [{"order_sn": sn} for sn in lote]})
+                for x in (r.get("response") or {}).get("result_list") or []:
+                    tipos[x.get("order_sn")] = x.get("suggest_shipping_document_type") or "THERMAL_AIR_WAYBILL"
+            except Exception as e:
+                for sn in lote:
+                    erros[sn] = str(e)[:160]
+                continue
+            def status():
+                r = _shopee_http("POST", "/api/v2/logistics/get_shipping_document_result", loja=loja,
+                                 corpo={"order_list": [{"order_sn": sn, "shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL")}
+                                                       for sn in lote]})
+                return {x.get("order_sn"): x for x in (r.get("response") or {}).get("result_list") or []}
+            st = status()
+            criar = [sn for sn in lote if (st.get(sn) or {}).get("status") != "READY"]
+            if criar:
+                lst = []
+                for sn in criar:
+                    try:
+                        trk = (_shopee_http("GET", "/api/v2/logistics/get_tracking_number", loja=loja,
+                                            params={"order_sn": sn}).get("response") or {}).get("tracking_number", "")
+                    except Exception:
+                        trk = ""
+                    lst.append({"order_sn": sn, "tracking_number": trk,
+                                "shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL")})
+                try:
+                    _shopee_http("POST", "/api/v2/logistics/create_shipping_document", loja=loja, corpo={"order_list": lst})
+                except Exception as e:
+                    for sn in criar:
+                        erros[sn] = str(e)[:160]
+                for _ in range(15):
+                    time.sleep(2)
+                    st = status()
+                    if all((st.get(sn) or {}).get("status") in ("READY", "FAILED") for sn in criar):
+                        break
+            for sn in lote:
+                s = (st.get(sn) or {})
+                if s.get("status") != "READY":
+                    erros.setdefault(sn, f"etiqueta nao liberada pela Shopee ({s.get('status') or s.get('fail_message') or '?'})")
+                    continue
+                try:
+                    ok[sn] = _shopee_doc_bytes("/api/v2/logistics/download_shipping_document",
+                                               {"shipping_document_type": tipos.get(sn, "THERMAL_AIR_WAYBILL"),
+                                                "order_list": [{"order_sn": sn}]}, loja)
+                    erros.pop(sn, None)
+                except Exception as e:
+                    erros[sn] = str(e)[:160]
+    return ok, erros
+
+
+def etq_pdf(grupo, ate=None, reimprimir=False):
+    """Monta o PDF do grupo (ordem dos lotes) e o CSV do LightBurn. Marca os pedidos como impressos."""
+    import io, sys, tempfile
+    from pypdf import PdfReader, PdfWriter
+    sys.path.insert(0, AQUI)
+    import etq_montar
+    nome_g, envios, so_dia = ETQ_GRUPOS[grupo]
+    if not so_dia:
+        ate = (datetime.now(BR) + timedelta(days=30)).strftime("%Y-%m-%d")
+    L = etq_lista(ate)["pedidos"]
+    with conn() as c:
+        ja = {r[0] for r in c.execute("SELECT order_sn FROM etq_pedidos WHERE impresso_em<>''")}
+    sel = [p for p in L if p["envio"] in envios and (reimprimir or p["order_sn"] not in ja)]
+    avisos = []
+    if "TIKTOK" in envios:
+        avisos.append("TikTok ainda não está ligado na Central (aguardando liberação da API do TikTok)")
+    if not sel:
+        return {"ok": False, "erro": "nada novo para imprimir neste grupo", "avisos": avisos}
+    pdfs, erros = shopee_etiquetas_oficiais([p["order_sn"] for p in sel])
+    if not pdfs:
+        return {"ok": False, "erro": "a Shopee não liberou nenhuma etiqueta", "falhas": erros, "avisos": avisos}
+    w, page_of, P = PdfWriter(), {}, []
+    for p in sel:
+        if p["order_sn"] not in pdfs:
+            continue
+        r = PdfReader(io.BytesIO(pdfs[p["order_sn"]]))
+        ini = len(w.pages)
+        for pg in r.pages:
+            w.add_page(pg)
+        page_of[p["order_sn"]] = list(range(ini, len(w.pages)))
+        tipo = p["tipo"] if p["tipo"] in ETQ_TIPOS else "C"
+        if tipo == "A" and p["origem"] == "sugestao":
+            obs = "nome sugerido pela mensagem - CONFERIR"
+        else:
+            obs = p["obs"] or ("nome não veio na nota - BUSCAR NO CHAT" if tipo == "C" else "")
+        nomes = list(p["nomes"])
+        its, k = [], 0
+        for u in p["unidades"]:
+            sku = u["sku"].split("-")[0].strip()
+            cor = (u["var"] or "").split(",")[0].strip()
+            if u["pers"] and tipo in ("G", "A"):
+                its.append((sku, cor, nomes[k] if k < len(nomes) else "")); k += 1
+            else:
+                its.append((sku, cor, ""))
+        if tipo == "G" and k != len([u for u in p["unidades"] if u["pers"]]):
+            tipo = "A"; obs = obs or "quantidade de nomes diferente das peças - CONFERIR"
+        if not any(u["pers"] for u in p["unidades"]):
+            tipo = "N"
+        P.append((p["order_sn"], _ETQ_CANAL.get(p["envio"], "SP"), tipo, its or [("", "", "")], p["fonte"], obs))
+    with conn() as c:
+        prat = {r[0]: r[1] for r in c.execute("SELECT sku, prateleira FROM prateleiras")}
+    agora_br = datetime.now(BR)
+    lote = agora_br.strftime("%Y-%m-%d_%Hh%M") + "_" + grupo
+    with tempfile.TemporaryDirectory() as td:
+        src, out, csvp = f"{td}/src.pdf", f"{td}/out.pdf", f"{td}/nomes.csv"
+        with open(src, "wb") as f:
+            w.write(f)
+        info = etq_montar.main(src, P, out, csvp, lote, page_of=page_of, ids={}, prateleiras=prat or None)
+        pdf_b = open(out, "rb").read()
+        csv_b = open(csvp, "rb").read()
+    with _lock, conn() as c:
+        for sn in page_of:
+            c.execute("""INSERT INTO etq_pedidos(order_sn, tipo, nomes, fonte, obs, por, atualizado, impresso_em, impresso_lote)
+                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(order_sn) DO UPDATE SET impresso_em=excluded.impresso_em,
+                         impresso_lote=excluded.impresso_lote""",
+                      (sn, "", "[]", "", "", "", agora(), agora(), lote))
+        c.execute("INSERT INTO meta(chave, valor) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
+                  ("etq_csv_" + lote, csv_b.decode("utf-8")))
+    try:
+        etq_para_producao([p for p in sel if p["order_sn"] in page_of], "ETQ " + agora_br.strftime("%d/%m %Hh%M"))
+    except Exception as e:
+        avisos.append("não consegui lançar na produção: " + str(e)[:120])
+    _etq_ultimo.update(lote=lote, falhas=erros, avisos=avisos, pedidos=len(page_of))
+    return {"ok": True, "lote": lote, "pdf": pdf_b, "pedidos": len(page_of), "paginas": info["paginas"],
+            "falhas": erros, "avisos": avisos}
+
+
+
 if __name__ == "__main__":
     iniciar_db()
+    etq_iniciar()
+    etq_iniciar_pdf()
     try:
         n = carregar_abertura()
         if n:
