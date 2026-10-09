@@ -119,6 +119,7 @@ function card(p){const i=D.pedidos.indexOf(p);const n=Math.max(p.npers,p.nomes.l
   <div class="ped"><b>${esc(p.order_sn)}</b><br><span class="tag ${tcls}">${esc(p.envio)}</span><span class="tag">${esc(p.loja)}</span>
    <div class="mut">Prazo ${esc(p.prazo)} · ${esc(p.status)}</div>
    ${p.impresso?`<span class="tag" style="background:#dbeafe">🖨️ ${esc(p.impresso)}</span>`:''}
+   ${(!p.impresso&&p.na_central)?`<span class="tag" style="background:#dbeafe">🖨️ já impressa (UpSeller)</span>`:''}
    ${p.enviado_em?`<span class="tag" style="background:#dcfce7">✔ ${esc(p.lote)}</span>`:''}
    <span class="tag">${p.origem=='sugestao'?'sugestão':p.origem}</span></div>
   <div><div class="it">${p.itens.map(t=>`<div>• <b>${esc(t.sku)}</b> ${esc(t.var)} <b>x${t.qtd}</b></div>`).join('')}</div>

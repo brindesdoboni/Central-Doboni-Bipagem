@@ -3208,7 +3208,7 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/etiquetas":
             return self._pagina("etiquetas.html")
-        if p.startswith("/api/etiquetas/"):
+        if p in ("/api/etiquetas/dia", "/api/etiquetas/imprimir", "/api/etiquetas/ultimo", "/api/etiquetas/csv_lote", "/api/etiquetas/csv"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
             if p == "/api/etiquetas/dia":
@@ -3536,7 +3536,7 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True}, extra={
                     "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
             return self._envia(403, {"erro": "senha incorreta"})
-        if p.startswith("/api/etiquetas/"):
+        if p in ("/api/etiquetas/salvar", "/api/etiquetas/enviar", "/api/etiquetas/sincronizar"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
             if p == "/api/etiquetas/salvar":
@@ -7570,6 +7570,7 @@ def etq_lista(ate=None):
                     "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
                     "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
                     "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
+                    "na_central": bool(ce),   # etiqueta ja entrou na Central (impressa pelo UpSeller): nao imprimir de novo
                     "status": SHOPEE_STATUS_PT.get(p["status"], p["status"])})
     out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
                             x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
@@ -7772,7 +7773,7 @@ def etq_pdf(grupo, ate=None, reimprimir=False):
     L = etq_lista(ate)["pedidos"]
     with conn() as c:
         ja = {r[0] for r in c.execute("SELECT order_sn FROM etq_pedidos WHERE impresso_em<>''")}
-    sel = [p for p in L if p["envio"] in envios and (reimprimir or p["order_sn"] not in ja)]
+    sel = [p for p in L if p["envio"] in envios and (reimprimir or (p["order_sn"] not in ja and not p.get("na_central")))]
     avisos = []
     if "TIKTOK" in envios:
         avisos.append("TikTok ainda não está ligado na Central (aguardando liberação da API do TikTok)")
