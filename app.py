@@ -3212,6 +3212,10 @@ class H(BaseHTTPRequestHandler):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
             return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS, "travados": len(reserva_consultar()["pedidos"])})
+        if p == "/api/chat":
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, {"ok": True, "msgs": chat_lista(), "shopee_auto": _etq_shopee_auto})
         if p == "/api/maquinas/tempos":
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -3552,6 +3556,14 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True}, extra={
                     "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
             return self._envia(403, {"erro": "senha incorreta"})
+        if p == "/api/chat/enviar":
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, chat_enviar(d.get("texto"), d.get("por")))
+        if p == "/api/chat/responder":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "sem acesso"})
+            return self._envia(200, chat_responder(d.get("fila_id"), d.get("texto")))
         if p in ("/api/fila/pedir", "/api/fila/continuar", "/api/fila/cancelar"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -8004,6 +8016,12 @@ def fila_iniciar():
     with conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS app_fila(id INTEGER PRIMARY KEY AUTOINCREMENT, grupo TEXT, por TEXT,
                      criado TEXT, status TEXT, msg TEXT DEFAULT '', atualizado TEXT, resultado TEXT DEFAULT '')""")
+        try:   # 09/10 (Lucas): pedido escrito no chat do app (grupo "livre")
+            c.execute("ALTER TABLE app_fila ADD COLUMN texto TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        c.execute("""CREATE TABLE IF NOT EXISTS app_chat(id INTEGER PRIMARY KEY AUTOINCREMENT, fila_id INTEGER,
+                     de TEXT, por TEXT, texto TEXT, criado TEXT)""")
 
 
 def fila_lista(n=20):
@@ -8012,7 +8030,7 @@ def fila_lista(n=20):
 
 
 def fila_pedir(grupo, por):
-    if grupo not in FILA_GRUPOS:
+    if grupo not in FILA_GRUPOS or grupo == "livre":   # pedido "livre" entra so pelo chat (chat_enviar)
         return {"ok": False, "erro": "grupo invalido"}
     with _lock, conn() as c:
         ab = c.execute(f"SELECT id, status FROM app_fila WHERE grupo=? AND status IN ({','.join('?' * len(FILA_ABERTOS))})",
@@ -8033,6 +8051,10 @@ def fila_mudar(fid, status, msg="", resultado=None, so_de=None):
             return {"ok": False, "erro": "pedido da fila nao encontrado"}
         if so_de and r[0] not in so_de:
             return {"ok": False, "erro": f"não dá para mudar: está {r[0]}"}
+        g = c.execute("SELECT grupo FROM app_fila WHERE id=?", (int(fid),)).fetchone()
+        if g and g[0] == "livre" and status in ("PRECISA_LOGIN", "ERRO", "PRONTO") and str(msg or "").strip():
+            c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)",
+                      (int(fid), "claude", "Claude", str(msg)[:2000], agora()))
         if resultado is None:
             c.execute("UPDATE app_fila SET status=?, msg=?, atualizado=? WHERE id=?", (status, str(msg)[:1000], agora(), int(fid)))
         else:
@@ -8046,11 +8068,107 @@ def fila_proximo():
     with _lock, conn() as c:
         r = c.execute("SELECT * FROM app_fila WHERE status='NA_FILA' ORDER BY id LIMIT 1").fetchone()
         if not r:
+            r = _fila_auto_upseller(c)
+        if not r:
             return {"ok": True, "pedido": None}
         c.execute("UPDATE app_fila SET status='TRABALHANDO', msg='Claude começou o lote', atualizado=? WHERE id=?", (agora(), r["id"]))
         d = dict(r)
     d["nome_grupo"] = FILA_GRUPOS.get(d["grupo"], d["grupo"])
     return {"ok": True, "pedido": d}
+
+
+# ---- 09/10 (Lucas): chat do app + atualizacao automatica (sem precisar apertar botao)
+FILA_GRUPOS["livre"] = "Pedido especial (escrito no chat)"
+# UpSeller nao tem API: quem le e o Claude (tarefa da fila). Se a lista estiver mais velha que isso, a proxima
+# rodada da fila ja atualiza sozinha (seg-sab, das ETQ_AUTO_INI as ETQ_AUTO_FIM). 0 = desliga.
+ETQ_UPS_AUTO_MIN = int(os.environ.get("ETQ_UPSELLER_AUTO_MIN", "15"))
+ETQ_AUTO_INI, ETQ_AUTO_FIM = int(os.environ.get("ETQ_AUTO_INI", "7")), int(os.environ.get("ETQ_AUTO_FIM", "19"))
+# Shopee tem API oficial: a Central le sozinha a cada ETQ_SHOPEE_AUTO_MIN minutos no horario de trabalho. 0 = desliga.
+ETQ_SHOPEE_AUTO_MIN = float(os.environ.get("ETQ_SHOPEE_AUTO_MIN", "3"))
+_etq_shopee_auto = {"em": None, "erro": ""}
+
+
+def _etq_horario():
+    h = datetime.now(BR)
+    return h.weekday() < 6 and ETQ_AUTO_INI <= h.hour < ETQ_AUTO_FIM
+
+
+def _fila_auto_upseller(c):
+    """Chamado dentro de fila_proximo (com _lock): cria e devolve um 'atualizar_upseller' automatico se precisar."""
+    if ETQ_UPS_AUTO_MIN <= 0 or not _etq_horario():
+        return None
+    lim = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()   # automatico que travou no meio nao segura os proximos
+    c.execute("""UPDATE app_fila SET status='ERRO', msg='Atualização automática parou sem terminar (a próxima tenta de novo)', atualizado=?
+                 WHERE grupo='atualizar_upseller' AND por='automático' AND status='TRABALHANDO' AND atualizado<?""", (agora(), lim))
+    ab = c.execute(f"SELECT id FROM app_fila WHERE grupo='atualizar_upseller' AND status IN ({','.join('?' * len(FILA_ABERTOS))})",
+                   FILA_ABERTOS).fetchone()
+    if ab:
+        return None
+    r = c.execute("SELECT valor FROM meta WHERE chave='etq_upseller'").fetchone()
+    try:
+        idade = (datetime.now(timezone.utc) - datetime.fromisoformat(json.loads(r[0])["em"])).total_seconds() / 60 if r and r[0] else 1e9
+    except Exception:
+        idade = 1e9
+    if idade < ETQ_UPS_AUTO_MIN - 2:
+        return None
+    cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado) VALUES(?,?,?,?,?,?)",
+                    ("atualizar_upseller", "automático", agora(), "NA_FILA", "Atualização automática do UpSeller", agora()))
+    return c.execute("SELECT * FROM app_fila WHERE id=?", (cur.lastrowid,)).fetchone()
+
+
+def chat_lista(n=60):
+    with conn() as c:
+        msgs = [dict(r) for r in c.execute("SELECT * FROM app_chat ORDER BY id DESC LIMIT ?", (n,))][::-1]
+        ids = sorted({m["fila_id"] for m in msgs if m["fila_id"]})
+        st = {r[0]: r[1] for r in c.execute(f"SELECT id, status FROM app_fila WHERE id IN ({','.join('?' * len(ids))})", ids)} if ids else {}
+    for m in msgs:
+        m["status"] = st.get(m["fila_id"], "")
+    return msgs
+
+
+def chat_enviar(texto, por):
+    """Mensagem da equipe no chat = pedido especial na fila (o Claude le o texto e faz exatamente isso)."""
+    texto = str(texto or "").strip()
+    if len(texto) < 3:
+        return {"ok": False, "erro": "Escreva o que você precisa."}
+    with _lock, conn() as c:
+        cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado, texto) VALUES(?,?,?,?,?,?,?)",
+                        ("livre", str(por or "")[:40], agora(), "NA_FILA", "Aguardando o Claude ler o pedido (até 15 min)", agora(), texto[:2000]))
+        fid = cur.lastrowid
+        c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)", (fid, "equipe", str(por or "")[:40], texto[:2000], agora()))
+    return {"ok": True, "id": fid}
+
+
+def chat_responder(fid, texto):
+    """Para o Claude: responde no chat (ex.: o que entendeu, pergunta de duvida)."""
+    texto = str(texto or "").strip()
+    if not texto:
+        return {"ok": False, "erro": "texto vazio"}
+    with _lock, conn() as c:
+        c.execute("INSERT INTO app_chat(fila_id, de, por, texto, criado) VALUES(?,?,?,?,?)",
+                  (int(fid or 0) or None, "claude", "Claude", texto[:2000], agora()))
+    return {"ok": True}
+
+
+def _etq_shopee_auto_loop():
+    """Le os pedidos da Shopee (API oficial, so leitura) a cada poucos minutos no horario de trabalho,
+    para a tela de etiquetas estar sempre atualizada sem apertar botao."""
+    import time
+    time.sleep(60)
+    while True:
+        try:
+            if ETQ_SHOPEE_AUTO_MIN > 0 and _etq_horario():
+                with conn() as c:
+                    ids = [r[0] for r in c.execute("SELECT shop_id FROM shopee_lojas")]
+                for sid in ids:
+                    try:
+                        shopee_sincronizar(sid)
+                    except Exception as e:
+                        _etq_shopee_auto["erro"] = str(e)[:200]
+                _etq_shopee_auto["em"] = agora()
+        except Exception as e:
+            _etq_shopee_auto["erro"] = str(e)[:200]
+        time.sleep(max(60, ETQ_SHOPEE_AUTO_MIN * 60))
 
 
 # ---- divisao em 3 maquinas (SKU inteiro na mesma maquina, equilibrado pelo tempo medido nos bipes da gravacao)
@@ -8195,6 +8313,7 @@ if __name__ == "__main__":
     etq_iniciar_pdf()
     fila_iniciar()
     reserva_iniciar()
+    threading.Thread(target=_etq_shopee_auto_loop, daemon=True).start()   # tela de etiquetas sempre atualizada (Shopee)
     try:
         n = carregar_abertura()
         if n:

@@ -39,9 +39,13 @@ th:first-child,td:first-child{text-align:left}td.big{font-size:20px;font-weight:
   <div class="card">
     <h2>📋 O que tem para imprimir</h2>
     <div class="bar">
-      <button onclick="atualizarUpseller()" id="bUps">🔄 Atualizar UpSeller</button>
-      <button onclick="atualizarShopee()" id="bShp">🔄 Atualizar Shopee</button>
+      <span class="mut">🟢 Atualiza sozinho: a tela a cada 20 s, a Shopee a cada 3 min e o UpSeller a cada 15 min (seg–sáb, 7h–19h).</span>
       <span class="mut" id="quando"></span>
+    </div>
+    <div class="bar" style="margin-top:4px">
+      <span class="mut">Precisa agora?</span>
+      <button onclick="atualizarUpseller()" id="bUps" style="font-size:13px;padding:5px 9px">🔄 Forçar UpSeller</button>
+      <button onclick="atualizarShopee()" id="bShp" style="font-size:13px;padding:5px 9px">🔄 Forçar Shopee</button>
     </div>
     <div id="resumo"></div>
     <div class="mut" id="shopee" style="margin-top:6px"></div>
@@ -61,6 +65,17 @@ th:first-child,td:first-child{text-align:left}td.big{font-size:20px;font-weight:
       imprime sozinho e dá baixa no UpSeller. Nunca imprime repetido: cada pedido é travado na Central antes de imprimir (vale para o app e para os lotes automáticos). Se algo estiver deslogado, aparece aqui: faça o login e clique em <b>Já loguei, continuar</b>.</div>
     <div id="travados" style="margin-top:6px;color:#b54708;font-size:13px"></div>
     <div id="fila" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card" style="border-left:6px solid #7c3aed">
+    <h2>💬 Pedido especial — escreva para o Claude</h2>
+    <div class="mut">Para o que os botões não fazem. Ex.: <i>"imprimir só 20% dos pedidos da bexlu, os de prazo mais curto"</i>,
+      <i>"só os 7447 pretos da lucmarix"</i>, <i>"só TikTok com prazo amanhã"</i>. O Claude lê em até 15 min, responde aqui o que entendeu e imprime
+      do mesmo jeito dos botões (3 máquinas, trava contra repetida, nomes conferidos). Se ficar em dúvida, ele pergunta aqui antes de imprimir.</div>
+    <div id="chat" style="max-height:360px;overflow:auto;margin:8px 0;padding:6px;background:#f8fafc;border-radius:8px"></div>
+    <div class="bar"><textarea id="chatTxt" rows="2" style="flex:1;min-width:220px;font-size:15px;padding:8px;border:1px solid var(--bd);border-radius:8px"
+      placeholder="Escreva aqui o que precisa imprimir..."></textarea>
+      <button class="pri" onclick="chatEnviar()" id="bChat">Enviar</button></div>
   </div>
 </main>
 </div>
@@ -88,8 +103,9 @@ async function resumo(){try{
     `<tr><td><b>Total</b></td><td class="big">${th}</td><td><b>${to}</b></td></tr></table>`;
   $('#quando').textContent=H.fonte_lista=='upseller'?('Lista do UpSeller de '+H.upseller_em):'Lista pela Shopee (UpSeller desatualizado)';
   $('#shopee').textContent=H.aviso?('⚠ '+H.aviso):'';$('#shopee').style.color=H.aviso?'#b54708':''}catch(e){}}
+function auto(x){return x.grupo=='atualizar_upseller'&&x.por=='automático'&&!['PRECISA_LOGIN','ERRO'].includes(x.status)}
 async function fila(){try{const r=await api('/api/fila');FILAG=r.grupos;$('#travados').textContent=r.travados?`⚠ ${r.travados} pedido(s) reservado(s) há mais de 3 h sem confirmação de impressão — o Claude confere no registro da Zebra antes de liberar.`:'';
-  const L=r.fila.slice(0,8);
+  const L=r.fila.filter(x=>!auto(x)&&x.grupo!='livre').slice(0,8);
   $('#fila').innerHTML=L.map(x=>{const [t,c]=FST[x.status]||[x.status,'#eee'];
     return `<div style="background:${c};border-radius:8px;padding:8px 10px;margin-top:6px"><b>${t}</b> · nº ${x.id} · ${esc(r.grupos[x.grupo]||x.grupo)} · ${quando(x.criado)}${x.por?' · '+esc(x.por):''}
     <div style="white-space:pre-wrap">${esc(x.msg)}</div>${x.resultado?`<div class="mut" style="white-space:pre-wrap">${esc(x.resultado)}</div>`:''}
@@ -103,9 +119,25 @@ async function atualizarUpseller(){const r=await api('/api/fila/pedir',{grupo:'a
 async function atualizarShopee(){const b=$('#bShp');b.disabled=true;aviso('Lendo pedidos da Shopee...');
   try{const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Shopee atualizada':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');await resumo()}
   finally{b.disabled=false}}
+const CST={NA_FILA:'⏳ na fila',TRABALHANDO:'⚙️ Claude fazendo',PRECISA_LOGIN:'🔑 precisa logar',ERRO:'❌ erro / dúvida',PRONTO:'✅ pronto',CANCELADO:'🚫 cancelado'};
+let chatN=-1;
+async function chat(){try{const r=await api('/api/chat');const el=$('#chat');
+  el.innerHTML=r.msgs.map(m=>{const eu=m.de=='equipe';
+    return `<div style="display:flex;justify-content:${eu?'flex-end':'flex-start'};margin:4px 0"><div style="max-width:80%;background:${eu?'#ede9fe':'#fff'};border:1px solid var(--bd);border-radius:10px;padding:6px 9px">
+    <div class="mut">${eu?esc(m.por||'equipe'):'🤖 Claude'} · ${quando(m.criado)}${eu&&m.status?' · '+(CST[m.status]||m.status):''}</div>
+    <div style="white-space:pre-wrap">${esc(m.texto)}</div>
+    ${eu&&['NA_FILA','PRECISA_LOGIN','ERRO'].includes(m.status)?`<button style="margin-top:4px;font-size:12px;padding:3px 7px" onclick="filaAcao('cancelar',${m.fila_id}).then(chat)">Cancelar</button>`:''}
+    ${eu&&['PRECISA_LOGIN'].includes(m.status)?`<button class="ok" style="margin-top:4px;font-size:12px;padding:3px 7px" onclick="filaAcao('continuar',${m.fila_id}).then(chat)">Já loguei, continuar</button>`:''}
+    </div></div>`}).join('')||'<span class="mut">Nenhuma mensagem ainda.</span>';
+  if(r.msgs.length!=chatN){el.scrollTop=el.scrollHeight;chatN=r.msgs.length}}catch(e){}}
+async function chatEnviar(){const t=$('#chatTxt').value.trim();if(t.length<3)return;
+  if(!$('#quem').value.trim()){alert('Escreva seu nome lá em cima antes de mandar.');return}
+  if(!confirm('Mandar para o Claude imprimir:\n\n"'+t+'"\n\nÉ isso mesmo?'))return;
+  $('#bChat').disabled=true;try{const r=await api('/api/chat/enviar',{texto:t,por:$('#quem').value});
+  if(!r.ok)alert(r.erro);else{$('#chatTxt').value='';aviso('Mensagem enviada — o Claude responde aqui em até 15 min','#7ee787')}await chat()}finally{$('#bChat').disabled=false}}
 async function filaAcao(a,id){const r=await api('/api/fila/'+a,{id,por:$('#quem').value});if(!r.ok)alert(r.erro);fila()}
-async function iniciar(){try{await api('/api/fila');$('#app').hidden=false;$('#login').hidden=true;fila();resumo()}catch(e){}}
-setInterval(fila,15000);setInterval(resumo,60000);
+async function iniciar(){try{await api('/api/fila');$('#app').hidden=false;$('#login').hidden=true;fila();resumo();chat()}catch(e){}}
+setInterval(fila,15000);setInterval(resumo,20000);setInterval(chat,10000);
 iniciar();
 </script>
 </body>
