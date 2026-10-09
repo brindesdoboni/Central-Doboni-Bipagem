@@ -39,13 +39,13 @@ th:first-child,td:first-child{text-align:left}td.big{font-size:20px;font-weight:
   <div class="card">
     <h2>📋 O que tem para imprimir</h2>
     <div class="bar">
-      <span class="mut">🟢 Atualiza sozinho: a tela a cada 20 s, a Shopee a cada 3 min e o UpSeller a cada 15 min (seg–sáb, 7h–19h).</span>
+      <span class="mut">🟢 Atualiza sozinho: a tela a cada 20 s e a Shopee a cada 1 min (seg–sáb, 7h–19h). UpSeller (TikTok e o que já foi impresso): só no botão.</span>
       <span class="mut" id="quando"></span>
     </div>
     <div class="bar" style="margin-top:4px">
-      <span class="mut">Precisa agora?</span>
-      <button onclick="atualizarUpseller()" id="bUps" style="font-size:13px;padding:5px 9px">🔄 Forçar UpSeller</button>
-      <button onclick="atualizarShopee()" id="bShp" style="font-size:13px;padding:5px 9px">🔄 Forçar Shopee</button>
+      <span class="mut">Atualizar:</span>
+      <button onclick="atualizarUpseller()" id="bUps" style="font-size:13px;padding:5px 9px">🔄 Atualizar UpSeller</button>
+      <button onclick="atualizarShopee()" id="bShp" style="font-size:13px;padding:5px 9px">🔄 Shopee agora</button>
     </div>
     <div id="resumo"></div>
     <div class="mut" id="shopee" style="margin-top:6px"></div>

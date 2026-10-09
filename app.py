@@ -8081,10 +8081,10 @@ def fila_proximo():
 FILA_GRUPOS["livre"] = "Pedido especial (escrito no chat)"
 # UpSeller nao tem API: quem le e o Claude (tarefa da fila). Se a lista estiver mais velha que isso, a proxima
 # rodada da fila ja atualiza sozinha (seg-sab, das ETQ_AUTO_INI as ETQ_AUTO_FIM). 0 = desliga.
-ETQ_UPS_AUTO_MIN = int(os.environ.get("ETQ_UPSELLER_AUTO_MIN", "15"))
+ETQ_UPS_AUTO_MIN = int(os.environ.get("ETQ_UPSELLER_AUTO_MIN", "0"))   # Lucas 09/10: UpSeller so quando apertar o botao
 ETQ_AUTO_INI, ETQ_AUTO_FIM = int(os.environ.get("ETQ_AUTO_INI", "7")), int(os.environ.get("ETQ_AUTO_FIM", "19"))
 # Shopee tem API oficial: a Central le sozinha a cada ETQ_SHOPEE_AUTO_MIN minutos no horario de trabalho. 0 = desliga.
-ETQ_SHOPEE_AUTO_MIN = float(os.environ.get("ETQ_SHOPEE_AUTO_MIN", "3"))
+ETQ_SHOPEE_AUTO_MIN = float(os.environ.get("ETQ_SHOPEE_AUTO_MIN", "1"))   # roda no servidor (API oficial), nao gasta Claude
 _etq_shopee_auto = {"em": None, "erro": ""}
 
 
