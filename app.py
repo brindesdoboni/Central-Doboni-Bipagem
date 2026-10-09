@@ -7556,8 +7556,11 @@ def etq_sugerir(msg, qtd_pers):
     return nomes, fonte
 
 
-def etq_lista(ate=None):
-    """Pedidos a enviar com prazo ate o fim do dia `ate` (YYYY-MM-DD, padrao hoje)."""
+def etq_lista(ate=None, incluir_impressos=False):
+    """Pedidos a enviar com prazo ate o fim do dia `ate` (YYYY-MM-DD, padrao hoje).
+    09/10/2026 (Lucas/Jo): a tela mostra SO o que ainda nao foi impresso (o que esta "Para Imprimir").
+    Ja impresso = impresso por esta tela, OU a etiqueta ja entrou na Central (PDF/e-mail/lote/Zebra),
+    OU o espelho do UpSeller (recente) diz que ja esta em Para Retirada. Esses pedidos nao aparecem."""
     dia = datetime.strptime(ate, "%Y-%m-%d").replace(tzinfo=BR) if ate else datetime.now(BR)
     fim = int(dia.replace(hour=23, minute=59, second=59).timestamp())
     with conn() as c:
@@ -7566,9 +7569,20 @@ def etq_lista(ate=None):
         salvos = {r["order_sn"]: dict(r) for r in c.execute("SELECT * FROM etq_pedidos")}
         cent = {}
         if peds:
+            # itens criados so pelo espelho do UpSeller (lote "UPSELLER ...") nao sao etiqueta impressa
             for r in c.execute(f"""SELECT k.codigo, i.nomes, i.fonte, i.tipo, i.impresso FROM codigos k JOIN itens i ON i.id=k.item_id
-                                   WHERE k.codigo IN ({",".join("?" * len(peds))})""", [p["order_sn"] for p in peds]):
+                                   WHERE k.codigo IN ({",".join("?" * len(peds))})
+                                   AND COALESCE(i.lote,'') NOT LIKE 'UPSELLER%' AND COALESCE(i.lote,'')<>'DEVOLUCAO'""",
+                                [p["order_sn"] for p in peds]):
                 cent.setdefault(r[0], dict(r))
+        ups = {}
+        try:
+            rr = c.execute("SELECT valor FROM meta WHERE chave='upseller_resumo'").fetchone()
+            if peds and rr and rr[0] and (datetime.now(timezone.utc) - datetime.fromisoformat(json.loads(rr[0])["em"])).total_seconds() < UPSELLER_FRESCO_H * 3600:
+                ups = {r[0]: r[1] for r in c.execute(f"""SELECT codigo, estado FROM upseller_pedidos
+                       WHERE codigo IN ({",".join("?" * len(peds))})""", [p["order_sn"] for p in peds])}
+        except Exception:
+            ups = {}
     out = []
     for p in peds:
         itens = json.loads(p["itens"] or "[]")
@@ -7578,6 +7592,9 @@ def etq_lista(ate=None):
         npers = sum(u["pers"] for u in unid)
         s = salvos.get(p["order_sn"])
         ce = cent.get(p["order_sn"])
+        ja_impresso = bool(s and s.get("impresso_em")) or bool(ce) or ups.get(p["order_sn"]) in ("to_pickup", "pickup_exception")
+        if ja_impresso and not incluir_impressos:
+            continue
         if s and s["tipo"]:
             tipo, nomes, fonte, obs, origem = s["tipo"], json.loads(s["nomes"] or "[]"), s["fonte"], s["obs"], "conferido"
         elif ce and (ce.get("nomes") or ce.get("tipo")):
@@ -7592,7 +7609,7 @@ def etq_lista(ate=None):
                     "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
                     "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
                     "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
-                    "na_central": bool(ce) or p["status"] == "PROCESSED",   # ja entrou na Central ou a etiqueta ja foi gerada na Shopee (UpSeller): nao imprimir de novo
+                    "na_central": ja_impresso,   # so aparece True quando incluir_impressos (reimpressao autorizada)
                     "status": SHOPEE_STATUS_PT.get(p["status"], p["status"])})
     out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
                             x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
@@ -7792,7 +7809,7 @@ def etq_pdf(grupo, ate=None, reimprimir=False):
     nome_g, envios, so_dia = ETQ_GRUPOS[grupo]
     if not so_dia:
         ate = (datetime.now(BR) + timedelta(days=30)).strftime("%Y-%m-%d")
-    L = etq_lista(ate)["pedidos"]
+    L = etq_lista(ate, incluir_impressos=reimprimir)["pedidos"]
     with conn() as c:
         ja = {r[0] for r in c.execute("SELECT order_sn FROM etq_pedidos WHERE impresso_em<>''")}
     sel = [p for p in L if p["envio"] in envios and (reimprimir or (p["order_sn"] not in ja and not p.get("na_central")))]
