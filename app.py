@@ -3208,6 +3208,14 @@ class H(BaseHTTPRequestHandler):
             return self._envia(200, {"ok": True})
         if p == "/etiquetas":
             return self._pagina("etiquetas.html")
+        if p == "/api/fila":
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            return self._envia(200, {"ok": True, "fila": fila_lista(), "grupos": FILA_GRUPOS})
+        if p == "/api/fila/proximo":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "sem acesso"})
+            return self._envia(200, fila_proximo())
         if p in ("/api/etiquetas/dia", "/api/etiquetas/imprimir", "/api/etiquetas/ultimo", "/api/etiquetas/csv_lote", "/api/etiquetas/csv"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -3536,6 +3544,20 @@ const j=await r.json();document.getElementById("m").textContent=j.ok?"Pronto: "+
                 return self._envia(200, {"ok": True}, extra={
                     "Set-Cookie": f"cb_admin={assinatura()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
             return self._envia(403, {"erro": "senha incorreta"})
+        if p in ("/api/fila/pedir", "/api/fila/continuar", "/api/fila/cancelar"):
+            if not self._etq_ok():
+                return self._envia(401, {"erro": "login necessario"})
+            if p == "/api/fila/pedir":
+                return self._envia(200, fila_pedir(str(d.get("grupo") or ""), d.get("por")))
+            if p == "/api/fila/continuar":
+                return self._envia(200, fila_mudar(d.get("id"), "NA_FILA", "Logado — voltou para a fila (até 15 min)",
+                                                   so_de=("PRECISA_LOGIN", "ERRO")))
+            return self._envia(200, fila_mudar(d.get("id"), "CANCELADO", "Cancelado por " + str(d.get("por") or "equipe")[:40],
+                                               so_de=("NA_FILA", "PRECISA_LOGIN", "ERRO")))
+        if p == "/api/fila/status":
+            if not (self._admin() or hmac.compare_digest(self.headers.get("X-Token", ""), API_TOKEN)):
+                return self._envia(403, {"erro": "sem acesso"})
+            return self._envia(200, fila_mudar(d.get("id"), str(d.get("status") or ""), d.get("msg") or "", d.get("resultado")))
         if p in ("/api/etiquetas/salvar", "/api/etiquetas/enviar", "/api/etiquetas/sincronizar"):
             if not self._etq_ok():
                 return self._envia(401, {"erro": "login necessario"})
@@ -7570,7 +7592,7 @@ def etq_lista(ate=None):
                     "itens": itens, "unidades": unid, "npers": npers, "tipo": tipo, "nomes": nomes, "fonte": fonte,
                     "obs": obs, "origem": origem, "lote": (s or {}).get("lote", ""), "enviado_em": (s or {}).get("enviado_em", ""),
                     "impresso": (s or {}).get("impresso_lote", "") if (s or {}).get("impresso_em") else "",
-                    "na_central": bool(ce),   # etiqueta ja entrou na Central (impressa pelo UpSeller): nao imprimir de novo
+                    "na_central": bool(ce) or p["status"] == "PROCESSED",   # ja entrou na Central ou a etiqueta ja foi gerada na Shopee (UpSeller): nao imprimir de novo
                     "status": SHOPEE_STATUS_PT.get(p["status"], p["status"])})
     out.sort(key=lambda x: (ETQ_ORDEM_ENVIO.index(x["envio"]) if x["envio"] in ETQ_ORDEM_ENVIO else 9,
                             x["unidades"][0]["sku"] if x["unidades"] else "", x["order_sn"]))
@@ -7838,10 +7860,72 @@ def etq_pdf(grupo, ate=None, reimprimir=False):
             "falhas": erros, "avisos": avisos}
 
 
+# ================================================================== FILA DO APP (botao no app -> Claude faz o lote)
+# O colaborador clica no botao; o pedido entra na fila. O Claude (tarefa agendada) pega o pedido, le os chats,
+# gera as etiquetas, imprime e devolve o andamento aqui (ou "precisa logar na loja X").
+FILA_GRUPOS = {"er_hoje": "Entrega Rápida do dia", "tt_hoje": "TikTok do dia", "sp_hoje": "Shopee do dia",
+               "tudo_hoje": "Tudo do dia (Entrega Rápida → TikTok → Shopee)", "tudo": "Tudo, inclusive próximos dias"}
+FILA_ABERTOS = ("NA_FILA", "TRABALHANDO", "PRECISA_LOGIN")
+
+
+def fila_iniciar():
+    with conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS app_fila(id INTEGER PRIMARY KEY AUTOINCREMENT, grupo TEXT, por TEXT,
+                     criado TEXT, status TEXT, msg TEXT DEFAULT '', atualizado TEXT, resultado TEXT DEFAULT '')""")
+
+
+def fila_lista(n=20):
+    with conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM app_fila ORDER BY id DESC LIMIT ?", (n,))]
+
+
+def fila_pedir(grupo, por):
+    if grupo not in FILA_GRUPOS:
+        return {"ok": False, "erro": "grupo invalido"}
+    with _lock, conn() as c:
+        ab = c.execute(f"SELECT id, status FROM app_fila WHERE grupo=? AND status IN ({','.join('?' * len(FILA_ABERTOS))})",
+                       (grupo, *FILA_ABERTOS)).fetchone()
+        if ab:
+            return {"ok": False, "erro": f"Esse pedido já está na fila (nº {ab[0]}, {ab[1]}). Aguarde terminar."}
+        cur = c.execute("INSERT INTO app_fila(grupo, por, criado, status, msg, atualizado) VALUES(?,?,?,?,?,?)",
+                        (grupo, str(por or "")[:40], agora(), "NA_FILA", "Aguardando o Claude começar (até 15 min)", agora()))
+        return {"ok": True, "id": cur.lastrowid}
+
+
+def fila_mudar(fid, status, msg="", resultado=None, so_de=None):
+    if status not in ("NA_FILA", "TRABALHANDO", "PRECISA_LOGIN", "ERRO", "PRONTO", "CANCELADO"):
+        return {"ok": False, "erro": "status invalido"}
+    with _lock, conn() as c:
+        r = c.execute("SELECT status FROM app_fila WHERE id=?", (int(fid or 0),)).fetchone()
+        if not r:
+            return {"ok": False, "erro": "pedido da fila nao encontrado"}
+        if so_de and r[0] not in so_de:
+            return {"ok": False, "erro": f"não dá para mudar: está {r[0]}"}
+        if resultado is None:
+            c.execute("UPDATE app_fila SET status=?, msg=?, atualizado=? WHERE id=?", (status, str(msg)[:1000], agora(), int(fid)))
+        else:
+            c.execute("UPDATE app_fila SET status=?, msg=?, resultado=?, atualizado=? WHERE id=?",
+                      (status, str(msg)[:1000], str(resultado)[:4000], agora(), int(fid)))
+    return {"ok": True}
+
+
+def fila_proximo():
+    """Para o Claude: devolve o pedido mais antigo NA_FILA e ja marca TRABALHANDO."""
+    with _lock, conn() as c:
+        r = c.execute("SELECT * FROM app_fila WHERE status='NA_FILA' ORDER BY id LIMIT 1").fetchone()
+        if not r:
+            return {"ok": True, "pedido": None}
+        c.execute("UPDATE app_fila SET status='TRABALHANDO', msg='Claude começou o lote', atualizado=? WHERE id=?", (agora(), r["id"]))
+        d = dict(r)
+    d["nome_grupo"] = FILA_GRUPOS.get(d["grupo"], d["grupo"])
+    return {"ok": True, "pedido": d}
+
+
 if __name__ == "__main__":
     iniciar_db()
     etq_iniciar()
     etq_iniciar_pdf()
+    fila_iniciar()
     try:
         n = carregar_abertura()
         if n:

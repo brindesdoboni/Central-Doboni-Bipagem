@@ -48,17 +48,17 @@ main{padding:12px 16px;max-width:1300px;margin:auto}
 </header>
 <main>
   <div class="card" style="display:block;border-left:6px solid #111827">
-    <b style="font-size:17px">🖨️ Imprimir etiquetas (ordem dos lotes: Entrega Rápida → TikTok → Shopee)</b>
+    <b style="font-size:17px">🖨️ Pedir etiquetas ao Claude (ordem: Entrega Rápida → TikTok → Shopee)</b>
     <div class="bar" style="margin-top:8px">
-      <button class="pri" onclick="imprimir('tudo_hoje')">🖨️ Tudo do dia</button>
-      <button onclick="imprimir('er_hoje')">⚡ Entrega Rápida do dia</button>
-      <button onclick="imprimir('tt_hoje')">🎵 TikTok do dia</button>
-      <button onclick="imprimir('sp_hoje')">🛍️ Shopee do dia</button>
-      <button onclick="imprimir('tudo')">📚 Tudo (inclui próximos dias)</button>
-      <label><input type="checkbox" id="reimp"> reimprimir os já impressos</label>
+      <button class="pri" onclick="pedir('tudo_hoje')">🖨️ Tudo do dia</button>
+      <button onclick="pedir('er_hoje')">⚡ Entrega Rápida do dia</button>
+      <button onclick="pedir('tt_hoje')">🎵 TikTok do dia</button>
+      <button onclick="pedir('sp_hoje')">🛍️ Shopee do dia</button>
+      <button onclick="pedir('tudo')">📚 Tudo (inclui próximos dias)</button>
     </div>
-    <div class="mut">Só imprime o que ainda não foi impresso (não duplica). O PDF e o CSV do LightBurn baixam neste computador; no PC da Zebra a impressão sai sozinha. Retirada pelo Comprador não tem etiqueta.</div>
-    <div id="impres" style="margin-top:6px"></div>
+    <div class="mut">O Claude pega o pedido em até 15 min, lê os nomes nos chats, gera as etiquetas + CSV do LightBurn, imprime sozinho,
+      manda por e-mail e dá baixa no UpSeller. Nunca imprime repetido. Se alguma loja estiver deslogada, aparece aqui embaixo: faça o login e clique em <b>Já loguei, continuar</b>.</div>
+    <div id="fila" style="margin-top:8px"></div>
   </div>
   <div class="bar chips" id="fEnvio"></div>
   <div class="bar chips" id="fTipo"></div>
@@ -81,7 +81,7 @@ function aviso(t,cor){$('#msg').textContent=t;$('#msg').style.color=cor||'#fff'}
 async function api(url,corpo){const r=await fetch(url,corpo?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo)}:{});
   if(r.status==401){$('#app').hidden=true;$('#login').hidden=false;throw new Error('login')}return r.json()}
 async function entrar(){const r=await fetch('/etiquetas/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha:$('#senha').value})});
-  if(r.ok){$('#login').hidden=true;carregar()}else $('#lerr').textContent='Senha incorreta'}
+  if(r.ok){$('#login').hidden=true;carregar().then(fila)}else $('#lerr').textContent='Senha incorreta'}
 async function carregar(){aviso('Carregando...');D=await api('/api/etiquetas/dia?ate='+$('#ate').value);$('#app').hidden=false;$('#login').hidden=true;
   aviso(D.pedidos.length+' pedidos com prazo até '+D.dia);render()}
 async function sincronizar(){aviso('Lendo pedidos da Shopee...');const r=await api('/api/etiquetas/sincronizar',{});aviso(r.ok?'Atualizado':'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
@@ -92,19 +92,21 @@ async function enviar(){const n=D.pedidos.filter(p=>!p.enviado_em&&p.envio!='RET
   if(!confirm(`Enviar ${n} pedidos para a produção?`+(pend?`\n\nATENÇÃO: ${pend} ainda estão como sugestão (não conferidos).`:'')))return;
   const r=await api('/api/etiquetas/enviar',{ate:$('#ate').value,envios:fEnv?[fEnv]:null});
   aviso(r.ok?`Lote ${r.lote}: ${r.pedidos} pedidos enviados`:'Erro: '+r.erro,r.ok?'#7ee787':'#ffb4b4');carregar()}
-function baixa(blob,nome){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=nome;document.body.appendChild(a);a.click();setTimeout(()=>a.remove(),1000)}
-async function imprimir(g){const nomes={tudo_hoje:'Tudo do dia',er_hoje:'Entrega Rápida do dia',tt_hoje:'TikTok do dia',sp_hoje:'Shopee do dia',tudo:'Tudo (inclui próximos dias)'};
-  if(!confirm('Imprimir: '+nomes[g]+'?'))return;const box=$('#impres');box.innerHTML='⏳ Buscando as etiquetas na Shopee e montando o PDF... (pode levar 1-2 min)';
-  const url='/api/etiquetas/imprimir?grupo='+g+'&ate='+$('#ate').value+($('#reimp').checked?'&reimprimir=1':'');
-  try{const r=await fetch(url);if(r.status==401){location.reload();return}
-    const ct=r.headers.get('Content-Type')||'';
-    if(ct.includes('pdf')){const lote=r.headers.get('X-Lote');const pdf=await r.blob();
-      const csv=await fetch('/api/etiquetas/csv_lote?lote='+encodeURIComponent(lote));if(csv.ok)baixa(await csv.blob(),'lightburn_nomes_'+lote+'.csv');
-      baixa(pdf,'etiquetas_'+lote+'.pdf');const u=await api('/api/etiquetas/ultimo');
-      const f=Object.entries(u.falhas||{});box.innerHTML=`✅ <b>${u.pedidos} pedidos</b> no PDF etiquetas_${esc(lote)}.pdf`+
-        (f.length?`<br>⚠️ ${f.length} sem etiqueta: `+f.map(([k,v])=>esc(k)+' ('+esc(v)+')').join('; '):'')+((u.avisos||[]).length?'<br>ℹ️ '+u.avisos.map(esc).join('<br>ℹ️ '):'');carregar()}
-    else{const j=await r.json();const f=Object.entries(j.falhas||{});box.innerHTML='❌ '+esc(j.erro||'erro')+(f.length?'<br>'+f.slice(0,20).map(([k,v])=>esc(k)+': '+esc(v)).join('<br>'):'')+((j.avisos||[]).length?'<br>ℹ️ '+j.avisos.map(esc).join('<br>ℹ️ '):'')}}
-  catch(e){box.textContent='❌ '+e}}
+const FST={NA_FILA:['⏳ Na fila','#eef2f6'],TRABALHANDO:['⚙️ Claude trabalhando','#dbeafe'],PRECISA_LOGIN:['🔑 Precisa logar','#fde68a'],
+  ERRO:['❌ Erro','#fecaca'],PRONTO:['✅ Pronto','#dcfce7'],CANCELADO:['🚫 Cancelado','#e5e7eb']};
+async function pedir(g){const G=FILAG||{};let txt='Pedir ao Claude: '+(G[g]||g)+'?';
+  if(g=='tudo')txt='ATENÇÃO: isso imprime também etiquetas que NÃO são de hoje.\n\nÉ isso mesmo?';
+  if(!confirm(txt))return;const r=await api('/api/fila/pedir',{grupo:g,por:$('#quem').value});
+  if(!r.ok)alert(r.erro);fila()}
+let FILAG=null;
+async function fila(){try{const r=await api('/api/fila');FILAG=r.grupos;const L=r.fila.filter((x,k)=>k<8);
+  $('#fila').innerHTML=L.map(x=>{const [t,c]=FST[x.status]||[x.status,'#eee'];const quando=new Date(x.criado).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    return `<div style="background:${c};border-radius:8px;padding:8px 10px;margin-top:6px"><b>${t}</b> · nº ${x.id} · ${esc(r.grupos[x.grupo]||x.grupo)} · ${quando}${x.por?' · '+esc(x.por):''}
+    <div style="white-space:pre-wrap">${esc(x.msg)}</div>${x.resultado?`<div class="mut" style="white-space:pre-wrap">${esc(x.resultado)}</div>`:''}
+    ${x.status=='PRECISA_LOGIN'||x.status=='ERRO'?`<button class="ok" style="margin-top:6px" onclick="filaAcao('continuar',${x.id})">Já loguei, continuar</button> `:''}
+    ${['NA_FILA','PRECISA_LOGIN','ERRO'].includes(x.status)?`<button style="margin-top:6px" onclick="filaAcao('cancelar',${x.id})">Cancelar</button>`:''}</div>`}).join('')||'<span class="mut">Nenhum pedido ainda.</span>'}catch(e){}}
+async function filaAcao(a,id){const r=await api('/api/fila/'+a,{id,por:$('#quem').value});if(!r.ok)alert(r.erro);fila()}
+setInterval(fila,15000);
 function chips(){const envs=['','ENTREGA RÁPIDA','SHOPEE','RETIRADA'];
   $('#fEnvio').innerHTML=envs.map(e=>{const n=D.pedidos.filter(p=>!e||p.envio==e).length;return `<span class="${fEnv==e?'on':''}" onclick="fEnv='${e}';render()">${e||'Todos'} (${n})</span>`}).join('');
   $('#fTipo').innerHTML=[''].concat(Object.keys(D.tipos)).map(t=>{const n=D.pedidos.filter(p=>(!fEnv||p.envio==fEnv)&&(!t||p.tipo==t)).length;
@@ -134,7 +136,7 @@ async function salvar(i){const p=D.pedidos[i],c=$('#c'+i);const nomes=[...c.quer
   const r=await api('/api/etiquetas/salvar',body);
   if(r.ok){Object.assign(p,body,{origem:'conferido'});$('#s'+i).textContent='✔ salvo';c.className=c.className.replace(/tipo-\w/,'tipo-'+body.tipo)}
   else $('#s'+i).textContent='❌ '+r.erro}
-carregar().catch(()=>{});
+carregar().then(fila).catch(()=>{});
 </script>
 </body>
 </html>
