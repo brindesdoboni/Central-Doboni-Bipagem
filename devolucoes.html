@@ -60,7 +60,7 @@
   .env{width:100%;font-size:19px;padding:14px;border:0;border-radius:12px;background:#ee4d2d;color:#fff;font-weight:900;margin-top:8px}
   .env:disabled{background:#d1d5db;color:#555}
   .barra{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin-top:4px}.barra i{display:block;height:100%;background:#7c3aed;width:0}
-#pend .card{scroll-margin-top:150px}
+#pend .card,#oq{scroll-margin-top:150px}
 </style>
 </head>
 <body>
@@ -168,7 +168,7 @@ async function post(url,body){return api(url,body||{})}
 async function registrar(){const c=$("cod").value.trim();if(!c)return;$("msg").textContent="Registrando...";
   try{const d=await post("/api/devolucoes/registrar",{codigo:c});$("msg").textContent=d.ok?(d.registradas?`✅ Devolução registrada: ${c}`:`Já estava registrada: ${c}`)+" — o pacote bipado fica em destaque na lista":"❌ "+d.erro;$("cod").value="";
     FOCO=d.ok&&d.ids?d.ids:[];FOCO_COD=c;await carregar();
-    if(d.ok&&d.ids&&d.ids.length)oque(d.ids[0]);   // abre o "O que fazer na Shopee" como antes
+    if(d.ok&&d.ids&&d.ids.length){await oque(d.ids[0]);$("oq").scrollIntoView({behavior:"smooth",block:"start"})}   // abre o "O que fazer na Shopee" como antes
     if(d.ok&&!(FOCO.length&&$("d"+FOCO[0])))$("msg").textContent+=" (já foi conferido: veja no histórico)"}
   catch(e){$("msg").textContent="❌ Não salvou — tente de novo"}$("cod").focus()}
 async function decidir(id,destino){const m=$("m"+id).value;
